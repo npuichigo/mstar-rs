@@ -15,6 +15,8 @@
 
 mod frame;
 mod mailbox;
+pub mod shm;
 
 pub use frame::{read_frame, write_frame, FrameError};
 pub use mailbox::{Mailbox, MailboxError};
+pub use shm::{ShmArena, ShmError, ALIGN};

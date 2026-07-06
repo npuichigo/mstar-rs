@@ -11,4 +11,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 mstar-core = { path = "../mstar-core" }
 mstar-runtime = { path = "../mstar-runtime" }
+mstar-comm = { path = "../mstar-comm" }
 pyo3 = { version = "0.23", features = ["extension-module"] }

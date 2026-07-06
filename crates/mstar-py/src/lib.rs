@@ -6,13 +6,16 @@
 //! `(uuid, dims, dtype)` tuples to keep the FFI surface flat and cheap.
 
 use std::collections::BTreeMap;
+use std::os::raw::{c_int, c_void};
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use std::collections::BTreeMap as StdBTreeMap;
 
+use mstar_comm::ShmArena;
 use mstar_core::{IncomingInput, TensorRef};
 use mstar_runtime::{Event, KvCacheConfig, Runtime, RuntimeError};
 
@@ -280,10 +283,84 @@ impl PyRuntime {
     }
 }
 
+/// Shared-memory tensor arena for cross-process transport. Producer:
+/// `create(name, size)` -> `reserve(nbytes)` -> `torch.frombuffer(
+/// memoryview(arena)[off:off+n], dtype=..).copy_(cpu_tensor)`; send the
+/// offset descriptor; `free(off)` on ACK. Consumer: `open(name)` and
+/// `torch.frombuffer(memoryview(arena)[off:off+n], ..)` (then H2D).
+#[pyclass(name = "ShmArena")]
+struct PyShmArena {
+    arena: ShmArena,
+}
+
+#[pymethods]
+impl PyShmArena {
+    #[staticmethod]
+    fn create(name: &str, size: usize) -> PyResult<Self> {
+        Ok(Self {
+            arena: ShmArena::create(name, size).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+
+    #[staticmethod]
+    fn open(name: &str) -> PyResult<Self> {
+        Ok(Self {
+            arena: ShmArena::open(name).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+
+    fn reserve(&self, nbytes: usize) -> PyResult<usize> {
+        self.arena
+            .reserve(nbytes)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    fn free(&self, offset: usize) -> bool {
+        self.arena.free(offset)
+    }
+
+    #[getter]
+    fn size(&self) -> usize {
+        self.arena.size()
+    }
+
+    #[getter]
+    fn bytes_free(&self) -> usize {
+        self.arena.bytes_free()
+    }
+
+    fn close(&mut self) {
+        self.arena.close();
+    }
+
+    /// Whole arena as a writable memoryview -> zero-copy `torch.frombuffer`.
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(PyValueError::new_err("null buffer view"));
+        }
+        let borrow = slf.borrow();
+        let ptr = borrow.arena.as_mut_ptr() as *mut c_void;
+        let len = borrow.arena.size() as ffi::Py_ssize_t;
+        let ret = ffi::PyBuffer_FillInfo(view, slf.as_ptr(), ptr, len, 0, flags);
+        if ret != 0 {
+            Err(PyErr::fetch(slf.py()))
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyBatch>()?;
+    m.add_class::<PyShmArena>()?;
     m.add("EMIT_TO_CLIENT", mstar_core::EMIT_TO_CLIENT)?;
     m.add("EMPTY_DESTINATION", mstar_core::EMPTY_DESTINATION)?;
     Ok(())
