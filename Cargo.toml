@@ -4,6 +4,7 @@ members = [
     "crates/mstar-core",
     "crates/mstar-sched",
     "crates/mstar-runtime",
+    "crates/mstar-comm",
     "crates/mstar-py",
 ]
 
