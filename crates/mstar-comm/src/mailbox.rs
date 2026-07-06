@@ -38,7 +38,9 @@ fn sock_path(dir: &Path, id: &str) -> PathBuf {
 pub struct Mailbox<M> {
     my_id: String,
     dir: PathBuf,
-    rx: Receiver<M>,
+    // Behind a Mutex so `Mailbox` is `Sync` (a bare `Receiver` is `!Sync`) —
+    // lets it be held by a PyO3 pyclass shared across Python threads.
+    rx: Mutex<Receiver<M>>,
     /// peer id -> (cached writer, socket-file inode). A restarted peer
     /// re-creates its socket with a new inode, which invalidates the cache.
     peers: Mutex<HashMap<String, (BufWriter<UnixStream>, u64)>>,
@@ -67,7 +69,7 @@ where
         Ok(Self {
             my_id,
             dir,
-            rx,
+            rx: Mutex::new(rx),
             peers: Mutex::new(HashMap::new()),
             shutdown,
             accept_thread,
@@ -161,23 +163,24 @@ where
 
     /// Non-blocking: next inbound message, or None.
     pub fn try_recv(&self) -> Option<M> {
-        self.rx.try_recv().ok()
+        self.rx.lock().expect("rx lock").try_recv().ok()
     }
 
     /// Block until the next inbound message.
     pub fn recv(&self) -> Option<M> {
-        self.rx.recv().ok()
+        self.rx.lock().expect("rx lock").recv().ok()
     }
 
     /// Block up to `timeout` for the next inbound message.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<M> {
-        self.rx.recv_timeout(timeout).ok()
+        self.rx.lock().expect("rx lock").recv_timeout(timeout).ok()
     }
 
     /// Drain all currently-queued inbound messages.
     pub fn drain(&self) -> Vec<M> {
+        let rx = self.rx.lock().expect("rx lock");
         let mut out = Vec::new();
-        while let Ok(m) = self.rx.try_recv() {
+        while let Ok(m) = rx.try_recv() {
             out.push(m);
         }
         out

@@ -15,9 +15,13 @@ use pyo3::types::{PyDict, PyList};
 
 use std::collections::BTreeMap as StdBTreeMap;
 
-use mstar_comm::ShmArena;
+use std::time::Duration;
+
+use mstar_comm::{Mailbox, ShmArena};
 use mstar_core::{IncomingInput, TensorRef};
 use mstar_runtime::{Event, KvCacheConfig, Runtime, RuntimeError};
+
+use pyo3::types::PyBytes;
 
 fn to_py_err(e: RuntimeError) -> PyErr {
     PyValueError::new_err(e.to_string())
@@ -356,11 +360,49 @@ impl PyShmArena {
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 }
 
+/// The control-plane message mesh for the conductor + worker processes.
+/// Carries opaque `bytes` payloads (the Python side frames its protocol with
+/// msgpack); transport is the UDS `Mailbox` (framed, ordered, reconnecting).
+#[pyclass(name = "Mailbox")]
+struct PyMailbox {
+    inner: Mailbox<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyMailbox {
+    /// Bind this entity's inbox at `<dir>/<my_id>.sock`.
+    #[new]
+    fn new(my_id: &str, dir: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: Mailbox::bind(my_id, dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+
+    /// Fire-and-forget send `data` to peer `peer_id`.
+    fn send(&self, peer_id: &str, data: &[u8]) -> PyResult<()> {
+        self.inner
+            .send(peer_id, &data.to_vec())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Non-blocking: next inbound message as bytes, or None.
+    fn try_recv<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner.try_recv().map(|b| PyBytes::new(py, &b))
+    }
+
+    /// Block up to `timeout_ms` for the next message.
+    fn recv_timeout<'py>(&self, py: Python<'py>, timeout_ms: u64) -> Option<Bound<'py, PyBytes>> {
+        py.allow_threads(|| self.inner.recv_timeout(Duration::from_millis(timeout_ms)))
+            .map(|b| PyBytes::new(py, &b))
+    }
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyBatch>()?;
     m.add_class::<PyShmArena>()?;
+    m.add_class::<PyMailbox>()?;
     m.add("EMIT_TO_CLIENT", mstar_core::EMIT_TO_CLIENT)?;
     m.add("EMPTY_DESTINATION", mstar_core::EMPTY_DESTINATION)?;
     Ok(())
