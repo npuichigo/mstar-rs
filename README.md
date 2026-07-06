@@ -51,6 +51,7 @@ Order is dependency order — each tier is usable and testable without the tiers
 | **T4 model** | `python/mstar_rs/models/pi05.py` | ✅ second model | **Pi0.5**: prefill (SigLIP fp32 → PaliGemma writes paged prefix KV, bf16) + 10-step flow-matching `action_gen` loop as **one CUDA-graph-captured euler step replayed 10×** (frozen prefix, `kv_appends=0` + suffix scratch). Reuses mstar's pi05 nn modules + weight remapping wholesale; the single code path matches mstar's engine config exactly. |
 | **T4** | Streaming tier (`mstar-runtime::stream` + partitions) | ✅ implemented | Rust: **`ChunkPolicy`** (sliding-window / ramp / left-context / fixed) + **`StreamBuffer`** (in-order windowing, overlap, producer-done flush, `continue_after_done`); the runtime runs **concurrent per-partition walk slots** per request, delivers ready windows into consumer walks (`pump_streams`), and marks partition-done on the pass that consumes the final chunk. Python driver seeds every partition at ingest, `finish_partition` completes the request when all are done. Unit-tested + toy e2e. |
 | **T4 model** | `python/mstar_rs/models/orpheus.py` | ✅ third model | **Orpheus** speech LM: `LLM` partition (prefill + AR decode loop, KV append 1, EOS-stop) streaming `new_token` under a SlidingWindow(28,7) into a self-triggered `SNAC` partition (vendored SNAC decoder → 24 kHz audio). Reuses mstar's `OrpheusForCausalLM` behind a causal FlashInfer handle (llama3 RoPE); the decode step is **CUDA-graph-captured with the sampler in-graph** (mstar's `CudaGraphableSampler`) and the SNAC decoder is graphed too — matching mstar's decode path. LLM data plane **bit-exact 81/81** vs a dense reference; **RTF 0.349, matched to mstar's 0.345** on 1× H100. |
+| **T5 core** | Async execution pipeline (`mstar-runtime` + driver) | ▢ planned | The runtime capability, not a per-model trick: **overlap host-side scheduling/routing/postprocess with GPU compute** across every walk, mirroring mstar's worker `run()` (async 1-deep speculative pipeline). Runtime side: speculative `next_batch` (predict the next-ready nodes from the walk state machine — pure Rust control plane) + decoupled async `complete_batch`; driver side: a GPU stream/thread that launches batch N+1 while the host routes/postprocesses N, CUDA-event-gated, with off-stream stop checks (no per-token `.item()` sync). Model code is unchanged — `execute` stays synchronous. Benefits every model (vjepa2 sequential, pi05 flow loop, orpheus AR decode); mstar-rs can do the speculation GIL-free. |
 | T5 dependent | `crates/mstar-comm` | ▢ planned | ZMQ PUSH/PULL control mesh (serde/msgpack envelopes — replaces pickle) + SHM-ring tensor transport. Only needed for multi-process / disaggregated deployment. |
 | T5 dependent | `crates/mstar-server` | ▢ planned | axum HTTP shell (`/generate`, OpenAI routes). Thin; can equally stay FastAPI. |
 
@@ -112,12 +113,14 @@ mstar graphs. **Orpheus reaches parity once the whole decode step is captured to
 mstar** — the LLM forward, the sampler (`CudaGraphableSampler`, in-graph seeded sampling),
 and the SNAC decoder. Profiling was decisive here: the eager sampler cost ~4.4 ms/token —
 *more than the entire 28-layer LLM decode* — and folding it into the graph (as mstar does)
-took RTF 0.408 → 0.349. The residual ~1% is the synchronous Python driver loop sitting on
-the critical path (mstar's worker overlaps host work with GPU via an async pipeline; the
-mstar-rs v0 driver does not yet) — a driver-maturity gap, not a language one: the
-control-plane row shows the Rust runtime is **>2× faster** than even mstar's graph-IO layer
-in isolation, and its share of any real request is ~0.1-0.3%. Driving the AR loop from Rust
-(no per-token Python/PyO3 crossing) would remove that residual.
+took RTF 0.408 → 0.349. The residual ~1% is the synchronous driver: mstar's worker overlaps
+host-side scheduling/routing/postprocess with GPU compute (async 1-deep speculative
+pipeline), and the mstar-rs v0 driver does not yet — this is the **T5 async-execution-pipeline
+tier** (a runtime capability that benefits every walk, not a per-model tweak), not a language
+gap: the control-plane row shows the Rust runtime is **>2× faster** than even mstar's
+graph-IO layer in isolation, and its share of any real request is ~0.1-0.3%. Speculative
+scheduling is pure control-plane logic — exactly what the Rust walk state machine does — so
+mstar-rs can pipeline GIL-free.
 
 **Numerical fidelity** (all verified vs independent dense references sharing no runtime
 code): pi05 actions max_abs_diff 7.0e-3 / cosine 0.999986; vjepa2 predictor bit-exact;
