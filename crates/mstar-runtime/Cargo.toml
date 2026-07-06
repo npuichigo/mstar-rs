@@ -7,4 +7,6 @@ license.workspace = true
 [dependencies]
 mstar-core = { path = "../mstar-core" }
 mstar-sched = { path = "../mstar-sched" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -232,7 +232,9 @@ class PI05(Model):
 
     # -- policy: prefill -> action_gen -> done ------------------------------
 
-    def next_forward(self, request_id, walk, fwd_index, persist) -> NextWalk | None:
+    def next_forward(
+        self, request_id, partition, walk, fwd_index, persist, stream_done
+    ) -> NextWalk | None:
         if walk == "prefill":
             seed = self._seeds[request_id]
             generator = torch.Generator(device=self.device).manual_seed(seed)

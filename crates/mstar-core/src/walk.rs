@@ -28,6 +28,13 @@ pub enum RouteEvent {
         name: String,
         tensors: Vec<TensorRef>,
     },
+    /// Streaming edge: goes to the stream buffer of the connection into
+    /// `target_partition` (the runtime owns buffers; walks don't see them).
+    Stream {
+        name: String,
+        target_partition: String,
+        tensors: Vec<TensorRef>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -159,6 +166,34 @@ impl WalkState {
         }
         st.scheduled = true;
         Ok(st.current.clone())
+    }
+
+    fn stream_target(&self, input_name: &str) -> Option<&str> {
+        self.graph.nodes.iter().find_map(|(name, spec)| {
+            let st = &self.nodes[name];
+            (spec.input_names.contains(input_name)
+                && !st.completed
+                && !st.scheduled
+                && !st.current.contains_key(input_name))
+            .then_some(name.as_str())
+        })
+    }
+
+    /// Can a stream chunk for `input_name` be ingested right now? (mstar's
+    /// `process_new_streaming_inputs` with `can_buffer=False` — chunks are
+    /// only delivered into a node that is waiting for exactly this input.)
+    pub fn can_accept_input(&self, input_name: &str) -> bool {
+        self.stream_target(input_name).is_some()
+    }
+
+    /// Ingest a stream chunk (the window, in order). Caller must have
+    /// checked `can_accept_input`.
+    pub fn ingest_stream_input(&mut self, input_name: &str, tensors: Vec<TensorRef>) {
+        let node = self
+            .stream_target(input_name)
+            .expect("caller checked can_accept_input")
+            .to_string();
+        self.ingest(&node, input_name, tensors);
     }
 
     /// Record a finish signal for a loop (mstar's `check_stop -> STOP_LOOPS`).
@@ -297,6 +332,14 @@ impl WalkState {
                 tensors: tensors.clone(),
             });
         }
+        if let Some(partition) = &edge.target_partition {
+            events.push(RouteEvent::Stream {
+                name: edge.name.clone(),
+                target_partition: partition.clone(),
+                tensors,
+            });
+            return;
+        }
         match edge.next_node.as_str() {
             EMIT_TO_CLIENT => events.push(RouteEvent::Emission {
                 name: edge.name.clone(),
@@ -357,6 +400,7 @@ mod tests {
             name: name.to_string(),
             persist: false,
             output_modality: None,
+            target_partition: None,
         }
     }
 
@@ -366,6 +410,7 @@ mod tests {
             name: name.to_string(),
             persist,
             output_modality: Some(modality.to_string()),
+            target_partition: None,
         }
     }
 

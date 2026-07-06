@@ -60,6 +60,7 @@ class FlashInferAttention:
         device: torch.device,
         max_new_tokens: int,
         cudagraph: bool,
+        causal: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         import flashinfer
@@ -68,6 +69,7 @@ class FlashInferAttention:
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = cache.kv.shape[4]
         self.head_dim = head_dim
+        self.causal = causal
         self.dtype = dtype
         self.device = device
         self._workspace = torch.empty(
@@ -119,7 +121,7 @@ class FlashInferAttention:
             num_kv_heads=self.num_kv_heads,
             head_dim_qk=self.head_dim,
             page_size=ps,
-            causal=False,
+            causal=self.causal,
             q_data_type=self.dtype,
         )
         # Token -> (page, slot) for the new tokens; rope positions.
@@ -152,18 +154,36 @@ class FlashInferCacheHandle:
         k: torch.Tensor,
         rope_theta: float = 10000.0,
         rope_scale: float = 1.0,
-        **_: object,
+        **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Non-interleaved RoPE via FlashInfer. Routes to the llama3.1
+        variant when the model passes scaling params (orpheus), exactly as
+        mstar's `cache_manager.apply_rope` does."""
         import flashinfer
 
         n = self.attn.new_len
         q, k = q.to(self.attn.dtype).contiguous(), k.to(self.attn.dtype).contiguous()
-        flashinfer.rope.apply_rope_pos_ids_inplace(
-            q, k, self.attn.pos_ids[:n],
-            interleave=False,
-            rope_scale=rope_scale or 1.0,
-            rope_theta=rope_theta,
-        )
+        pos_ids = self.attn.pos_ids[:n]
+        llama31 = {
+            key: kwargs[key]
+            for key in ("low_freq_factor", "high_freq_factor", "old_context_len")
+            if key in kwargs and kwargs[key] is not None
+        }
+        if llama31:
+            flashinfer.rope.apply_llama31_rope_pos_ids_inplace(
+                q, k, pos_ids,
+                interleave=False,
+                rope_scale=rope_scale or 1.0,
+                rope_theta=rope_theta,
+                **llama31,
+            )
+        else:
+            flashinfer.rope.apply_rope_pos_ids_inplace(
+                q, k, pos_ids,
+                interleave=False,
+                rope_scale=rope_scale or 1.0,
+                rope_theta=rope_theta,
+            )
         return q, k
 
     def run_attention(

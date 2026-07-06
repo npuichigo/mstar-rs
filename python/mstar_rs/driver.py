@@ -20,7 +20,18 @@ class Driver:
     def __init__(self, model: Model, max_batch_size: int = 8) -> None:
         self.model = model
         self.max_batch_size = max_batch_size
-        self.runtime = Runtime(json.dumps(model.walks()))
+        # A model spec with partitions is passed as {"walks", "partitions",
+        # "connections"}; a bare model just as the walk dict.
+        if (topo := model.partitions()) is not None:
+            partition_specs, connection_specs = topo
+            spec = {
+                "walks": model.walks(),
+                "partitions": partition_specs,
+                "connections": connection_specs,
+            }
+            self.runtime = Runtime(json.dumps(spec))
+        else:
+            self.runtime = Runtime(json.dumps(model.walks()))
         if (kv := model.kv_config()) is not None:
             configs, node_labels = kv
             self.runtime.configure_kv(configs, node_labels)
@@ -31,7 +42,8 @@ class Driver:
     def submit(self, request: dict[str, Any]) -> int:
         request_id = self.runtime.add_request()
         request = dict(request, request_id=request_id)
-        self._start_walk(request_id, self.model.initial_inputs(request))
+        for nxt in self.model.initial_walks(request):
+            self._start_walk(request_id, nxt)
         self.results[request_id] = []
         return request_id
 
@@ -56,6 +68,10 @@ class Driver:
                 for rid, named in batch.inputs.items()
             }
             outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+            # check_stop -> STOP_LOOPS: must land before complete_batch so the
+            # loop terminates on this iteration rather than advancing.
+            for rid, loop_name in self.model.loops_to_finish():
+                self.runtime.signal_loop_finish(rid, loop_name)
             out_refs = {
                 rid: {
                     name: [self.store.put(t, rid) for t in tensors]
@@ -79,10 +95,20 @@ class Driver:
                 name: self.store.get_all(refs)
                 for name, refs in event["persist"].items()
             }
-            nxt = self.model.next_forward(rid, event["walk"], event["fwd_index"], persist)
+            nxt = self.model.next_forward(
+                rid,
+                event["partition"],
+                event["walk"],
+                event["fwd_index"],
+                persist,
+                event["stream_done"],
+            )
             if nxt is None:
-                self.runtime.finish_request(rid)
-                self.store.free_request(rid)
+                # Partition finished; the request completes only when every
+                # partition is done (finish_partition returns all-done).
+                if self.runtime.finish_partition(rid, event["partition"]):
+                    self.runtime.finish_request(rid)
+                    self.store.free_request(rid)
             else:
                 self._start_walk(rid, nxt)
         else:

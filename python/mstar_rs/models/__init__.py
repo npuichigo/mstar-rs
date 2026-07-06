@@ -11,7 +11,11 @@ def __getattr__(name: str):
         from .pi05 import PI05
 
         return PI05
+    if name == "Orpheus":
+        from .orpheus import Orpheus
+
+        return Orpheus
     raise AttributeError(name)
 
 
-__all__ = ["VJEPA2", "PI05"]
+__all__ = ["VJEPA2", "PI05", "Orpheus"]

@@ -22,6 +22,11 @@ pub struct EdgeSpec {
     pub persist: bool,
     #[serde(default)]
     pub output_modality: Option<String>,
+    /// Streaming edge (mstar's `StreamingGraphEdge`): the value goes into
+    /// the stream buffer of the connection targeting this partition instead
+    /// of a node in this walk. The producer is otherwise unaware.
+    #[serde(default)]
+    pub target_partition: Option<String>,
 }
 
 /// A unit of computation. Executed on the data plane (Python/torch); the
@@ -164,7 +169,10 @@ impl CompiledWalk {
             .chain(self.loops.iter().flat_map(|l| l.outputs.iter()))
             .chain(self.loops.iter().flat_map(|l| l.accumulated_outputs.iter()));
         for edge in edge_iter {
-            if edge.next_node != EMIT_TO_CLIENT
+            // Streaming edges leave this walk (their next_node lives in the
+            // target partition's walk); everything else must resolve here.
+            if edge.target_partition.is_none()
+                && edge.next_node != EMIT_TO_CLIENT
                 && edge.next_node != EMPTY_DESTINATION
                 && !self.nodes.contains_key(&edge.next_node)
             {

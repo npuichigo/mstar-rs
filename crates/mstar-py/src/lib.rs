@@ -76,12 +76,18 @@ struct PyRuntime {
 
 #[pymethods]
 impl PyRuntime {
-    /// walks_json: `{"walk_name": <Section>, ...}` (see mstar-core::Section).
+    /// walks_json: either a bare walk-set `{"walk_name": <Section>, ...}`
+    /// or a full model spec `{"walks": {...}, "partitions": [...],
+    /// "connections": [...]}` (streaming models).
     #[new]
     fn new(walks_json: &str) -> PyResult<Self> {
-        Ok(Self {
-            inner: Runtime::from_walks_json(walks_json).map_err(to_py_err)?,
-        })
+        let inner = if walks_json.contains("\"walks\"") {
+            Runtime::from_spec_json(walks_json)
+        } else {
+            Runtime::from_walks_json(walks_json)
+        }
+        .map_err(to_py_err)?;
+        Ok(Self { inner })
     }
 
     fn new_uuid(&mut self) -> u64 {
@@ -219,26 +225,32 @@ impl PyRuntime {
             match event {
                 Event::Emission {
                     request_id,
+                    partition,
                     name,
                     modality,
                     tensors,
                 } => {
                     d.set_item("type", "emission")?;
                     d.set_item("request_id", request_id)?;
+                    d.set_item("partition", partition)?;
                     d.set_item("name", name)?;
                     d.set_item("modality", modality)?;
                     d.set_item("tensors", tensors_to_py(py, &tensors)?)?;
                 }
                 Event::WalkDone {
                     request_id,
+                    partition,
                     walk,
                     fwd_index,
                     persist,
+                    stream_done,
                 } => {
                     d.set_item("type", "walk_done")?;
                     d.set_item("request_id", request_id)?;
+                    d.set_item("partition", partition)?;
                     d.set_item("walk", walk)?;
                     d.set_item("fwd_index", fwd_index)?;
+                    d.set_item("stream_done", stream_done)?;
                     let p = PyDict::new(py);
                     for (name, tensors) in persist {
                         p.set_item(name, tensors_to_py(py, &tensors)?)?;
@@ -249,6 +261,14 @@ impl PyRuntime {
             list.append(d)?;
         }
         Ok(list.unbind().into())
+    }
+
+    /// Mark a partition done (signals producer-done on its outgoing
+    /// streams). Returns true when ALL partitions of the request are done.
+    fn finish_partition(&mut self, request_id: u64, partition: &str) -> PyResult<bool> {
+        self.inner
+            .finish_partition(request_id, partition)
+            .map_err(to_py_err)
     }
 
     fn finish_request(&mut self, request_id: u64) -> PyResult<()> {

@@ -80,6 +80,8 @@ version = "0.1.0"
 dependencies = [
  "mstar-core",
  "mstar-sched",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

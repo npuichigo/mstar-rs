@@ -50,12 +50,15 @@ Order is dependency order — each tier is usable and testable without the tiers
 | T4 dependent | `crates/mstar-comm` | ▢ planned | ZMQ PUSH/PULL control mesh (serde/msgpack envelopes — replaces pickle) + SHM-ring tensor transport (grow from `mstar/rust/mstar_shmring`). Only needed for multi-process / disaggregated deployment. |
 | **T4** | KV-cache tier (`mstar-runtime::kv` + `python/mstar_rs/fi.py`) | ✅ implemented | Rust: paged-KV **allocator** (free-list, per-(request,label) page tables + seq positions), schedule-time reservation with hold-on-OOM, scratch-page reservation for transient suffixes, page-table views in `Batch.kv`, advance-on-complete, free-on-finish. Python: KV tensors in mstar's layout + a cache handle implementing mstar's cache-manager interface (`apply_rope`/`run_attention`/…) over **FlashInfer paged attention in bf16** — mstar transformer modules run unmodified, on the same kernels mstar's engine uses. |
 | **T4 model** | `python/mstar_rs/models/pi05.py` | ✅ second model | **Pi0.5**: prefill (SigLIP fp32 → PaliGemma writes paged prefix KV, bf16) + 10-step flow-matching `action_gen` loop as **one CUDA-graph-captured euler step replayed 10×** (frozen prefix, `kv_appends=0` + suffix scratch). Reuses mstar's pi05 nn modules + weight remapping wholesale; the single code path matches mstar's engine config exactly. |
-| T4 dependent | Streaming partitions | ▢ planned | `StreamBuffer` + `ChunkPolicy` (sliding window / ramp / left-context) in Rust; async partition topology in the runtime. Unlocks orpheus / qwen3-omni streaming. |
+| **T4** | Streaming tier (`mstar-runtime::stream` + partitions) | ✅ implemented | Rust: **`ChunkPolicy`** (sliding-window / ramp / left-context / fixed) + **`StreamBuffer`** (in-order windowing, overlap, producer-done flush, `continue_after_done`); the runtime runs **concurrent per-partition walk slots** per request, delivers ready windows into consumer walks (`pump_streams`), and marks partition-done on the pass that consumes the final chunk. Python driver seeds every partition at ingest, `finish_partition` completes the request when all are done. Unit-tested + toy e2e. |
+| **T4 model** | `python/mstar_rs/models/orpheus.py` | ◐ code-complete, unverified | **Orpheus** speech LM: `LLM` partition (prefill + AR decode loop, KV append 1, mstar's `Sampler`, EOS-stop) streaming `new_token` under a SlidingWindow(28,7) into a self-triggered `SNAC` partition (vendored SNAC decoder → 24 kHz audio). Reuses mstar's `OrpheusForCausalLM` behind a causal FlashInfer handle with llama3 RoPE. **Awaiting HF access to gated `canopylabs/orpheus-3b-0.1-ft`** to run/verify. |
+| T5 dependent | `crates/mstar-comm` | ▢ planned | ZMQ PUSH/PULL control mesh (serde/msgpack envelopes — replaces pickle) + SHM-ring tensor transport. Only needed for multi-process / disaggregated deployment. |
 | T5 dependent | `crates/mstar-server` | ▢ planned | axum HTTP shell (`/generate`, OpenAI routes). Thin; can equally stay FastAPI. |
 
 Model roadmap (runtime features each one forces): **vjepa2** ✅ (stateless walks — T0-T3) →
-**pi05** ✅ (paged KV cache + `Loop` flow-matching — T4) → **orpheus** (streaming partitions) →
-**bagel / qwen3_omni** (CFG-parallel, MoE).
+**pi05** ✅ (paged KV cache + `Loop` flow-matching — T4) → **orpheus** ◐ (streaming
+partitions — tier done, model awaiting weight access) → **bagel / qwen3_omni** (CFG-parallel,
+MoE).
 
 ## Core semantics (faithful to Python mstar)
 
