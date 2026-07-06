@@ -63,18 +63,22 @@ class ShmPool:
         t = t.detach().to("cpu").contiguous()
         nbytes = t.numel() * t.element_size()
         off = self.arena.reserve(max(nbytes, 1))
-        mv = memoryview(self.arena)[off:off + nbytes]
-        torch.frombuffer(mv, dtype=t.dtype).copy_(t.flatten())
+        if nbytes:  # torch.frombuffer rejects an empty buffer
+            mv = memoryview(self.arena)[off:off + nbytes]
+            torch.frombuffer(mv, dtype=t.dtype).copy_(t.flatten())
         return [self.name, off, nbytes, list(t.shape), _DTYPE_TO_STR[t.dtype]]
 
     def read(self, desc: list) -> torch.Tensor:
         name, off, nbytes, dims, dtype_str = desc
+        dtype = _STR_TO_DTYPE[dtype_str]
+        if nbytes == 0:  # empty tensor: nothing to map, reconstruct from dims
+            return torch.empty(dims, dtype=dtype)
         arena = self._peers.get(name)
         if arena is None:
             arena = ShmArena.open(name)
             self._peers[name] = arena
         mv = memoryview(arena)[off:off + nbytes]
-        flat = torch.frombuffer(mv, dtype=_STR_TO_DTYPE[dtype_str]).clone()
+        flat = torch.frombuffer(mv, dtype=dtype).clone()
         return flat.reshape(dims)
 
     def free(self, desc: list) -> None:
@@ -157,6 +161,11 @@ class Conductor:
         self.results: dict[int, list[Any]] = {}
         self._inflight = 0        # batches dispatched but not yet completed
         self.finished: set[int] = set()  # request ids whose request completed
+        # Serving hooks (set by a frontend bridge): stream each emission and
+        # signal completion, keyed by the *frontend's* request id.
+        self.on_token = None      # callable(front_rid, value)
+        self.on_done = None       # callable(front_rid)
+        self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
 
     # -- request ingestion --
 
@@ -186,28 +195,47 @@ class Conductor:
 
     def poll(self, timeout_ms: int = 5) -> bool:
         """One non-blocking drive step across ALL active requests (continuous
-        batching): dispatch every ready batch, then drain the completions
-        that have arrived. Returns True if anything progressed. This is the
-        serving primitive — the HTTP layer runs it in a background thread
-        while requests stream in and out concurrently."""
+        batching): dispatch every ready batch, then drain whatever has arrived
+        on the inbox. The inbox carries two kinds of message — worker `done`
+        (a batch completed) and, when a frontend is attached, `submit` (a new
+        request). Both are demuxed here by `t`. Returns True if anything
+        progressed. This is the serving primitive — the HTTP layer runs it in
+        a background thread while requests stream in and out concurrently."""
         did = False
         while (batch := self.runtime.next_batch(self.max_batch_size)) is not None:
             self._dispatch(batch)
             self._inflight += 1
             did = True
-        if self._inflight:
-            raw = self.mbox.recv_timeout(timeout_ms)
-            while raw is not None:
-                self._process_done(raw)
-                self._inflight -= 1
-                did = True
-                raw = self.mbox.try_recv()
+        # Block briefly only when there is in-flight work to wait on; otherwise
+        # peek non-blocking so an idle conductor still notices new submits.
+        raw = self.mbox.recv_timeout(timeout_ms) if self._inflight else self.mbox.try_recv()
+        while raw is not None:
+            did = True
+            self._handle_message(raw)
+            raw = self.mbox.try_recv()
         return did
+
+    def _handle_message(self, raw: bytes) -> None:
+        """Demux an inbox message by type: worker completion vs new request."""
+        msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+        if msg["t"] == "done":
+            self._process_done(msg)
+            self._inflight -= 1
+        elif msg["t"] == "submit":
+            self._ingest_submit(msg)
+
+    def _ingest_submit(self, msg: dict) -> None:
+        """A frontend submitted token-ids: start a request, and remember the
+        frontend's request id so emissions can be streamed back to it."""
+        rid = self.submit({"tokens": list(msg["tokens"]), "max_tokens": msg["max_tokens"]})
+        self._front_rid[rid] = msg["rid"]
 
     def run_until_idle(self) -> dict[int, list[Any]]:
         """Drive until no request has work left (used by the batch demo)."""
-        while self.poll(timeout_ms=2000) or self._inflight:
-            pass
+        while True:
+            did = self.poll(timeout_ms=50)
+            if not did and self._inflight == 0:
+                break
         return self.results
 
     def _dispatch(self, batch) -> None:
@@ -228,11 +256,9 @@ class Conductor:
             ),
         )
 
-    def _process_done(self, raw: bytes) -> None:
+    def _process_done(self, msg: dict) -> None:
         """Route a worker's `done` message: mint output uuids, record their
         SHM location, and route via complete_batch."""
-        msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
-        assert msg["t"] == "done"
         # Mint uuids for the worker's outputs + record their SHM location.
         outputs = {}
         for rid, named in msg["outputs"].items():
@@ -253,9 +279,11 @@ class Conductor:
         rid = event["request_id"]
         if event["type"] == "emission":
             tensors = [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in event["tensors"]]
-            self.results[rid].append(
-                self.model.postprocess(event["name"], event["modality"], tensors)
-            )
+            value = self.model.postprocess(event["name"], event["modality"], tensors)
+            self.results[rid].append(value)
+            # Stream this emission to the frontend, if one is attached.
+            if self.on_token is not None and rid in self._front_rid:
+                self.on_token(self._front_rid[rid], value)
         elif event["type"] == "walk_done":
             persist = {
                 name: [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in refs]
@@ -269,8 +297,31 @@ class Conductor:
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
                     self.finished.add(rid)  # signal the serving layer
+                    front = self._front_rid.pop(rid, None)
+                    if self.on_done is not None and front is not None:
+                        self.on_done(front)
             else:
                 self._start_walk(rid, nxt)
+
+    # -- frontend serving --
+
+    def serve_frontend(self) -> None:
+        """Run forever as a streaming backend for the Rust axum frontend.
+
+        The frontend sends `submit` messages (token-ids) on our inbox; we wire
+        each per-token emission and the request-complete signal back to it over
+        the same `Mailbox` mesh as msgpack. `submit`/`done`/`token` are the
+        only messages that cross this seam — tensor bytes never do (those move
+        worker<->conductor through SHM)."""
+        self.on_token = lambda front_rid, value: self.mbox.send(
+            "frontend",
+            msgpack.packb({"t": "token", "rid": front_rid, "id": int(value)}),
+        )
+        self.on_done = lambda front_rid: self.mbox.send(
+            "frontend", msgpack.packb({"t": "done", "rid": front_rid})
+        )
+        while True:
+            self.poll(timeout_ms=20)
 
     def shutdown_workers(self) -> None:
         for worker in set(self.node_to_worker.values()):

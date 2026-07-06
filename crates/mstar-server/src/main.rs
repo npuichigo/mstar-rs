@@ -6,13 +6,19 @@
 //! exactly the layer vLLM and SGLang moved to Rust. The conductor stays
 //! Python (model policy, per-forward-pass, off the hot path); this frontend
 //! talks to it over the `mstar-comm` `Mailbox` (submit token-ids, receive a
-//! token-id stream — wired in the next increment).
+//! token-id stream) — see `bridge`.
 //!
-//! Increment 1 (this file): a self-contained, runnable server proving the
-//! architecture — `/tokenize`, `/detokenize`, and a streaming
-//! `/v1/chat/completions` whose token source is a local mock generator, with
-//! incremental detokenization + OpenAI-style SSE, entirely off the GIL.
+//! Two token sources, selected at startup by whether a conductor socket dir
+//! is passed:
+//!   - **real** (socket dir given): submit token-ids to the Python conductor
+//!     over the Mailbox, stream the generated token-ids back (`sse_from_stream`).
+//!   - **mock** (no socket dir): a self-contained generator that echoes the
+//!     prompt tokens (`mockgen`) — proves the HTTP/tokenize/detok/SSE layer
+//!     standalone, no conductor needed.
+//! Either way, tokenization, incremental detokenization, and SSE
+//! serialization all happen in Rust, off the GIL.
 
+mod bridge;
 mod tokenizer;
 
 use std::sync::Arc;
@@ -27,27 +33,36 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use bridge::{Bridge, StreamItem};
 use tokenizer::Tok;
 
 #[derive(Clone)]
 struct AppState {
     tok: Arc<Tok>,
+    /// Present when a conductor socket dir is given: real streaming via the
+    /// Mailbox bridge. Absent: the self-contained mock generator.
+    bridge: Option<Arc<Bridge>>,
 }
 
 #[tokio::main]
 async fn main() {
     let tokenizer_path = std::env::args()
         .nth(1)
-        .expect("usage: mstar-server <tokenizer.json> [port]");
+        .expect("usage: mstar-server <tokenizer.json> [port] [conductor_socket_dir]");
     let port: u16 = std::env::args()
         .nth(2)
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
+    let socket_dir = std::env::args().nth(3);
 
     eprintln!("loading tokenizer: {tokenizer_path}");
     let tok = Arc::new(Tok::from_file(&tokenizer_path).expect("load tokenizer"));
     eprintln!("tokenizer loaded ({} vocab)", tok.vocab_size());
-    let state = AppState { tok };
+    let bridge = socket_dir.map(|dir| {
+        eprintln!("bridging to conductor at {dir}");
+        Arc::new(Bridge::new(&dir).expect("bind bridge"))
+    });
+    let state = AppState { tok, bridge };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -110,6 +125,7 @@ struct ChatReq {
     messages: Vec<ChatMessage>,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    #[allow(dead_code)] // accepted for OpenAI compatibility; we always stream
     #[serde(default)]
     stream: bool,
 }
@@ -139,21 +155,81 @@ async fn chat_completions(
         .last()
         .map(|m| m.content.clone())
         .unwrap_or_default();
+    let prompt_ids = st.tok.encode(&prompt);
 
-    // Mock "generation": echo the prompt's own token stream back, capped.
-    let mut gen_ids = st.tok.encode(&prompt);
-    gen_ids.truncate(req.max_tokens);
-
-    let tok = st.tok.clone();
-    let stream = mockgen::sse_per_token(tok, gen_ids);
+    let stream: futures::future::Either<_, _> = match &st.bridge {
+        // Real path: submit token-ids to the conductor, stream the generated
+        // token-ids back, detokenize incrementally in Rust.
+        Some(b) => {
+            let (_rid, rx) = b.submit(prompt_ids, req.max_tokens as u32);
+            futures::future::Either::Left(sse_from_stream(st.tok.clone(), rx))
+        }
+        // Mock path: echo the prompt tokens (self-contained, no conductor).
+        None => {
+            let mut ids = prompt_ids;
+            ids.truncate(req.max_tokens);
+            futures::future::Either::Right(mockgen::sse_per_token(st.tok.clone(), ids))
+        }
+    };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// SSE from a live token-id stream (the bridge path): each token is
+/// detokenized against the running prefix and emitted as a delta chunk;
+/// `Done` closes with a finish chunk + `[DONE]`.
+fn sse_from_stream(
+    tok: Arc<Tok>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
+) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
+    enum Phase {
+        Stream,
+        Finish,
+        End,
+    }
+    let init = (rx, tok, Vec::<u32>::new(), String::new(), Phase::Stream);
+    futures::stream::unfold(init, |(mut rx, tok, mut ids, mut emitted, phase)| async move {
+        match phase {
+            Phase::Stream => match rx.recv().await {
+                Some(StreamItem::Token(id)) => {
+                    ids.push(id);
+                    let full = tok.decode(&ids);
+                    let piece = if full.len() > emitted.len() && full.starts_with(&emitted) {
+                        let p = full[emitted.len()..].to_string();
+                        emitted = full;
+                        p
+                    } else {
+                        String::new()
+                    };
+                    let chunk = json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [{"delta": {"content": piece}, "index": 0, "finish_reason": null}],
+                    });
+                    let ev = Ok(Event::default().data(chunk.to_string()));
+                    Some((ev, (rx, tok, ids, emitted, Phase::Stream)))
+                }
+                _ => {
+                    let done = json!({
+                        "object": "chat.completion.chunk",
+                        "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
+                    });
+                    let ev = Ok(Event::default().data(done.to_string()));
+                    Some((ev, (rx, tok, ids, emitted, Phase::Finish)))
+                }
+            },
+            Phase::Finish => {
+                let ev = Ok(Event::default().data("[DONE]"));
+                Some((ev, (rx, tok, ids, emitted, Phase::End)))
+            }
+            Phase::End => None,
+        }
+    })
+}
+
 /// Mock token source: build the per-token SSE events eagerly and replay them
-/// as a stream. Increment 2 replaces this with events produced as token-ids
-/// arrive from the conductor over the Mailbox — the tokenization,
-/// incremental detokenization, and SSE serialization stay identical (all
-/// Rust, off the GIL); only the token *source* changes.
+/// as a stream. Used when no conductor is attached — the real path
+/// (`sse_from_stream`) produces the same SSE from token-ids arriving over the
+/// Mailbox; only the token *source* differs (tokenization, incremental
+/// detokenization, and SSE serialization stay identical, all Rust off the GIL).
 mod mockgen {
     use super::*;
     use futures::stream;
