@@ -155,6 +155,8 @@ class Conductor:
         # uuid -> descriptor for every tensor the runtime is routing.
         self.desc: dict[int, list] = {}
         self.results: dict[int, list[Any]] = {}
+        self._inflight = 0        # batches dispatched but not yet completed
+        self.finished: set[int] = set()  # request ids whose request completed
 
     # -- request ingestion --
 
@@ -182,17 +184,30 @@ class Conductor:
 
     # -- the drive loop --
 
+    def poll(self, timeout_ms: int = 5) -> bool:
+        """One non-blocking drive step across ALL active requests (continuous
+        batching): dispatch every ready batch, then drain the completions
+        that have arrived. Returns True if anything progressed. This is the
+        serving primitive — the HTTP layer runs it in a background thread
+        while requests stream in and out concurrently."""
+        did = False
+        while (batch := self.runtime.next_batch(self.max_batch_size)) is not None:
+            self._dispatch(batch)
+            self._inflight += 1
+            did = True
+        if self._inflight:
+            raw = self.mbox.recv_timeout(timeout_ms)
+            while raw is not None:
+                self._process_done(raw)
+                self._inflight -= 1
+                did = True
+                raw = self.mbox.try_recv()
+        return did
+
     def run_until_idle(self) -> dict[int, list[Any]]:
-        pending = 0
-        while True:
-            batch = self.runtime.next_batch(self.max_batch_size)
-            if batch is not None:
-                self._dispatch(batch)
-                pending += 1
-            elif pending == 0:
-                break
-            if pending:
-                pending -= self._drain_done()
+        """Drive until no request has work left (used by the batch demo)."""
+        while self.poll(timeout_ms=2000) or self._inflight:
+            pass
         return self.results
 
     def _dispatch(self, batch) -> None:
@@ -213,12 +228,9 @@ class Conductor:
             ),
         )
 
-    def _drain_done(self) -> int:
-        """Process one completion if available; returns 1 if it finished a
-        batch, else 0 (so the caller keeps the in-flight count right)."""
-        raw = self.mbox.recv_timeout(2000)
-        if raw is None:
-            return 0
+    def _process_done(self, raw: bytes) -> None:
+        """Route a worker's `done` message: mint output uuids, record their
+        SHM location, and route via complete_batch."""
         msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
         assert msg["t"] == "done"
         # Mint uuids for the worker's outputs + record their SHM location.
@@ -236,7 +248,6 @@ class Conductor:
             outputs[rid] = out
         for event in self.runtime.complete_batch(msg["batch_id"], outputs):
             self._handle_event(event)
-        return 1
 
     def _handle_event(self, event: dict) -> None:
         rid = event["request_id"]
@@ -257,6 +268,7 @@ class Conductor:
             if nxt is None:
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
+                    self.finished.add(rid)  # signal the serving layer
             else:
                 self._start_walk(rid, nxt)
 
