@@ -1,0 +1,18 @@
+[package]
+name = "mstar-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mstar-server"
+path = "src/main.rs"
+
+[dependencies]
+mstar-comm = { path = "../mstar-comm" }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = "0.3"
