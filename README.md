@@ -96,7 +96,7 @@ capture), on the same otherwise-idle GPU.
 |---|---|---|---|---|
 | **V-JEPA 2** ViT-L | bf16 autocast + `torch.compile` | 1172 ms | **380 ms** | mstar-rs **3.1× faster** |
 | **Pi0.5** | bf16 + FlashInfer paged attn + CUDA-graph decode | 74.8 ms | **57.6 ms** | mstar-rs **1.3× faster** |
-| **Orpheus** (RTF) | bf16 + FlashInfer + CUDA-graph decode | **0.345** | 0.409 | mstar **1.2× faster** (why below) |
+| **Orpheus** (RTF) | bf16 + FlashInfer + CUDA-graph decode **incl. in-graph sampler + SNAC** | 0.345 | **0.349** | **matched** (≈1%) |
 | **control plane** (no-op, 2-node walk) | like-for-like | 184 µs¹ | **79 µs** | the layer mstar-rs rewrites |
 
 vjepa2/pi05 are e2e request latency (20 iters); orpheus is RTF = wall/audio-seconds
@@ -106,19 +106,26 @@ scheduler, tensor store, ZMQ, pickle; the Rust number is the whole runtime.
 **Reading the results.** mstar-rs wins decisively when per-request serving overhead
 dominates (vjepa2, pi05: HTTP + ZMQ + pickle + SHM hops that the in-process runtime
 eliminates — part of the gap is architecture, not language, but removing those hops for
-single-GPU deployment is the design). The advantage shrinks as the autoregressive decode
-loop comes to dominate wall-clock and amortizes the serving overhead — and **orpheus is
-where mstar's more mature engine edges ahead**: it CUDA-graphs the SNAC decoder (5 shape
-buckets, ~40 invocations/request) and the sampler, while mstar-rs graphs only the LLM
-decode step and runs SNAC + sampling eager. That's the entire ~1.2× gap and it's a known,
-closable optimization — at the cost of mstar's ~10-minute warmup (37 LLM + 5 SNAC graph
-captures across buckets) versus mstar-rs's ~1 second (one decode graph per shape). The
-control-plane row is the pure like-for-like: the Rust runtime is **>2× faster** than even
-mstar's graph-IO layer in isolation, and its share of any real request is ~0.1-0.3%.
+single-GPU deployment is the design). As the autoregressive decode loop comes to dominate
+wall-clock, that advantage amortizes away and it comes down to graphing the same kernels
+mstar graphs. **Orpheus reaches parity once the whole decode step is captured to match
+mstar** — the LLM forward, the sampler (`CudaGraphableSampler`, in-graph seeded sampling),
+and the SNAC decoder. Profiling was decisive here: the eager sampler cost ~4.4 ms/token —
+*more than the entire 28-layer LLM decode* — and folding it into the graph (as mstar does)
+took RTF 0.408 → 0.349. The residual ~1% is the synchronous Python driver loop sitting on
+the critical path (mstar's worker overlaps host work with GPU via an async pipeline; the
+mstar-rs v0 driver does not yet) — a driver-maturity gap, not a language one: the
+control-plane row shows the Rust runtime is **>2× faster** than even mstar's graph-IO layer
+in isolation, and its share of any real request is ~0.1-0.3%. Driving the AR loop from Rust
+(no per-token Python/PyO3 crossing) would remove that residual.
 
 **Numerical fidelity** (all verified vs independent dense references sharing no runtime
-code): pi05 actions max_abs_diff 7.0e-3 / cosine 0.999986; orpheus greedy tokens
-**bit-exact 81/81**; vjepa2 predictor bit-exact. The engine (`python/mstar_rs/fi.py`)
+code): pi05 actions max_abs_diff 7.0e-3 / cosine 0.999986; vjepa2 predictor bit-exact;
+orpheus LLM data plane (KV / attention / RoPE) **bit-exact 81/81** greedy tokens via the
+eager-argmax path, and the in-graph sampler is separately verified capture-faithful
+(identical token eager-vs-graphed on identical inputs — greedy isn't argmax-reproducible
+because mstar encodes it as `top_k=1`, which breaks flat-codebook ties differently). The
+engine (`python/mstar_rs/fi.py`)
 mirrors mstar's recipe exactly — same KV layout `[L, pages, 2, page_size, kvh, hd]`,
 `BatchPrefillWithPagedKVCacheWrapper("NHD")` planned from CPU int32 page tables,
 fancy-indexed K/V writes, FlashInfer RoPE — so mstar's transformer modules run unmodified.
