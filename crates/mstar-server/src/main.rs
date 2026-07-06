@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use bridge::{Bridge, StreamItem};
-use tokenizer::Tok;
+use tokenizer::{IncrementalDecoder, Tok};
 
 #[derive(Clone)]
 struct AppState {
@@ -175,8 +175,8 @@ async fn chat_completions(
 }
 
 /// SSE from a live token-id stream (the bridge path): each token is
-/// detokenized against the running prefix and emitted as a delta chunk;
-/// `Done` closes with a finish chunk + `[DONE]`.
+/// detokenized incrementally (same `IncrementalDecoder` as the mock path) and
+/// emitted as a delta chunk; `Done` closes with a finish chunk + `[DONE]`.
 fn sse_from_stream(
     tok: Arc<Tok>,
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
@@ -186,26 +186,18 @@ fn sse_from_stream(
         Finish,
         End,
     }
-    let init = (rx, tok, Vec::<u32>::new(), String::new(), Phase::Stream);
-    futures::stream::unfold(init, |(mut rx, tok, mut ids, mut emitted, phase)| async move {
+    let init = (rx, IncrementalDecoder::new(tok), Phase::Stream);
+    futures::stream::unfold(init, |(mut rx, mut detok, phase)| async move {
         match phase {
             Phase::Stream => match rx.recv().await {
                 Some(StreamItem::Token(id)) => {
-                    ids.push(id);
-                    let full = tok.decode(&ids);
-                    let piece = if full.len() > emitted.len() && full.starts_with(&emitted) {
-                        let p = full[emitted.len()..].to_string();
-                        emitted = full;
-                        p
-                    } else {
-                        String::new()
-                    };
+                    let piece = detok.step(id).unwrap_or_default();
                     let chunk = json!({
                         "object": "chat.completion.chunk",
                         "choices": [{"delta": {"content": piece}, "index": 0, "finish_reason": null}],
                     });
                     let ev = Ok(Event::default().data(chunk.to_string()));
-                    Some((ev, (rx, tok, ids, emitted, Phase::Stream)))
+                    Some((ev, (rx, detok, Phase::Stream)))
                 }
                 _ => {
                     let done = json!({
@@ -213,12 +205,12 @@ fn sse_from_stream(
                         "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
                     });
                     let ev = Ok(Event::default().data(done.to_string()));
-                    Some((ev, (rx, tok, ids, emitted, Phase::Finish)))
+                    Some((ev, (rx, detok, Phase::Finish)))
                 }
             },
             Phase::Finish => {
                 let ev = Ok(Event::default().data("[DONE]"));
-                Some((ev, (rx, tok, ids, emitted, Phase::End)))
+                Some((ev, (rx, detok, Phase::End)))
             }
             Phase::End => None,
         }
@@ -238,7 +230,7 @@ mod mockgen {
         tok: Arc<Tok>,
         ids: Vec<u32>,
     ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-        let mut detok = tok.decode_stream();
+        let mut detok = IncrementalDecoder::new(tok);
         let mut events: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
         for id in ids {
             if let Some(piece) = detok.step(id) {

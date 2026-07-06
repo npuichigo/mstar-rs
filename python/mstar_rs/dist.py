@@ -26,6 +26,7 @@ dtype)` descriptors.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import msgpack
@@ -166,6 +167,7 @@ class Conductor:
         self.on_token = None      # callable(front_rid, value)
         self.on_done = None       # callable(front_rid)
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
+        self._stop = threading.Event()  # graceful shutdown for serve_frontend
 
     # -- request ingestion --
 
@@ -206,9 +208,11 @@ class Conductor:
             self._dispatch(batch)
             self._inflight += 1
             did = True
-        # Block briefly only when there is in-flight work to wait on; otherwise
-        # peek non-blocking so an idle conductor still notices new submits.
-        raw = self.mbox.recv_timeout(timeout_ms) if self._inflight else self.mbox.try_recv()
+        # Block up to `timeout_ms` for the first message, then drain whatever
+        # else is queued non-blocking. Blocking (rather than a bare try_recv)
+        # is what keeps an idle conductor asleep instead of spinning a core —
+        # recv_timeout wakes on either a worker `done` or a new `submit`.
+        raw = self.mbox.recv_timeout(timeout_ms)
         while raw is not None:
             did = True
             self._handle_message(raw)
@@ -320,8 +324,16 @@ class Conductor:
         self.on_done = lambda front_rid: self.mbox.send(
             "frontend", msgpack.packb({"t": "done", "rid": front_rid})
         )
-        while True:
+        # Short poll timeout bounds shutdown latency: after stop() the loop
+        # returns from the blocking recv within this window and exits, so the
+        # thread is joinable before interpreter teardown (a daemon thread stuck
+        # in a native recv at finalization cores the process).
+        while not self._stop.is_set():
             self.poll(timeout_ms=20)
+
+    def stop(self) -> None:
+        """Signal serve_frontend to exit; join the serving thread after this."""
+        self._stop.set()
 
     def shutdown_workers(self) -> None:
         for worker in set(self.node_to_worker.values()):

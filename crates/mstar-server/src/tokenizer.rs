@@ -4,6 +4,8 @@
 //! token-id arrives, emit only the *new* text, handling multi-byte /
 //! partial-token boundaries.
 
+use std::sync::Arc;
+
 use tokenizers::Tokenizer;
 
 pub struct Tok {
@@ -32,40 +34,44 @@ impl Tok {
         self.inner.decode(ids, true).unwrap_or_default()
     }
 
-    /// A streaming detokenizer that emits the incremental text per token,
-    /// buffering incomplete pieces (partial UTF-8 / sub-word) until they
-    /// resolve — the correct behavior for per-token SSE.
-    pub fn decode_stream(&self) -> IncrementalDecoder<'_> {
-        IncrementalDecoder {
-            tok: &self.inner,
-            ids: Vec::new(),
-            emitted: String::new(),
-        }
-    }
 }
 
-/// Prefix-diff incremental decoder: keep the running id list, re-decode, and
-/// emit the suffix beyond what was already emitted. O(n) per step here for
-/// clarity; the O(1) `tokenizers::DecodeStream` is the drop-in for production.
-pub struct IncrementalDecoder<'a> {
-    tok: &'a Tokenizer,
+/// A streaming detokenizer that emits the incremental text per token,
+/// buffering incomplete pieces (partial UTF-8 / sub-word) until they resolve
+/// — the correct behavior for per-token SSE. Owns an `Arc<Tok>` so a single
+/// instance can be threaded through an async stream's state (both the live
+/// bridge path and the mock path use it — one decode implementation, no
+/// hand-rolled prefix-diff at the call site).
+///
+/// Prefix-diff strategy: keep the running id list, re-decode, and emit the
+/// suffix beyond what was already emitted. O(n) per step for clarity; the O(1)
+/// `tokenizers::DecodeStream` is the drop-in when stream length warrants it.
+pub struct IncrementalDecoder {
+    tok: Arc<Tok>,
     ids: Vec<u32>,
     emitted: String,
 }
 
-impl IncrementalDecoder<'_> {
+impl IncrementalDecoder {
+    pub fn new(tok: Arc<Tok>) -> Self {
+        Self {
+            tok,
+            ids: Vec::new(),
+            emitted: String::new(),
+        }
+    }
+
     /// Feed one token-id; return the new text to stream (None if this token
     /// didn't yet resolve to emittable text — e.g. a partial multi-byte char).
     pub fn step(&mut self, id: u32) -> Option<String> {
         self.ids.push(id);
-        let full = self.tok.decode(&self.ids, true).unwrap_or_default();
+        let full = self.tok.decode(&self.ids);
         if full.len() <= self.emitted.len() || !full.starts_with(&self.emitted) {
             // The decode didn't extend our stable prefix yet; hold.
             return None;
         }
         let piece = full[self.emitted.len()..].to_string();
-        // Only commit text up to the last complete UTF-8 boundary (decode
-        // already yields valid UTF-8, so `full` is safe; commit all of it).
+        // decode() already yields valid UTF-8, so `full` is safe to commit.
         self.emitted = full;
         Some(piece)
     }

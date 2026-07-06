@@ -75,7 +75,8 @@ def main() -> int:
     from mstar_rs.models.echo import EchoAR
 
     cond = Conductor(EchoAR(), node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
-    threading.Thread(target=cond.serve_frontend, daemon=True).start()
+    serve_thread = threading.Thread(target=cond.serve_frontend, daemon=True)
+    serve_thread.start()
     print("conductor serving")
 
     # 3) Rust axum frontend, pointed at the same socket dir
@@ -128,6 +129,8 @@ def main() -> int:
         ok = got.strip() != "" and prompt.startswith(got.strip()[:10])
     finally:
         server.terminate()
+        cond.stop()
+        serve_thread.join(timeout=2)  # exit the serving loop before teardown
         cond.shutdown_workers()
         worker.join(timeout=3)
 
