@@ -176,6 +176,9 @@ pub struct StreamBuffer {
     consumed: usize,
     chunks_popped: u64,
     pub producer_done: bool,
+    /// Whether the terminal (`is_final`) chunk has already been popped. Guards
+    /// the empty-buffer-at-done path so exactly one final chunk is emitted.
+    final_emitted: bool,
 }
 
 impl StreamBuffer {
@@ -186,6 +189,7 @@ impl StreamBuffer {
             consumed: 0,
             chunks_popped: 0,
             producer_done: false,
+            final_emitted: false,
         }
     }
 
@@ -213,6 +217,14 @@ impl StreamBuffer {
             if self.policy.continue_after_producer_done() {
                 return true; // keep emitting empty chunks
             }
+            // Buffer already emptied (e.g. a non-overlapping policy drained it
+            // on an ordinary pop before producer-done). We must still emit ONE
+            // terminal chunk so its `is_final` sets `stream_done` — otherwise
+            // the consumer partition, which finishes only on `stream_done`,
+            // hangs forever. Guarded by `final_emitted` so it fires once.
+            if !self.final_emitted {
+                return true;
+            }
         }
         self.policy.is_ready(len)
     }
@@ -239,6 +251,9 @@ impl StreamBuffer {
         let is_final = self.producer_done
             && self.buffer.is_empty()
             && !self.policy.continue_after_producer_done();
+        if is_final {
+            self.final_emitted = true;
+        }
         let chunk = StreamChunk {
             items,
             chunk_index: self.chunks_popped,
@@ -317,6 +332,39 @@ mod tests {
         let c = buf.pop_chunk();
         assert_eq!(ids(&c), vec![2, 3]);
         assert!(c.is_final);
+    }
+
+    #[test]
+    fn fixed_policy_drained_before_done_still_emits_final_chunk() {
+        // Regression: a non-overlapping policy can drain the buffer to empty on
+        // an ordinary pop BEFORE producer-done. The terminal `is_final` chunk
+        // must still fire on signal_done, or the consumer partition hangs.
+        let mut buf = StreamBuffer::new(ChunkPolicySpec::Fixed {
+            chunk_size: 4,
+            continue_after_done: false,
+        });
+        for i in 0..8 {
+            buf.push(vec![t(i)]);
+        }
+        let c = buf.pop_chunk();
+        assert_eq!(ids(&c), vec![0, 1, 2, 3]);
+        assert!(!c.is_final);
+        let c = buf.pop_chunk();
+        assert_eq!(ids(&c), vec![4, 5, 6, 7]);
+        assert!(!c.is_final, "producer not done yet");
+        assert!(!buf.has_chunk_ready(), "buffer empty, producer not done");
+
+        // Producer signals done with an ALREADY-EMPTY buffer.
+        buf.signal_done();
+        assert!(
+            buf.has_chunk_ready(),
+            "must still deliver a terminal chunk so stream_done fires"
+        );
+        let c = buf.pop_chunk();
+        assert!(c.items.is_empty());
+        assert!(c.is_final, "terminal chunk carries is_final");
+        assert!(!buf.has_chunk_ready(), "exactly one terminal chunk");
+        assert_eq!(buf.consumed(), 8);
     }
 
     #[test]

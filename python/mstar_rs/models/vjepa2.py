@@ -90,6 +90,10 @@ class VJEPA2(Model):
         pixel_values = request["pixel_values_videos"]
         if pixel_values.dim() == 4:  # [T, C, H, W] -> add batch dim
             pixel_values = pixel_values.unsqueeze(0)
+        # Move to the model's device/dtype so a request that bypassed
+        # preprocess_video doesn't hit a device/dtype mismatch in the encoder
+        # (mirrors pi05's initial_inputs).
+        pixel_values = pixel_values.to(self.device, self.dtype)
         walk = request.get("walk", "prefill_video")
         return walk, [("video_encoder", "video_frames", [pixel_values])]
 

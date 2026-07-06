@@ -49,6 +49,18 @@ _DTYPE_TO_STR = {
 _STR_TO_DTYPE = {v: k for k, v in _DTYPE_TO_STR.items()}
 
 
+def _dtype_str(dtype: torch.dtype) -> str:
+    """Map a torch dtype to its wire tag, with a clear error for unsupported
+    dtypes (e.g. fp8/float64) instead of a bare KeyError that would kill the
+    batch — and, in the worker, the process."""
+    try:
+        return _DTYPE_TO_STR[dtype]
+    except KeyError:
+        raise TypeError(
+            f"dtype {dtype} cannot cross the SHM seam; add it to _DTYPE_TO_STR"
+        ) from None
+
+
 class ShmPool:
     """One owned arena (this entity's producer buffer) + a cache of opened
     peer arenas for reading. A descriptor is
@@ -67,7 +79,7 @@ class ShmPool:
         if nbytes:  # torch.frombuffer rejects an empty buffer
             mv = memoryview(self.arena)[off:off + nbytes]
             torch.frombuffer(mv, dtype=t.dtype).copy_(t.flatten())
-        return [self.name, off, nbytes, list(t.shape), _DTYPE_TO_STR[t.dtype]]
+        return [self.name, off, nbytes, list(t.shape), _dtype_str(t.dtype)]
 
     def read(self, desc: list) -> torch.Tensor:
         name, off, nbytes, dims, dtype_str = desc
@@ -106,33 +118,56 @@ class Worker:
             if raw is None:
                 continue
             msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
-            if msg["t"] == "shutdown":
+            t = msg["t"]
+            if t == "shutdown":
                 return
-            if msg["t"] == "execute":
+            if t == "execute":
                 self._handle_execute(msg)
+            elif t == "free":
+                # Conductor reclaims a finished request's tensors: release our
+                # arena offsets (all were read/cloned by the conductor already).
+                for off in msg["offs"]:
+                    self.shm.arena.free(off)
 
     def _handle_execute(self, msg: dict) -> None:
-        # inputs: {rid: {name: [descriptor, ...]}}
-        inputs = {
-            int(rid): {
-                name: [self.shm.read(d).to(self.device) for d in descs]
-                for name, descs in named.items()
+        batch_id = msg["batch_id"]
+        rids = [int(rid) for rid in msg["inputs"].keys()]
+        try:
+            # inputs: {rid: {name: [descriptor, ...]}}
+            inputs = {
+                int(rid): {
+                    name: [self.shm.read(d).to(self.device) for d in descs]
+                    for name, descs in named.items()
+                }
+                for rid, named in msg["inputs"].items()
             }
-            for rid, named in msg["inputs"].items()
-        }
-        kv = msg.get("kv")  # reserved for KV models; None for stateless
-        outputs = self.model.execute(msg["node"], msg["walk"], inputs, kv=kv)
-        # Stage every output tensor into our arena; reply with descriptors.
-        out_desc = {
-            rid: {
-                name: [self.shm.stage(t) for t in tensors]
-                for name, tensors in named.items()
+            kv = msg.get("kv")  # reserved for KV models; None for stateless
+            outputs = self.model.execute(msg["node"], msg["walk"], inputs, kv=kv)
+            # check_stop: report loops the model wants terminated this pass
+            # (the conductor replays them before complete_batch).
+            stops = self.model.loops_to_finish()
+            # Stage every output tensor into our arena; reply with descriptors.
+            out_desc = {
+                rid: {
+                    name: [self.shm.stage(t) for t in tensors]
+                    for name, tensors in named.items()
+                }
+                for rid, named in outputs.items()
             }
-            for rid, named in outputs.items()
-        }
+        except Exception as e:  # never let one bad batch kill the worker
+            import traceback
+
+            traceback.print_exc()
+            self.mbox.send(
+                "conductor",
+                msgpack.packb({"t": "error", "batch_id": batch_id, "rids": rids, "msg": repr(e)}),
+            )
+            return
         self.mbox.send(
             "conductor",
-            msgpack.packb({"t": "done", "batch_id": msg["batch_id"], "outputs": out_desc}),
+            msgpack.packb(
+                {"t": "done", "batch_id": batch_id, "outputs": out_desc, "stops": stops}
+            ),
         )
 
 
@@ -159,7 +194,12 @@ class Conductor:
         self.shm = ShmPool("conductor")
         # uuid -> descriptor for every tensor the runtime is routing.
         self.desc: dict[int, list] = {}
+        # request id -> uuids minted for it, so SHM/descriptors can be reclaimed
+        # when the request finishes (mirrors the single-process store's
+        # free_request; without it the arenas and `desc` grow without bound).
+        self._req_uuids: dict[int, list[int]] = {}
         self.results: dict[int, list[Any]] = {}
+        self.errors: dict[int, str] = {}  # request id -> worker error message
         self._inflight = 0        # batches dispatched but not yet completed
         self.finished: set[int] = set()  # request ids whose request completed
         # Serving hooks (set by a frontend bridge): stream each emission and
@@ -174,9 +214,10 @@ class Conductor:
     def submit(self, request: dict[str, Any]) -> int:
         rid = self.runtime.add_request()
         request = dict(request, request_id=rid)
+        self.results[rid] = []
+        self._req_uuids[rid] = []
         for nxt in self.model.initial_walks(request):
             self._start_walk(rid, nxt)
-        self.results[rid] = []
         return rid
 
     def _start_walk(self, rid: int, next_walk) -> None:
@@ -189,7 +230,8 @@ class Conductor:
             for t in tensors:
                 uuid = self.runtime.new_uuid()
                 self.desc[uuid] = self.shm.stage(t)  # seed -> SHM
-                refs.append((uuid, list(t.shape), _DTYPE_TO_STR[t.dtype]))
+                self._req_uuids.setdefault(rid, []).append(uuid)
+                refs.append((uuid, list(t.shape), _dtype_str(t.dtype)))
             seeded.append((node, name, refs))
         self.runtime.start_walk(rid, walk, seeded, kv_appends, kv_scratch)
 
@@ -220,12 +262,17 @@ class Conductor:
         return did
 
     def _handle_message(self, raw: bytes) -> None:
-        """Demux an inbox message by type: worker completion vs new request."""
+        """Demux an inbox message by type: worker completion, worker error, or
+        a new request from a frontend."""
         msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
-        if msg["t"] == "done":
+        t = msg["t"]
+        if t == "done":
             self._process_done(msg)
             self._inflight -= 1
-        elif msg["t"] == "submit":
+        elif t == "error":
+            self._process_error(msg)
+            self._inflight -= 1
+        elif t == "submit":
             self._ingest_submit(msg)
 
     def _ingest_submit(self, msg: dict) -> None:
@@ -262,7 +309,8 @@ class Conductor:
 
     def _process_done(self, msg: dict) -> None:
         """Route a worker's `done` message: mint output uuids, record their
-        SHM location, and route via complete_batch."""
+        SHM location, replay any loop-finish signals the worker detected during
+        execute, and route via complete_batch."""
         # Mint uuids for the worker's outputs + record their SHM location.
         outputs = {}
         for rid, named in msg["outputs"].items():
@@ -273,11 +321,33 @@ class Conductor:
                 for d in descs:
                     uuid = self.runtime.new_uuid()
                     self.desc[uuid] = d
+                    self._req_uuids.setdefault(rid, []).append(uuid)
                     refs.append((uuid, d[3], d[4]))  # (uuid, dims, dtype)
                 out[name] = refs
             outputs[rid] = out
+        # check_stop -> STOP_LOOPS: the worker ran execute (where a model
+        # detects EOS), so it reports the loops to finish; replay them here
+        # BEFORE complete_batch so the loop terminates this iteration rather
+        # than advancing (mirrors the single-process Driver ordering). Without
+        # this, a looping model served through the conductor never stops early.
+        for rid, loop_name in msg.get("stops", []):
+            self.runtime.signal_loop_finish(int(rid), loop_name)
         for event in self.runtime.complete_batch(msg["batch_id"], outputs):
             self._handle_event(event)
+
+    def _process_error(self, msg: dict) -> None:
+        """A worker raised during execute: fail every request in that batch so
+        the serving layer resolves (instead of hanging on a dead worker) and
+        its SHM is reclaimed."""
+        detail = msg.get("msg", "worker error")
+        for rid in msg.get("rids", []):
+            rid = int(rid)
+            self.errors[rid] = detail
+            try:
+                self.runtime.finish_request(rid)
+            except Exception:
+                pass  # request may already be gone; failing it is best-effort
+            self._finish_request(rid)
 
     def _handle_event(self, event: dict) -> None:
         rid = event["request_id"]
@@ -300,12 +370,42 @@ class Conductor:
             if nxt is None:
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
-                    self.finished.add(rid)  # signal the serving layer
-                    front = self._front_rid.pop(rid, None)
-                    if self.on_done is not None and front is not None:
-                        self.on_done(front)
+                    self._finish_request(rid)
             else:
                 self._start_walk(rid, nxt)
+
+    def _finish_request(self, rid: int) -> None:
+        """A request completed (or failed): reclaim its SHM + descriptors, then
+        do path-appropriate bookkeeping. A frontend bridge already streamed the
+        output, so drop the server-side buffers and fire on_done; the FastAPI
+        path retains `results`/`finished` for the drive thread to consume."""
+        self._reclaim(rid)
+        front = self._front_rid.pop(rid, None)
+        if self.on_done is not None:
+            if front is not None:
+                self.on_done(front)
+            self.results.pop(rid, None)  # streamed already; don't accumulate
+        else:
+            self.finished.add(rid)  # FastAPI drive thread consumes + pops
+
+    def _reclaim(self, rid: int) -> None:
+        """Free every SHM offset + descriptor minted for `rid`. Conductor-owned
+        offsets are freed locally; worker-owned offsets are freed by messaging
+        the owning worker (safe now — by request-finish every tensor has been
+        read/cloned out of SHM). Without this the arenas fill and `desc` grows
+        unbounded across a serving run."""
+        by_worker: dict[str, list[int]] = {}
+        for uuid in self._req_uuids.pop(rid, []):
+            desc = self.desc.pop(uuid, None)
+            if desc is None:
+                continue
+            arena_name, off = desc[0], desc[1]
+            if arena_name == self.shm.name:
+                self.shm.arena.free(off)
+            else:  # arena name is f"mstar_rs_{worker_id}"
+                by_worker.setdefault(arena_name[len("mstar_rs_"):], []).append(off)
+        for worker_id, offs in by_worker.items():
+            self.mbox.send(worker_id, msgpack.packb({"t": "free", "offs": offs}))
 
     # -- frontend serving --
 

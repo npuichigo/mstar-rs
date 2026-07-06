@@ -40,6 +40,11 @@ class EchoAR(Model):
 
     def initial_inputs(self, request: dict[str, Any]) -> tuple[str, WalkInputs]:
         tokens = list(request["tokens"])[: request.get("max_tokens", len(request["tokens"]))]
+        if not tokens:
+            # An empty prompt (or max_tokens=0) has nothing to echo; the gen
+            # walk always emits one token, so guard here instead of emitting an
+            # empty tensor that would crash postprocess's `.item()`.
+            raise ValueError("EchoAR requires at least one prompt token (after max_tokens)")
         state = torch.tensor(tokens, dtype=torch.int64)
         return "gen", [("step", "state", [state])]
 

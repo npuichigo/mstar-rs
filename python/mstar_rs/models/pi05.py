@@ -181,6 +181,17 @@ class PI05(Model):
 
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
+        # action_gen replays ONE captured CUDA graph over static buffers
+        # (`_g_noisy`/`_g_ts`), so it is strictly single-request: batching >1
+        # request would re-plan the graph mid-loop and alias every output to
+        # the same post-last-request buffer. Fail loud rather than silently
+        # returning one request's actions for another. (bs=1 is how pi05 was
+        # verified bit-exact; per-request graph state is a future extension.)
+        if walk == "action_gen" and len(inputs) > 1:
+            raise RuntimeError(
+                f"pi05 action_gen is single-request (CUDA graph over static "
+                f"buffers); got a batch of {len(inputs)}"
+            )
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
             if node_name == "vit_encoder":
@@ -236,7 +247,7 @@ class PI05(Model):
         self, request_id, partition, walk, fwd_index, persist, stream_done
     ) -> NextWalk | None:
         if walk == "prefill":
-            seed = self._seeds[request_id]
+            seed = self._seeds.pop(request_id)  # consumed once; don't leak
             generator = torch.Generator(device=self.device).manual_seed(seed)
             noisy = torch.randn(
                 self.cfg.action_horizon,

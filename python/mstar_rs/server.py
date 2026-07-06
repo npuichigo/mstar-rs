@@ -40,16 +40,28 @@ class ServingEngine:
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
-        self.cond.shutdown_workers()
+        # Only touch the mailbox from here once the drive thread has actually
+        # exited; otherwise shutdown_workers() would race its poll() sends.
+        if not self._thread.is_alive():
+            self.cond.shutdown_workers()
 
     def submit(self, request: dict[str, Any], timeout: float = 120.0) -> Any:
         """Blocking submit: enqueue, wait for completion, return the result."""
         done = threading.Event()
         self._submit_q.put((request, done))
         if not done.wait(timeout):
+            # Don't leak bookkeeping for a request that never resolved.
+            rid = getattr(done, "_rid", None)
+            if rid is not None:
+                self._futures.pop(rid, None)
+                self._results.pop(rid, None)
             raise TimeoutError("request timed out")
         # rid is stashed on the event by the drive thread.
-        return self._results.pop(done._rid)  # type: ignore[attr-defined]
+        rid = done._rid  # type: ignore[attr-defined]
+        if (err := self.cond.errors.pop(rid, None)) is not None:
+            self._results.pop(rid, None)
+            raise RuntimeError(f"request failed in worker: {err}")
+        return self._results.pop(rid)
 
     def _drive(self) -> None:
         while not self._stop.is_set():

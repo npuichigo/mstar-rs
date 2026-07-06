@@ -118,6 +118,11 @@ class Orpheus(Model):
         )
         self._g_sampled = torch.zeros(1, dtype=torch.long, device=dev)
         self._pending_stops: list[tuple[int, str]] = []
+        # In cuda_graph mode the sampler/decode/SNAC graphs are single-slot
+        # (bs=1 static buffers), so only ONE request may be in flight through
+        # the LLM partition at a time — a second would reset `_g_sampler` state
+        # mid-decode and corrupt the first. Tracked on the conductor instance.
+        self._active_llm_rid: int | None = None
         # CUDA-graph decode state: one graph captures the single-token forward
         # (embed -> 28 layers over the paged cache -> lm_head -> logits) with
         # static token input + logits output. Plan runs outside the graph and
@@ -216,6 +221,13 @@ class Orpheus(Model):
         text_ids = self._tokenize(request.get("prompt", ""), request.get("voice", "tara"))
         seed = request.get("seed", 0)
         if self.cuda_graph:
+            if self._active_llm_rid is not None:
+                raise RuntimeError(
+                    "orpheus cuda_graph mode is single-in-flight (bs=1 sampler/"
+                    f"decode/SNAC graphs); request {self._active_llm_rid} is "
+                    f"still active when {rid} was submitted — serialize requests"
+                )
+            self._active_llm_rid = rid
             self._config_g_sampler(seed)
         else:
             # Per-request eager sampler state (faithful to mstar's config + seed).
@@ -317,6 +329,15 @@ class Orpheus(Model):
 
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
+        # cuda_graph mode replays single-slot graphs (sampler/decode/SNAC) over
+        # bs=1 static buffers; batching >1 request in one execute call would
+        # interleave their state and corrupt every output. Fail loud. (This is
+        # the bs=1 path verified bit-exact; per-request graph state is future
+        # work — see the [bs,V] buffers mstar uses.)
+        if self.cuda_graph and len(inputs) > 1:
+            raise RuntimeError(
+                f"orpheus cuda_graph execute is single-request; got {len(inputs)}"
+            )
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
             if node_name == "LLM":
@@ -391,6 +412,8 @@ class Orpheus(Model):
                     {KV_LABEL: 1},
                 )
             self.sampler.remove_request(str(request_id))
+            if self._active_llm_rid == request_id:
+                self._active_llm_rid = None  # sampler free; a new request may start
             return None  # decode finished -> LLM partition done
         # SNAC: re-arm until the final window is consumed.
         return None if stream_done else ("snac_chunk", [])

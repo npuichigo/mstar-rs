@@ -539,24 +539,54 @@ impl Runtime {
             .inflight
             .remove(&batch_id)
             .ok_or(RuntimeError::UnknownBatch(batch_id))?;
-        if let Some(kv) = &mut self.kv {
-            for (rid, label, append) in &inflight.kv_advances {
-                kv.advance(*rid, label, *append);
-            }
-        }
         let partition = inflight.partition.clone();
-        let mut events = Vec::new();
-        for &rid in &inflight.request_ids {
-            let out = outputs
-                .get(&rid)
-                .ok_or(RuntimeError::MissingOutputs {
+
+        // A request may have been finished or aborted while this batch was in
+        // flight — `finish_request`/`finish_partition` null `pstate.walk`
+        // without removing the batch from `self.inflight`. Completing such a
+        // request is a no-op: it is not "live", so we skip its routing AND its
+        // KV advance rather than dereferencing a `None` walk (which panicked,
+        // surfacing as a PyO3 abort and leaving the runtime inconsistent).
+        let live: Vec<u64> = inflight
+            .request_ids
+            .iter()
+            .copied()
+            .filter(|rid| {
+                self.requests
+                    .get(rid)
+                    .and_then(|r| r.partitions.get(&partition))
+                    .map_or(false, |p| p.walk.is_some())
+            })
+            .collect();
+
+        // Validate outputs for every live request BEFORE mutating any state,
+        // so a missing-output error leaves KV positions untouched (recoverable)
+        // rather than advancing seq_pos for a walk that did not progress.
+        for &rid in &live {
+            if !outputs.contains_key(&rid) {
+                return Err(RuntimeError::MissingOutputs {
                     batch: batch_id,
                     request: rid,
-                })?
-                .clone();
-            let req = self.requests.get_mut(&rid).expect("inflight rid");
-            let pstate = req.partitions.get_mut(&partition).expect("known partition");
-            let walk = pstate.walk.as_mut().expect("inflight walk");
+                });
+            }
+        }
+
+        if let Some(kv) = &mut self.kv {
+            for (rid, label, append) in &inflight.kv_advances {
+                if live.contains(rid) {
+                    kv.advance(*rid, label, *append);
+                }
+            }
+        }
+        let mut events = Vec::new();
+        for &rid in &inflight.request_ids {
+            if !live.contains(&rid) {
+                continue; // finished/aborted while in flight — no-op
+            }
+            let out = outputs.get(&rid).expect("validated live above").clone();
+            let req = self.requests.get_mut(&rid).expect("live rid");
+            let pstate = req.partitions.get_mut(&partition).expect("live partition");
+            let walk = pstate.walk.as_mut().expect("live walk");
             let result = walk.complete_node(&inflight.node, out)?;
             for ev in result.events {
                 match ev {
@@ -711,6 +741,42 @@ mod tests {
     fn tref(rt: &mut Runtime) -> TensorRef {
         let id = rt.new_uuid();
         TensorRef::new(id, vec![1], "float32")
+    }
+
+    #[test]
+    fn complete_batch_after_abort_is_noop_not_panic() {
+        // A request aborted while a batch is in flight: finish_request nulls
+        // the walk without removing the batch from `inflight`. The late
+        // complete_batch must be a no-op, not a `.expect("walk")` panic.
+        let mut rt = Runtime::from_walks_json(VJEPA2_WALKS).unwrap();
+        let rid = rt.add_request();
+        let frames = tref(&mut rt);
+        rt.start_walk(
+            rid,
+            "prefill_video",
+            vec![IncomingInput {
+                node: "video_encoder".into(),
+                name: "video_frames".into(),
+                tensors: vec![frames],
+            }],
+        )
+        .unwrap();
+        let batch = rt.next_batch(8).unwrap().unwrap(); // batch now in flight
+
+        rt.finish_request(rid).unwrap(); // client abort mid-flight
+
+        let hidden = tref(&mut rt);
+        let events = rt
+            .complete_batch(
+                batch.batch_id,
+                BTreeMap::from([(
+                    rid,
+                    BTreeMap::from([("encoder_hidden".to_string(), vec![hidden])]),
+                )]),
+            )
+            .expect("must not error");
+        assert!(events.is_empty(), "aborted request produces no events");
+        assert!(rt.idle());
     }
 
     #[test]
