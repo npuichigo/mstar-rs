@@ -43,6 +43,9 @@ DEFAULT_MODEL_ID = "canopylabs/orpheus-3b-0.1-ft"
 KV_LABEL = "main"
 PAGE_SIZE = 128
 NUM_PAGES = 256  # 32k tokens; prompt is short, decode up to max_output_tokens
+# Last page, reserved for CUDA-graph capture warmup writes (a real request's
+# ascending page allocation never reaches it: prompt + 2048 decode < 20 pages).
+SCRATCH_PAGE = NUM_PAGES - 1
 
 
 class Orpheus(Model):
@@ -51,17 +54,27 @@ class Orpheus(Model):
         model_id: str = DEFAULT_MODEL_ID,
         device: str = "cuda",
         max_output_tokens: int = 2048,
+        greedy: bool = False,
+        cuda_graph: bool = True,
     ) -> None:
+        from mstar.distributed.communication import TPCommGroup
         from mstar.model.orpheus.orpheus_model import OrpheusModel
         from mstar.utils.sampling import Sampler
 
         self.device = torch.device(device)
         self.max_output_tokens = max_output_tokens
+        self.greedy = greedy
+        self.cuda_graph = cuda_graph
         self._mstar = OrpheusModel(model_path_hf=model_id)
         self.cfg = self._mstar.config
         self.tokenizer = self._mstar.tokenizer
+        # Orpheus' lm_head is a ColumnParallelLinear; it needs a TP comm
+        # group even at world_size 1 (mstar's engine passes trivial()).
         llm_sub = self._mstar.get_submodule(
-            "LLM", device=str(device), autocast_dtype=torch.bfloat16
+            "LLM",
+            device=str(device),
+            tp_group=TPCommGroup.trivial(),
+            autocast_dtype=torch.bfloat16,
         )
         self.embed_tokens = llm_sub.embed_tokens
         self.language_model = llm_sub.language_model  # OrpheusForCausalLM
@@ -69,25 +82,37 @@ class Orpheus(Model):
         self.snac_sub = self._mstar.get_submodule("snac_decoder", device=str(device))
 
         self.kv_cache = FlashInferPagedKV(
-            num_layers=self.cfg.num_layers,
+            num_layers=self.cfg.num_hidden_layers,
             num_pages=NUM_PAGES,
             page_size=PAGE_SIZE,
-            num_kv_heads=self.cfg.num_kv_heads,
+            num_kv_heads=self.cfg.num_key_value_heads,
             head_dim=self.cfg.head_dim,
             device=self.device,
             dtype=torch.bfloat16,
         )
         # Causal attention for both prefill (multi-token) and decode (1 token).
         self._prefill_attn = FlashInferAttention(
-            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
             self.device, max_new_tokens=2048, cudagraph=False, causal=True,
         )
         self._decode_attn = FlashInferAttention(
-            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
-            self.device, max_new_tokens=1, cudagraph=False, causal=True,
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=1, cudagraph=cuda_graph, causal=True,
         )
         self.sampler = Sampler(device=self.device)
         self._pending_stops: list[tuple[int, str]] = []
+        # CUDA-graph decode state: one graph captures the single-token forward
+        # (embed -> 28 layers over the paged cache -> lm_head -> logits) with
+        # static token input + logits output. Plan runs outside the graph and
+        # updates the wrapper's fixed page/pos buffers; sampling runs outside.
+        self._g_token = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._g_logits = torch.zeros(
+            1, self.cfg.vocab_size, dtype=torch.float32, device=self.device
+        )
+        self._decode_graph: torch.cuda.CUDAGraph | None = None
+        # Debug: when set, `execute` records the LLM token stream per request
+        # (for verification against an independent reference decode).
+        self.token_log: dict[int, list[int]] | None = None
 
     # -- graph + topology -------------------------------------------------
 
@@ -156,9 +181,9 @@ class Orpheus(Model):
         self.sampler.set_config(
             srid,
             vocab_size=self.cfg.vocab_size,
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
-            repetition_penalty=self.cfg.repetition_penalty,
+            temperature=0.0 if self.greedy else self.cfg.temperature,
+            top_p=1.0 if self.greedy else self.cfg.top_p,
+            repetition_penalty=1.0 if self.greedy else self.cfg.repetition_penalty,
             ignore_eos=False,
         )
         self.sampler._sampling_config[srid].set_seed(request.get("seed", 0))
@@ -181,18 +206,60 @@ class Orpheus(Model):
             logits = self.lm_head(hidden[-1:])  # (1, vocab)
         return logits
 
+    def _decode_forward(self, handle: FlashInferCacheHandle) -> None:
+        """The capturable single-token decode step over static buffers: reads
+        `_g_token`, writes logits into `_g_logits`. The 28 per-layer KV
+        reads/writes bake into the graph (Python layer dispatch runs at
+        capture time); the write target is the wrapper's static token_page/
+        token_slot buffers, so replay lands at whatever plan() set them to."""
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            emb = self.embed_tokens(self._g_token)
+            hidden = self.language_model(emb, cache_handle=handle)
+            logits = self.lm_head(hidden[-1:])
+        self._g_logits.copy_(logits.float())
+
+    def _capture_decode(self) -> None:
+        """Capture the decode graph once. Warmup writes go to SCRATCH_PAGE
+        (a real request never allocates it), so the committed cache is
+        untouched; the graph records writes to the static buffers, which real
+        replays repoint at the request's actual pages via plan()."""
+        handle = FlashInferCacheHandle(self._decode_attn)
+        self._decode_attn.plan([SCRATCH_PAGE], seq_pos=0, new_len=1)
+        self._g_token.fill_(self.cfg.start_token_id)
+        torch.cuda.synchronize()
+        for _ in range(2):  # warmup (writes to scratch page)
+            self._decode_forward(handle)
+        torch.cuda.synchronize()
+        self._decode_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._decode_graph):
+            self._decode_forward(handle)
+        torch.cuda.synchronize()
+
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
             if node_name == "LLM":
-                attn = self._prefill_attn if walk == "prefill" else self._decode_attn
-                logits = self._run_llm(named["text_inputs"][0], kv[rid], attn)
+                if walk == "decode" and self.cuda_graph:
+                    view = kv[rid]
+                    if self._decode_graph is None:
+                        self._capture_decode()  # one-time (uses scratch page)
+                    # Plan the real step (append 1) into the fixed buffers,
+                    # load the token, replay, read the static logits.
+                    self._decode_attn.plan(view["pages"], view["seq_pos"], 1)
+                    self._g_token.copy_(named["text_inputs"][0].view(1))
+                    self._decode_graph.replay()
+                    logits = self._g_logits
+                else:
+                    attn = self._prefill_attn if walk == "prefill" else self._decode_attn
+                    logits = self._run_llm(named["text_inputs"][0], kv[rid], attn)
                 token = self.sampler.sample([str(rid)], logits, apply_penalty=True)
                 token = token.view(1).to(torch.long)  # (1,)
                 # EOS -> stop the decode loop (mstar's check_stop).
                 if walk == "decode" and int(token.item()) == self.cfg.stop_token_id:
                     self._pending_stops.append((rid, "decode_loop"))
+                if self.token_log is not None:
+                    self.token_log.setdefault(rid, []).append(int(token.item()))
                 out = {"new_token": [token]}
                 if walk == "decode":
                     out["text_inputs"] = [token]  # loop-back
