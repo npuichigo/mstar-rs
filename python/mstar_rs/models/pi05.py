@@ -1,0 +1,261 @@
+"""Pi0.5 on mstar-rs — the first KV-cache model (T4 tier).
+
+Walks (ported from ``mstar/model/pi05/pi05_model.py``):
+
+- ``prefill``:    image_inputs -> [vit_encoder] -> img_emb;
+                  img_emb + text_inputs -> [LLM]  (writes prefix KV, no outputs)
+- ``action_gen``: Loop x num_flow_steps over [LLM]: (noisy_actions,
+                  timestep_index) -> euler flow step -> loop-back; final
+                  noisy_actions -> EMIT_TO_CLIENT (action).
+
+The Rust runtime owns page tables and sequence positions (prefill declares
+``kv_appends = prefix_len``; action_gen declares append 0 + scratch pages
+for the transient suffix). The data plane matches mstar's engine exactly —
+bf16 autocast, FlashInfer paged attention, and a CUDA-graph-captured euler
+step replayed ``num_flow_steps`` times (`mstar_rs.fi`) — and drives
+**mstar's own pi05 nn modules unmodified**: `Pi05SiglipEncoder` (fp32, as in
+mstar), `Pi05PaliGemmaExpert`, `Pi05ActionExpert`, weight remapping, even
+`_euler_step`, through the same cache-manager interface mstar's engine
+implements.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+
+from ..fi import FlashInferAttention, FlashInferCacheHandle, FlashInferPagedKV
+from ..graph import edge, emit, loop, node, sequential
+from ..model import Model, NextWalk
+
+DEFAULT_MODEL_ID = "lerobot/pi05_base"
+KV_LABEL = "main"
+PAGE_SIZE = 128  # mstar kv_store default
+NUM_PAGES = 64   # 8192 tokens — plenty for prefix (768 img + <=220 text) + suffix
+MAX_PREFILL_TOKENS = 2048
+
+
+class PI05(Model):
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda") -> None:
+        from mstar.model.pi05.pi05_model import Pi05Model
+
+        self.device = torch.device(device)
+        # Reuse mstar's model wholesale: config, tokenizer, weight remapping,
+        # submodule construction (fp32 with selective-precision to() overrides).
+        self._mstar = Pi05Model(model_path_hf=model_id)
+        self.cfg = self._mstar.config
+        self.vit = self._mstar.get_submodule("vit_encoder", device=str(device))
+        self.llm = self._mstar.get_submodule("LLM", device=str(device))
+        self.kv_cache = FlashInferPagedKV(
+            num_layers=self.cfg.num_layers,
+            num_pages=NUM_PAGES,
+            page_size=PAGE_SIZE,
+            num_kv_heads=self.cfg.num_kv_heads,
+            head_dim=self.cfg.head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._prefill_attn = FlashInferAttention(
+            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=MAX_PREFILL_TOKENS, cudagraph=False,
+        )
+        self._step_attn = FlashInferAttention(
+            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=self.cfg.action_horizon, cudagraph=True,
+        )
+        # CUDA-graph state for the euler step (single-request slot).
+        self._g_noisy = torch.zeros(
+            self.cfg.action_horizon, self.cfg.action_dim, device=self.device
+        )
+        self._g_ts = torch.zeros(1, device=self.device, dtype=torch.long)
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._graph_rid: int | None = None
+        # Timestep-embedding basis (fp64, matching openpi) + write buffer.
+        half = self.cfg.action_hidden_size // 2
+        self._fraction = torch.linspace(
+            0.0, 1.0, half, device=self.device, dtype=torch.float64
+        )
+        self._time_emb_buffer = torch.empty(
+            1, self.cfg.action_hidden_size, device=self.device, dtype=torch.float32
+        )
+        # request_id -> seed for the initial action noise.
+        self._seeds: dict[int, int] = {}
+
+    # -- graph + KV declaration -------------------------------------------
+
+    def walks(self) -> dict[str, Any]:
+        return {
+            "prefill": sequential(
+                node("vit_encoder", ["image_inputs"], [edge("LLM", "img_emb")]),
+                node("LLM", ["img_emb", "text_inputs"], []),
+            ),
+            "action_gen": loop(
+                "flow",
+                node(
+                    "LLM",
+                    ["noisy_actions", "timestep_index"],
+                    [edge("LLM", "noisy_actions"), edge("LLM", "timestep_index")],
+                ),
+                max_iters=self.cfg.num_flow_steps,
+                outputs=[emit("noisy_actions", modality="action", persist=True)],
+            ),
+        }
+
+    def kv_config(self):
+        return [(KV_LABEL, NUM_PAGES, PAGE_SIZE)], {"LLM": KV_LABEL}
+
+    # -- request ingestion (mirrors Pi05Model.process_prompt) --------------
+
+    def tokenize(self, prompt: str, robot_state) -> torch.Tensor:
+        from mstar.model.pi05.components.flow_matching import discretize_state
+
+        cleaned = (prompt or "").strip().replace("_", " ").replace("\n", " ")
+        if robot_state is not None:
+            if not isinstance(robot_state, torch.Tensor):
+                robot_state = torch.tensor(robot_state, dtype=torch.float32)
+            bins = discretize_state(
+                robot_state.to(torch.float32), num_bins=self.cfg.state_token_bins
+            ).tolist()
+            state_str = " ".join(str(b) for b in bins)
+            full_prompt = f"Task: {cleaned}, State: {state_str};\nAction: "
+        else:
+            full_prompt = cleaned
+        return self._mstar.tokenizer.encode_prompt(full_prompt)
+
+    def initial_inputs(self, request: dict[str, Any]) -> NextWalk:
+        images = request["images"].to(self.device)  # (num_cameras, 3, H, W)
+        text_ids = self.tokenize(request.get("prompt", ""), request.get("robot_state"))
+        text_ids = text_ids.to(self.device)
+        prefix_len = self.cfg.num_cameras * self.cfg.tokens_per_image + text_ids.shape[0]
+        self._seeds[request["request_id"]] = request.get("seed", 0)
+        return (
+            "prefill",
+            [
+                ("vit_encoder", "image_inputs", [images]),
+                ("LLM", "text_inputs", [text_ids]),
+            ],
+            {KV_LABEL: prefix_len},
+        )
+
+    # -- CUDA-graph euler step ----------------------------------------------
+
+    def _euler_capturable(self, handle: FlashInferCacheHandle) -> None:
+        """One euler step over the static buffers, in-place. Everything here
+        is captured: timestep embed, time_mlp, action expert w/ paged
+        attention over the frozen prefix, euler update — mstar captures the
+        same region (`_forward_action_gen_batched`)."""
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            next_actions, next_index = self.llm._euler_step(
+                self._g_noisy, self._g_ts, self._fraction, self._time_emb_buffer, handle
+            )
+        self._g_noisy.copy_(next_actions)
+        self._g_ts.copy_(next_index)
+
+    def _prepare_graph(self, rid: int, view, noisy, ts) -> None:
+        """Per-request: re-plan attention over the request's real page table
+        (contents of the wrapper's fixed buffers change; addresses don't) and
+        load the loop state. Capture happens once, on the first request."""
+        assert view["scratch_len"] == self.cfg.action_horizon, view
+        self._step_attn.plan(view["pages"], view["seq_pos"], self.cfg.action_horizon)
+        self._g_noisy.copy_(noisy)
+        self._g_ts.copy_(ts)
+        if self._graph is None:
+            handle = FlashInferCacheHandle(self._step_attn)
+            self._g_handle = handle
+            torch.cuda.synchronize()
+            for _ in range(2):  # warmup, mstar-style
+                self._euler_capturable(handle)
+            self._g_noisy.copy_(noisy)
+            self._g_ts.copy_(ts)
+            torch.cuda.synchronize()
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph):
+                self._euler_capturable(handle)
+            torch.cuda.synchronize()
+            # Capture records without executing: buffers still hold the
+            # initial state; step 0 comes from the first replay.
+        self._graph_rid = rid
+
+    # -- node execution ------------------------------------------------------
+
+    @torch.inference_mode()
+    def execute(self, node_name, walk, inputs, kv=None):
+        outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
+        for rid, named in inputs.items():
+            if node_name == "vit_encoder":
+                pv = self.vit._prepare_one(named["image_inputs"][0])
+                features = self.vit.encoder(pv.float())  # (cams, 256, 2048)
+                outputs[rid] = {"img_emb": [features.reshape(-1, features.shape[-1])]}
+            elif node_name == "LLM" and walk == "prefill":
+                view = kv[rid]
+                img_emb = named["img_emb"][0] * self.llm._image_embed_scale
+                text_emb = self.llm._embed_tokens_scaled(named["text_inputs"][0])
+                prefix_emb = torch.cat([img_emb, text_emb], dim=0)
+                assert prefix_emb.shape[0] == view["append_len"], (
+                    prefix_emb.shape,
+                    view,
+                )
+                self._prefill_attn.plan(
+                    view["pages"], view["seq_pos"], view["append_len"]
+                )
+                handle = FlashInferCacheHandle(self._prefill_attn)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    self.llm.paligemma(
+                        query_sequence=prefix_emb,
+                        cache_handle=handle,
+                        write_cache=True,
+                    )
+                outputs[rid] = {}  # KV side effect only
+            elif node_name == "LLM" and walk == "action_gen":
+                view = kv[rid]
+                if self._graph_rid != rid:
+                    self._prepare_graph(
+                        rid, view, named["noisy_actions"][0],
+                        named["timestep_index"][0],
+                    )
+                else:
+                    # Loop-back inputs alias the static buffers; nothing to
+                    # copy in.
+                    assert (
+                        named["noisy_actions"][0].data_ptr()
+                        == self._g_noisy.data_ptr()
+                    )
+                self._graph.replay()
+                outputs[rid] = {
+                    "noisy_actions": [self._g_noisy],
+                    "timestep_index": [self._g_ts],
+                }
+            else:
+                raise ValueError(f"unknown node/walk: {node_name}/{walk}")
+        return outputs
+
+    # -- policy: prefill -> action_gen -> done ------------------------------
+
+    def next_forward(self, request_id, walk, fwd_index, persist) -> NextWalk | None:
+        if walk == "prefill":
+            seed = self._seeds[request_id]
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            noisy = torch.randn(
+                self.cfg.action_horizon,
+                self.cfg.action_dim,
+                device=self.device,
+                generator=generator,
+            )
+            ts = torch.zeros(1, device=self.device, dtype=torch.long)
+            return (
+                "action_gen",
+                [
+                    ("LLM", "noisy_actions", [noisy]),
+                    ("LLM", "timestep_index", [ts]),
+                ],
+                {KV_LABEL: 0},
+                # Scratch pages for the transient suffix K/V each euler step
+                # (mstar plans prefix+suffix pages with write_store=False).
+                {KV_LABEL: self.cfg.action_horizon},
+            )
+        return None  # action_gen done -> request done
+
+    def postprocess(self, name, modality, tensors):
+        assert modality == "action"
+        return tensors[0].detach().to(torch.float32).cpu()

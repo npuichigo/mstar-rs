@@ -1,0 +1,14 @@
+[package]
+name = "mstar-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mstar_rs_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mstar-core = { path = "../mstar-core" }
+mstar-runtime = { path = "../mstar-runtime" }
+pyo3 = { version = "0.23", features = ["extension-module"] }

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mstar-rs"
+version = "0.1.0"
+description = "Rust control-plane runtime for M* (mstar) with Python model execution"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+
+[tool.maturin]
+module-name = "mstar_rs._core"
+python-source = "../../python"
+manifest-path = "Cargo.toml"

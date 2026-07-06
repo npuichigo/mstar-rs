@@ -1,0 +1,10 @@
+[package]
+name = "mstar-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mstar-core = { path = "../mstar-core" }
+mstar-sched = { path = "../mstar-sched" }
+thiserror = { workspace = true }
