@@ -1,4 +1,4 @@
-"""HTTP serving surface for the multi-process runtime.
+"""HTTP serving surface for the multi-process runtime — the **dev path** (T5).
 
 A FastAPI app co-located with the conductor. HTTP requests are enqueued;
 a single **background drive thread** owns the `Conductor` (and thus the Rust
@@ -7,11 +7,22 @@ loops `conductor.poll()`, which continuously-batches across every in-flight
 request and dispatches to the worker processes. When a request completes,
 its future is resolved and the HTTP handler returns.
 
-Why Python and not axum: the conductor must be Python — it runs the model's
-policy (`next_forward` etc.). A Rust axum front-end would only proxy HTTP to
-this same Python conductor over the Mailbox (an extra process + hop) for a
-thin shell, so co-locating is simpler with no functional loss. The transport
-and runtime underneath are Rust either way.
+This is one of two front-ends; they are complementary, not redundant:
+
+  * **T5 (this file)** — FastAPI co-located with the conductor. Simplest to
+    run (one process, no extra hop); right for dev / low concurrency. HTTP,
+    tokenization, detokenization and JSON/SSE all run in Python under the GIL.
+  * **T6 (`crates/mstar-server`, axum)** — the *scale* path. It does NOT
+    replace the conductor (which must stay Python — it runs the model policy).
+    It moves the work that saturates a Python API server off the GIL: HTTP +
+    tokenize + per-token detokenize + SSE, in Rust, talking to the same Python
+    conductor over the Mailbox. That's exactly why vLLM and SGLang added Rust
+    front-ends; the extra process/hop buys GIL-free request handling.
+
+Relation to mstar: mstar's front-end is 100% Python (FastAPI/uvicorn) and,
+notably, runs the api_server as a *separate process* from the conductor
+(ZMQ IPC) — so T5's co-location is a deliberate simplification, and T6's Rust
+front-end for GIL offload is a departure mstar has no precedent for.
 """
 
 from __future__ import annotations
