@@ -26,7 +26,14 @@ NextWalk = (
 )
 
 
-class Model(ABC):
+class ModelPolicy(ABC):
+    """The control-plane half — everything the **conductor** needs, and
+    nothing that requires model weights or a GPU. Mirrors mstar's `Model` ABC,
+    which is a pure policy/graph object (weights load lazily via `get_submodule`
+    only in the worker). A conductor built on a `ModelPolicy` never allocates
+    model weights: it declares the graph, seeds walks, decides continuations,
+    and post-processes emissions — all descriptor/config-level work."""
+
     @abstractmethod
     def walks(self) -> dict[str, Any]:
         """Named walk graphs (dicts built with mstar_rs.graph helpers)."""
@@ -63,18 +70,6 @@ class Model(ABC):
         just the single `initial_inputs` walk."""
         return [self.initial_inputs(request)]
 
-    @abstractmethod
-    def execute(
-        self,
-        node: str,
-        walk: str,
-        inputs: dict[int, dict[str, list[torch.Tensor]]],
-        kv: dict[int, dict[str, Any]] | None = None,
-    ) -> dict[int, dict[str, list[torch.Tensor]]]:
-        """Run one node for a batch of requests. All torch compute lives
-        here. For KV nodes, `kv[rid]` carries the Rust runtime's view:
-        {"label", "pages", "seq_pos", "append_len", "scratch_len"}."""
-
     def next_forward(
         self,
         request_id: int,
@@ -91,15 +86,43 @@ class Model(ABC):
         partition is done. Default: single forward pass, no continuation."""
         return None
 
-    def loops_to_finish(self) -> list[tuple[int, str]]:
-        """After a batch executes (before its outputs are routed), return
-        (request_id, loop_name) pairs whose loop should terminate this
-        iteration — mstar's `check_stop -> STOP_LOOPS` (e.g. an EOS token
-        detected during `execute`). Default: none."""
-        return []
-
     def postprocess(
         self, name: str, modality: str | None, tensors: list[torch.Tensor]
     ) -> Any:
         """Turn an emission into client-facing output. Default: passthrough."""
         return tensors
+
+
+class ModelEngine(ABC):
+    """The data-plane half — everything the **worker** runs. This is where
+    model weights live and all torch compute happens. Mirrors mstar's engine
+    layer (`BaseEngine`/`KVCacheEngine`), which the worker builds via the
+    model's `get_submodule`; the conductor never constructs it."""
+
+    @abstractmethod
+    def execute(
+        self,
+        node: str,
+        walk: str,
+        inputs: dict[int, dict[str, list[torch.Tensor]]],
+        kv: dict[int, dict[str, Any]] | None = None,
+    ) -> dict[int, dict[str, list[torch.Tensor]]]:
+        """Run one node for a batch of requests. All torch compute lives
+        here. For KV nodes, `kv[rid]` carries the Rust runtime's view:
+        {"label", "pages", "seq_pos", "append_len", "scratch_len"}."""
+
+    def loops_to_finish(self) -> list[tuple[int, str]]:
+        """After a batch executes (before its outputs are routed), return
+        (request_id, loop_name) pairs whose loop should terminate this
+        iteration — mstar's `check_stop -> STOP_LOOPS` (e.g. an EOS token
+        detected during `execute`). Runs in the worker (it reads execute's
+        side effects); the conductor replays the signals. Default: none."""
+        return []
+
+
+class Model(ModelPolicy, ModelEngine, ABC):
+    """A model that is both its own policy and engine. Convenient for the
+    single-process `Driver` (one instance does everything) and for models not
+    yet split into weightless-policy + weighted-engine halves. For the
+    conductor/worker split, give the conductor a `ModelPolicy` and the worker
+    a `ModelEngine` so the conductor never loads weights."""

@@ -103,11 +103,15 @@ class ShmPool:
 
 
 class Worker:
-    """Runs on one GPU. Loops on the mailbox: execute node batches, reply."""
+    """Runs on one GPU. Loops on the mailbox: execute node batches, reply.
 
-    def __init__(self, worker_id: str, model, socket_dir: str, device: str = "cpu") -> None:
+    Takes a `ModelEngine` (the data-plane half — this is where model weights
+    live and torch compute runs). A full `Model` satisfies `ModelEngine`, so
+    either can be passed."""
+
+    def __init__(self, worker_id: str, engine, socket_dir: str, device: str = "cpu") -> None:
         self.worker_id = worker_id
-        self.model = model
+        self.engine = engine
         self.device = device
         self.mbox = Mailbox(worker_id, socket_dir)
         self.shm = ShmPool(worker_id)
@@ -142,10 +146,10 @@ class Worker:
                 for rid, named in msg["inputs"].items()
             }
             kv = msg.get("kv")  # reserved for KV models; None for stateless
-            outputs = self.model.execute(msg["node"], msg["walk"], inputs, kv=kv)
+            outputs = self.engine.execute(msg["node"], msg["walk"], inputs, kv=kv)
             # check_stop: report loops the model wants terminated this pass
             # (the conductor replays them before complete_batch).
-            stops = self.model.loops_to_finish()
+            stops = self.engine.loops_to_finish()
             # Stage every output tensor into our arena; reply with descriptors.
             out_desc = {
                 rid: {
@@ -175,20 +179,27 @@ class Worker:
 
 
 class Conductor:
-    """Drives the Runtime + model policy; dispatches batches to workers."""
+    """Drives the Runtime + model policy; dispatches batches to workers.
+
+    Takes a `ModelPolicy` (the control-plane half — graph, walk seeding,
+    continuation policy, postprocess). It never runs the model, so it holds no
+    weights: pass a weightless `ModelPolicy` and only the workers load weights
+    (mirrors mstar, whose conductor holds a policy-only `Model` while weights
+    materialize lazily in the worker). A full `Model` also satisfies
+    `ModelPolicy`, so it can be passed for models not yet split."""
 
     def __init__(
         self,
-        model,
+        policy,
         node_to_worker: dict[str, str],
         socket_dir: str,
         max_batch_size: int = 8,
     ) -> None:
-        self.model = model
+        self.policy = policy
         self.node_to_worker = node_to_worker
         self.max_batch_size = max_batch_size
-        self.runtime = Runtime(_spec_json(model))
-        if (kv := model.kv_config()) is not None:
+        self.runtime = Runtime(_spec_json(policy))
+        if (kv := policy.kv_config()) is not None:
             self.runtime.configure_kv(*kv)
         self.mbox = Mailbox("conductor", socket_dir)
         self.shm = ShmPool("conductor")
@@ -216,7 +227,7 @@ class Conductor:
         request = dict(request, request_id=rid)
         self.results[rid] = []
         self._req_uuids[rid] = []
-        for nxt in self.model.initial_walks(request):
+        for nxt in self.policy.initial_walks(request):
             self._start_walk(rid, nxt)
         return rid
 
@@ -353,7 +364,7 @@ class Conductor:
         rid = event["request_id"]
         if event["type"] == "emission":
             tensors = [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in event["tensors"]]
-            value = self.model.postprocess(event["name"], event["modality"], tensors)
+            value = self.policy.postprocess(event["name"], event["modality"], tensors)
             self.results[rid].append(value)
             # Stream this emission to the frontend, if one is attached.
             if self.on_token is not None and rid in self._front_rid:
@@ -368,7 +379,7 @@ class Conductor:
                 name: [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in refs]
                 for name, refs in event["persist"].items()
             }
-            nxt = self.model.next_forward(
+            nxt = self.policy.next_forward(
                 rid, event["partition"], event["walk"], event["fwd_index"],
                 persist, event["stream_done"],
             )
@@ -452,12 +463,12 @@ class Conductor:
             self.mbox.send(worker, msgpack.packb({"t": "shutdown"}))
 
 
-def _spec_json(model) -> str:
+def _spec_json(policy) -> str:
     import json
 
-    if (topo := model.partitions()) is not None:
+    if (topo := policy.partitions()) is not None:
         partition_specs, connection_specs = topo
         return json.dumps(
-            {"walks": model.walks(), "partitions": partition_specs, "connections": connection_specs}
+            {"walks": policy.walks(), "partitions": partition_specs, "connections": connection_specs}
         )
-    return json.dumps(model.walks())
+    return json.dumps(policy.walks())

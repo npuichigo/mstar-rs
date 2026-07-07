@@ -24,7 +24,7 @@ from .graph import (
     sliding_window,
     stream_edge,
 )
-from .model import Model
+from .model import Model, ModelEngine, ModelPolicy
 from .store import TensorStore
 
 __all__ = [
@@ -33,6 +33,8 @@ __all__ = [
     "Runtime",
     "Driver",
     "Model",
+    "ModelPolicy",
+    "ModelEngine",
     "TensorStore",
     "node",
     "edge",

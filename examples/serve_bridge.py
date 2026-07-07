@@ -36,9 +36,10 @@ sys.path.insert(0, str(REPO / "python"))
 def worker_main(worker_id: str, socket_dir: str) -> None:
     try:
         from mstar_rs.dist import Worker
-        from mstar_rs.models.echo import EchoAR
+        from mstar_rs.models.echo import EchoEngine
 
-        Worker(worker_id, EchoAR(), socket_dir, device="cpu").run()
+        # The worker holds the ENGINE (weights + execute).
+        Worker(worker_id, EchoEngine(), socket_dir, device="cpu").run()
     except Exception:
         import traceback
 
@@ -72,9 +73,10 @@ def main() -> int:
 
     # 2) conductor bridge (drives the Runtime, streams tokens to the frontend)
     from mstar_rs.dist import Conductor
-    from mstar_rs.models.echo import EchoAR
+    from mstar_rs.models.echo import EchoPolicy
 
-    cond = Conductor(EchoAR(), node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
+    # The conductor holds only the POLICY (no weights).
+    cond = Conductor(EchoPolicy(), node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
     serve_thread = threading.Thread(target=cond.serve_frontend, daemon=True)
     serve_thread.start()
     print("conductor serving")

@@ -34,7 +34,7 @@ import torch  # noqa: E402
 from mstar_rs.dist import Conductor, Worker  # noqa: E402
 from mstar_rs.graph import edge, emit, loop, node  # noqa: E402
 from mstar_rs.model import Model  # noqa: E402
-from mstar_rs.models.echo import EchoAR  # noqa: E402
+from mstar_rs.models.echo import EchoEngine, EchoPolicy  # noqa: E402
 
 
 def _start_worker(model, socket_dir, wid="worker_0"):
@@ -56,8 +56,8 @@ def _drive(cond, budget=8.0):
 
 def test_reclaim() -> None:
     d = tempfile.mkdtemp(prefix="verify_reclaim_")
-    w = _start_worker(EchoAR(), d)
-    cond = Conductor(EchoAR(), {"step": "worker_0"}, d)
+    w = _start_worker(EchoEngine(), d)
+    cond = Conductor(EchoPolicy(), {"step": "worker_0"}, d)
     for i in range(6):
         cond.submit({"tokens": list(range(3 + i)), "max_tokens": 100})
     assert _drive(cond), "did not reach idle"
@@ -70,7 +70,7 @@ def test_reclaim() -> None:
     print("1. RECLAIM OK — both arenas fully free, no desc/uuid leak after 6 requests")
 
 
-class _Boom(EchoAR):
+class _Boom(EchoEngine):
     def execute(self, *a, **k):
         raise ValueError("boom in execute")
 
@@ -78,7 +78,7 @@ class _Boom(EchoAR):
 def test_error_no_hang() -> None:
     d = tempfile.mkdtemp(prefix="verify_err_")
     _start_worker(_Boom(), d)
-    cond = Conductor(_Boom(), {"step": "worker_0"}, d)
+    cond = Conductor(EchoPolicy(), {"step": "worker_0"}, d)
     rid = cond.submit({"tokens": [1, 2, 3], "max_tokens": 10})
     assert _drive(cond, budget=5.0), "conductor hung after worker error"
     assert rid in cond.errors, "worker error not recorded"
@@ -126,13 +126,27 @@ class _LoopStop(Model):
         return int(tensors[0].item())
 
 
+def test_conductor_is_weightless() -> None:
+    # The policy/engine split means the conductor holds only a ModelPolicy —
+    # it never constructs the engine, so it never loads weights (mstar: the
+    # conductor holds a policy-only Model; weights materialize in the worker).
+    d = tempfile.mkdtemp(prefix="verify_weightless_")
+    w = _start_worker(EchoEngine(), d)
+    cond = Conductor(EchoPolicy(), {"step": "worker_0"}, d)
+    assert isinstance(cond.policy, EchoPolicy)
+    assert not hasattr(cond.policy, "weights_loaded"), "conductor loaded engine weights"
+    assert getattr(w.engine, "weights_loaded", False), "worker engine has no weights"
+    cond.shutdown_workers()
+    print("5. WEIGHTLESS-CONDUCTOR OK — conductor holds policy only; engine weights live in the worker")
+
+
 def test_incremental_reclaim() -> None:
     # Per-tensor reclaim must free tensors DURING the request (as the runtime
     # reports them unreachable), not only at finish — so the conductor's live
     # descriptor set stays bounded even for a long generation.
     d = tempfile.mkdtemp(prefix="verify_incr_")
-    _start_worker(EchoAR(), d)
-    cond = Conductor(EchoAR(), {"step": "worker_0"}, d)
+    _start_worker(EchoEngine(), d)
+    cond = Conductor(EchoPolicy(), {"step": "worker_0"}, d)
     n_tokens = 60
     cond.submit({"tokens": list(range(n_tokens)), "max_tokens": n_tokens})
     peak_desc = 0
@@ -167,6 +181,7 @@ def test_loop_stop() -> None:
 def main() -> int:
     test_reclaim()
     test_error_no_hang()
+    test_conductor_is_weightless()
     test_incremental_reclaim()
     test_loop_stop()
     print("\nALL DIST CHECKS PASSED")
