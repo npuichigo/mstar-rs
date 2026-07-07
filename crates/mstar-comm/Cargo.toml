@@ -9,3 +9,4 @@ serde = { workspace = true }
 bincode = "1.3"
 memmap2 = "0.9"
 thiserror = { workspace = true }
+zmq = "0.10"

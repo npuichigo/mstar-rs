@@ -75,7 +75,7 @@ def spawn_workers(socket_dir: str):
         p.start()
         procs.append(p)
     deadline = time.time() + 15
-    need = [f"{socket_dir}/worker_0.sock", f"{socket_dir}/worker_1.sock"]
+    need = [f"{socket_dir}/worker_0.ipc", f"{socket_dir}/worker_1.ipc"]
     while time.time() < deadline and not all(Path(p).exists() for p in need):
         time.sleep(0.1)
     return procs

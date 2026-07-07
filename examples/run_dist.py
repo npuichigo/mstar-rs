@@ -78,12 +78,12 @@ def main() -> int:
         workers.append(p)
     # Wait for both worker inboxes to appear (their bind creates the socket).
     deadline = time.time() + 15
-    need = {f"{socket_dir}/worker_0.sock", f"{socket_dir}/worker_1.sock"}
+    need = {f"{socket_dir}/worker_0.ipc", f"{socket_dir}/worker_1.ipc"}
     while time.time() < deadline:
         if all(Path(p).exists() for p in need):
             break
         time.sleep(0.1)
-    bound = [w for w in ("worker_0", "worker_1") if Path(f"{socket_dir}/{w}.sock").exists()]
+    bound = [w for w in ("worker_0", "worker_1") if Path(f"{socket_dir}/{w}.ipc").exists()]
     print(f"workers bound: {bound}")
 
     from mstar_rs.dist import Conductor

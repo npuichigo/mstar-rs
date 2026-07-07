@@ -42,7 +42,7 @@ def _start_worker(model, socket_dir, wid="worker_0"):
     w = Worker(wid, model, socket_dir, device="cpu")
     threading.Thread(target=w.run, daemon=True).start()
     deadline = time.time() + 5
-    while time.time() < deadline and not Path(f"{socket_dir}/{wid}.sock").exists():
+    while time.time() < deadline and not Path(f"{socket_dir}/{wid}.ipc").exists():
         time.sleep(0.05)
     return w
 

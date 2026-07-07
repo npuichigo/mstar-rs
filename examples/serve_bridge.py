@@ -67,9 +67,9 @@ def main() -> int:
     worker = ctx.Process(target=worker_main, args=("worker_0", socket_dir), daemon=True)
     worker.start()
     deadline = time.time() + 15
-    while time.time() < deadline and not Path(f"{socket_dir}/worker_0.sock").exists():
+    while time.time() < deadline and not Path(f"{socket_dir}/worker_0.ipc").exists():
         time.sleep(0.1)
-    print(f"worker bound: {Path(f'{socket_dir}/worker_0.sock').exists()}")
+    print(f"worker bound: {Path(f'{socket_dir}/worker_0.ipc').exists()}")
 
     # 2) conductor bridge (drives the Runtime, streams tokens to the frontend)
     from mstar_rs.dist import Conductor

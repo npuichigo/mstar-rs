@@ -372,7 +372,7 @@ impl PyShmArena {
 
 /// The control-plane message mesh for the conductor + worker processes.
 /// Carries opaque `bytes` payloads (the Python side frames its protocol with
-/// msgpack); transport is the UDS `Mailbox` (framed, ordered, reconnecting).
+/// msgpack); transport is the ZeroMQ PUSH/PULL `Mailbox` (ordered, reconnecting).
 #[pyclass(name = "Mailbox")]
 struct PyMailbox {
     inner: Mailbox<Vec<u8>>,
@@ -380,7 +380,7 @@ struct PyMailbox {
 
 #[pymethods]
 impl PyMailbox {
-    /// Bind this entity's inbox at `<dir>/<my_id>.sock`.
+    /// Bind this entity's PULL inbox at `ipc://<dir>/<my_id>.ipc`.
     #[new]
     fn new(my_id: &str, dir: &str) -> PyResult<Self> {
         Ok(Self {

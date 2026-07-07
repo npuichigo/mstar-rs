@@ -1,5 +1,5 @@
 """Multi-process runtime: a **conductor** process drives one or more
-**worker** processes over the UDS control mesh (`Mailbox`), with tensors
+**worker** processes over the ZeroMQ control mesh (`Mailbox`), with tensors
 moving through shared memory (`ShmArena`).
 
 Split of responsibilities (mirroring mstar's conductor/worker):
