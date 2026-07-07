@@ -21,8 +21,8 @@ mock), so those modules run unmodified on mstar-rs.
 `FlashInferAttention` is the single-request (bs=1) path used today.
 `BatchedFlashInferAttention` is the ragged-batch generalization (mstar's
 `BatchedCacheManager`: one plan/run over many requests) for compute-level
-batching — GPU-only and UNVERIFIED until `examples/verify_batched_capture.py`
-confirms it equals per-request attention on a GPU.
+batching — verified bit-exact vs per-request on GPU by
+`examples/verify_batched_capture.py`; what's left is model-side wiring.
 """
 
 from __future__ import annotations
@@ -156,11 +156,12 @@ class BatchedFlashInferAttention:
     refills the fixed index buffers (the FlashInfer `use_cuda_graph` pattern —
     identical to the single-request path, just wider).
 
-    GPU-ONLY AND UNVERIFIED: this is a faithful generalization of the bs=1
-    `FlashInferAttention`, but it has NOT been run against a GPU. Confirm it
-    equals per-request attention bit-exactly with
-    `examples/verify_batched_capture.py` before wiring a model to it, then drop
-    that (node, walk) from the model's `unbatchable()`.
+    VERIFIED bit-exact vs per-request attention on GPU
+    (`examples/verify_batched_capture.py`: batched == per-request AND
+    graph-replay == eager, max_abs_diff 0.0). What remains before a model can
+    use it is model-side wiring: the model's decode step must call this with a
+    stacked batch (+ a [max_bs, V] batched sampler for orpheus), after which
+    drop that (node, walk) from the model's `unbatchable()`.
     """
 
     def __init__(

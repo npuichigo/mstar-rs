@@ -86,7 +86,8 @@ def main() -> int:
                                    cudagraph=False, causal=False, dtype=dtype)
         attn.plan(req_pages[i], sp, 1)
         h = FlashInferCacheHandle(attn)
-        ref.append(h.run_attention(q[i].squeeze(0), k[i].squeeze(0), v[i].squeeze(0)).clone())
+        # q/k/v are [new_len=1, heads, dim] — the shape run_attention expects.
+        ref.append(h.run_attention(q[i], k[i], v[i]).clone())
 
     # Re-fill K/V slots the reference just wrote (so the batched run sees the same
     # pre-state) — the bs=1 runs wrote the new token into the cache; reset them.
@@ -112,18 +113,37 @@ def main() -> int:
     ok1 = d1 < 5e-3
     print(f"1. batched == per-request: max_abs_diff={d1:.2e} cos={c1:.6f} {'OK' if ok1 else 'MISMATCH'}")
 
-    # The capture/replay half (BucketedCudaGraph) is standard torch.cuda.graph
-    # over static buffers; its bucket/pad math is CPU-unit-tested
-    # (test_batched_graph_buckets). It's exercised for real once a model's
-    # decode step is wired to BatchedFlashInferAttention + BucketedCudaGraph:
-    # capture at bucket `padded_bucket(bs)`, load the real rows [0:bs], replay,
-    # read rows [0:bs]. This script verifies the harder, model-independent
-    # piece — that the batched attention numerics match per-request.
-    print(f"   (real bs={bs} would pad to capture bucket {padded_bucket(bs)}; "
-          f"graph-replay equivalence is checked when a model wires the decode step)")
+    # --- test 2: BucketedCudaGraph capture/replay == eager batched ---
+    # Reset the new-token slots so the captured run recomputes from the same
+    # pre-state the eager batched run saw.
+    for i, sp in enumerate(seq_positions):
+        pg, sl = req_pages[i][sp // PS], sp % PS
+        cache.kv[0, pg, 0, sl] = 0
+        cache.kv[0, pg, 1, sl] = 0
+    gattn = BatchedFlashInferAttention(cache, QOH, HD, dev, bs=bs,
+                                       max_pages_per_req=pages_per_req, new_len=1,
+                                       cudagraph=True, causal=False, dtype=dtype)
+    gattn.plan([(req_pages[i], seq_positions[i], 1) for i in range(bs)])  # outside capture
+    gh = FlashInferCacheHandle(gattn)
+    # Static input buffers the captured graph reads (load real rows before replay).
+    qg, kg, vg = qb.clone(), kb.clone(), vb.clone()
+    held: dict[str, torch.Tensor] = {}
 
-    print("\nBATCHED ATTENTION VERIFIED (batched == per-request)" if ok1 else "\nFAILED")
-    return 0 if ok1 else 1
+    def step(_bs: int) -> None:
+        held["out"] = gh.run_attention(qg, kg, vg)
+
+    graph = BucketedCudaGraph(step, buckets=(bs,))  # bs=4 is itself a bucket
+    graph.replay(real_bs=bs)
+    torch.cuda.synchronize()
+    out_g = held["out"]
+    d2 = float((out_g.float() - out_b.float()).abs().max())
+    c2 = _cos(out_g, out_b)
+    ok2 = d2 < 5e-3
+    print(f"2. graph replay == eager batched: max_abs_diff={d2:.2e} cos={c2:.6f} "
+          f"{'OK' if ok2 else 'MISMATCH'} (bs={bs} -> bucket {padded_bucket(bs)})")
+
+    print("\nBATCHED CAPTURE VERIFIED" if (ok1 and ok2) else "\nFAILED")
+    return 0 if (ok1 and ok2) else 1
 
 
 if __name__ == "__main__":

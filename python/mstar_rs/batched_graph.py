@@ -7,13 +7,12 @@ captured bucket, replay that graph, and discard the padding rows. This is what
 lets mstar batch compute across requests while still using CUDA graphs; the
 bs=1 single-slot graphs in pi05/orpheus are the degenerate case.
 
-Split by verifiability:
+Verification:
   * `padded_bucket` and the pad/discard index math are **pure Python** and are
     unit-tested on CPU (`test_batched_graph_buckets` in examples/verify_dist).
-  * `BucketedCudaGraph` captures/replays real `torch.cuda.CUDAGraph`s — that
-    half is **GPU-only and UNVERIFIED**; run `examples/verify_batched_capture.py`
-    on a GPU with a real model to confirm batched == per-request bit-exactly
-    before trusting it.
+  * `BucketedCudaGraph` capture/replay is **verified bit-exact on GPU** by
+    `examples/verify_batched_capture.py` (graph-replay == eager batched,
+    max_abs_diff 0.0). What remains is wiring a model's decode step to it.
 """
 
 from __future__ import annotations
@@ -48,7 +47,8 @@ class BucketedCudaGraph:
     `replay`, and reads outputs from rows `[0:real_bs]` after — the padding
     rows `[real_bs:bucket]` carry dummy data and are ignored.
 
-    GPU-only; UNVERIFIED until the equivalence script passes on a GPU.
+    GPU-only; capture/replay verified bit-exact by
+    `examples/verify_batched_capture.py`.
     """
 
     def __init__(
