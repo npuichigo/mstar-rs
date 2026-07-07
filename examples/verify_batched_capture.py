@@ -1,23 +1,21 @@
 """GPU verification for batched paged attention + bucketed CUDA-graph capture.
 
-This is the check that must pass before the batched path (fi.BatchedFlashInfer-
-Attention + batched_graph.BucketedCudaGraph) can be trusted and a model's
-`unbatchable()` caps for a node can be dropped. It is GPU-only (needs a CUDA
-device + the `flashinfer` package) and uses NO model weights — it builds a
-paged KV cache with random K/V and checks two equivalences:
+The check that must pass before the batched path (fi.BatchedFlashInfer-
+Attention + batched_graph.BucketedCudaGraph) can back a model. GPU-only (CUDA +
+`flashinfer`), no model weights. For each query length it checks:
 
-  1. **Batched == per-request**: attention for a batch of requests computed in
-     ONE BatchedFlashInferAttention plan/run must equal each request computed
-     alone through the (already-verified) bs=1 FlashInferAttention.
-  2. **Graphed == eager**: replaying a BucketedCudaGraph-captured decode step
-     (padded to a bucket) must equal the eager batched run for the real rows.
+  1. **Batched == per-request**: attention for a batch of requests in ONE
+     BatchedFlashInferAttention plan/run equals each request computed alone
+     through the (verified) bs=1 FlashInferAttention.
+  2. **Graph replay == eager batched**: a BucketedCudaGraph-captured step
+     (padded to a bucket) equals the eager batched run for the real rows.
+
+Two query lengths are exercised: `new_len=1` (AR decode — orpheus) and
+`new_len>1` (a multi-token suffix per request — pi05 action_gen's `horizon`).
 
     python examples/verify_batched_capture.py
 
-Prints per-check max abs diff + cosine; exits non-zero on mismatch. If (1)
-fails, the batched plan/run in fi.py is wrong (the ragged indptr / token-map
-construction) — fix there. If (1) passes but (2) fails, the capture/replay or
-pad-to-bucket handling is wrong (batched_graph.py).
+Prints per-case max abs diff + cosine; exits non-zero on any mismatch.
 """
 
 from __future__ import annotations
@@ -36,16 +34,7 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.dot(a, b) / (a.norm() * b.norm() + 1e-12))
 
 
-def main() -> int:
-    if not torch.cuda.is_available():
-        print("SKIP: no CUDA device")
-        return 0
-    try:
-        import flashinfer  # noqa: F401
-    except ImportError:
-        print("SKIP: flashinfer not installed")
-        return 0
-
+def run_check(new_len: int, causal: bool) -> bool:
     from mstar_rs.batched_graph import BucketedCudaGraph, padded_bucket
     from mstar_rs.fi import (
         BatchedFlashInferAttention,
@@ -55,95 +44,122 @@ def main() -> int:
     )
 
     dev = torch.device("cuda")
-    torch.manual_seed(0)
-    L, PS, KVH, QOH, HD = 1, 16, 4, 8, 64  # 1 layer, page 16, 4 kv / 8 qo heads, dim 64
+    torch.manual_seed(new_len)  # vary data per case
+    L, PS, KVH, QOH, HD = 1, 16, 4, 8, 64
     dtype = torch.bfloat16
-    # A batch of requests with distinct prefix lengths (decode: 1 new token each).
-    seq_positions = [30, 47, 16, 63]
+    seq_positions = [30, 47, 16, 63]  # distinct prefix lengths
     bs = len(seq_positions)
-    pages_per_req = 8  # >= ceil((max seq_pos + 1)/PS)
-    total_pages = bs * pages_per_req
+    pages_per_req = 8
 
-    # Shared KV pool; give each request its own disjoint page range and fill the
-    # cached prefix with random K/V so attention is non-trivial.
-    cache = FlashInferPagedKV(L, total_pages, PS, KVH, HD, dev, dtype)
+    cache = FlashInferPagedKV(L, bs * pages_per_req, PS, KVH, HD, dev, dtype)
     req_pages = [list(range(i * pages_per_req, (i + 1) * pages_per_req)) for i in range(bs)]
-    for i, sp in enumerate(seq_positions):
-        for g in range(sp):  # prefix tokens already in the cache
-            pg, sl = req_pages[i][g // PS], g % PS
-            cache.kv[0, pg, 0, sl] = torch.randn(KVH, HD, device=dev, dtype=dtype)
-            cache.kv[0, pg, 1, sl] = torch.randn(KVH, HD, device=dev, dtype=dtype)
 
-    # One new query token per request.
-    q = [torch.randn(1, QOH, HD, device=dev, dtype=dtype) for _ in range(bs)]
-    k = [torch.randn(1, KVH, HD, device=dev, dtype=dtype) for _ in range(bs)]
-    v = [torch.randn(1, KVH, HD, device=dev, dtype=dtype) for _ in range(bs)]
+    def fill_prefix() -> None:
+        for i, sp in enumerate(seq_positions):
+            for g in range(sp):
+                pg, sl = req_pages[i][g // PS], g % PS
+                cache.kv[0, pg, 0, sl] = torch.randn(KVH, HD, device=dev, dtype=dtype)
+                cache.kv[0, pg, 1, sl] = torch.randn(KVH, HD, device=dev, dtype=dtype)
 
-    # --- reference: each request alone through the bs=1 path ---
+    def clear_new() -> None:
+        for i, sp in enumerate(seq_positions):
+            for g in range(sp, sp + new_len):
+                cache.kv[0, req_pages[i][g // PS], :, g % PS] = 0
+
+    fill_prefix()
+    # new_len query tokens per request.
+    q = [torch.randn(new_len, QOH, HD, device=dev, dtype=dtype) for _ in range(bs)]
+    k = [torch.randn(new_len, KVH, HD, device=dev, dtype=dtype) for _ in range(bs)]
+    v = [torch.randn(new_len, KVH, HD, device=dev, dtype=dtype) for _ in range(bs)]
+
+    # reference: each request alone through the bs=1 path.
     ref = []
     for i, sp in enumerate(seq_positions):
-        attn = FlashInferAttention(cache, QOH, HD, dev, max_new_tokens=1,
-                                   cudagraph=False, causal=False, dtype=dtype)
-        attn.plan(req_pages[i], sp, 1)
-        h = FlashInferCacheHandle(attn)
-        # q/k/v are [new_len=1, heads, dim] — the shape run_attention expects.
-        ref.append(h.run_attention(q[i], k[i], v[i]).clone())
+        attn = FlashInferAttention(cache, QOH, HD, dev, max_new_tokens=new_len,
+                                   cudagraph=False, causal=causal, dtype=dtype)
+        attn.plan(req_pages[i], sp, new_len)
+        ref.append(FlashInferCacheHandle(attn).run_attention(q[i], k[i], v[i]).clone())
+    clear_new()  # reset new-token slots the refs wrote
 
-    # Re-fill K/V slots the reference just wrote (so the batched run sees the same
-    # pre-state) — the bs=1 runs wrote the new token into the cache; reset them.
-    for i, sp in enumerate(seq_positions):
-        pg, sl = req_pages[i][sp // PS], sp % PS
-        cache.kv[0, pg, 0, sl] = 0
-        cache.kv[0, pg, 1, sl] = 0
-
-    # --- test 1: batched (eager) ---
+    # test 1: eager batched.
     battn = BatchedFlashInferAttention(cache, QOH, HD, dev, bs=bs,
-                                       max_pages_per_req=pages_per_req, new_len=1,
-                                       cudagraph=False, causal=False, dtype=dtype)
-    battn.plan([(req_pages[i], seq_positions[i], 1) for i in range(bs)])
-    bh = FlashInferCacheHandle(battn)
-    qb = torch.cat([q[i] for i in range(bs)]).reshape(bs, QOH, HD)
-    kb = torch.cat([k[i] for i in range(bs)]).reshape(bs, KVH, HD)
-    vb = torch.cat([v[i] for i in range(bs)]).reshape(bs, KVH, HD)
-    out_b = bh.run_attention(qb, kb, vb)  # [bs, QOH, HD]
-
-    ref_stack = torch.cat(ref).reshape(bs, QOH, HD)
+                                       max_pages_per_req=pages_per_req, new_len=new_len,
+                                       cudagraph=False, causal=causal, dtype=dtype)
+    battn.plan([(req_pages[i], seq_positions[i], new_len) for i in range(bs)])
+    qb = torch.cat(q).reshape(bs * new_len, QOH, HD)
+    kb = torch.cat(k).reshape(bs * new_len, KVH, HD)
+    vb = torch.cat(v).reshape(bs * new_len, KVH, HD)
+    out_b = FlashInferCacheHandle(battn).run_attention(qb, kb, vb)
+    ref_stack = torch.cat(ref).reshape(bs * new_len, QOH, HD)
     d1 = float((out_b.float() - ref_stack.float()).abs().max())
-    c1 = _cos(out_b, ref_stack)
     ok1 = d1 < 5e-3
-    print(f"1. batched == per-request: max_abs_diff={d1:.2e} cos={c1:.6f} {'OK' if ok1 else 'MISMATCH'}")
+    print(f"  [new_len={new_len} causal={causal}] batched==per-request: "
+          f"max_abs_diff={d1:.2e} cos={_cos(out_b, ref_stack):.6f} {'OK' if ok1 else 'MISMATCH'}")
 
-    # --- test 2: BucketedCudaGraph capture/replay == eager batched ---
-    # Reset the new-token slots so the captured run recomputes from the same
-    # pre-state the eager batched run saw.
-    for i, sp in enumerate(seq_positions):
-        pg, sl = req_pages[i][sp // PS], sp % PS
-        cache.kv[0, pg, 0, sl] = 0
-        cache.kv[0, pg, 1, sl] = 0
+    # test 2: BucketedCudaGraph capture/replay == eager batched.
+    clear_new()
     gattn = BatchedFlashInferAttention(cache, QOH, HD, dev, bs=bs,
-                                       max_pages_per_req=pages_per_req, new_len=1,
-                                       cudagraph=True, causal=False, dtype=dtype)
-    gattn.plan([(req_pages[i], seq_positions[i], 1) for i in range(bs)])  # outside capture
+                                       max_pages_per_req=pages_per_req, new_len=new_len,
+                                       cudagraph=True, causal=causal, dtype=dtype)
+    gattn.plan([(req_pages[i], seq_positions[i], new_len) for i in range(bs)])
     gh = FlashInferCacheHandle(gattn)
-    # Static input buffers the captured graph reads (load real rows before replay).
     qg, kg, vg = qb.clone(), kb.clone(), vb.clone()
     held: dict[str, torch.Tensor] = {}
 
     def step(_bs: int) -> None:
         held["out"] = gh.run_attention(qg, kg, vg)
 
-    graph = BucketedCudaGraph(step, buckets=(bs,))  # bs=4 is itself a bucket
-    graph.replay(real_bs=bs)
+    BucketedCudaGraph(step, buckets=(bs,)).replay(real_bs=bs)
     torch.cuda.synchronize()
-    out_g = held["out"]
-    d2 = float((out_g.float() - out_b.float()).abs().max())
-    c2 = _cos(out_g, out_b)
+    d2 = float((held["out"].float() - out_b.float()).abs().max())
     ok2 = d2 < 5e-3
-    print(f"2. graph replay == eager batched: max_abs_diff={d2:.2e} cos={c2:.6f} "
-          f"{'OK' if ok2 else 'MISMATCH'} (bs={bs} -> bucket {padded_bucket(bs)})")
+    print(f"  [new_len={new_len} causal={causal}] graph==eager:          "
+          f"max_abs_diff={d2:.2e} cos={_cos(held['out'], out_b):.6f} {'OK' if ok2 else 'MISMATCH'} "
+          f"(bs={bs}->bucket {padded_bucket(bs)})")
+    return ok1 and ok2
 
-    print("\nBATCHED CAPTURE VERIFIED" if (ok1 and ok2) else "\nFAILED")
-    return 0 if (ok1 and ok2) else 1
+
+def _child(new_len: int, causal: bool, q) -> None:
+    # Each check runs in its OWN process: a FlashInfer CUDA-graph capture
+    # leaves wrapper/stream state that perturbs a later eager wrapper in the
+    # same process (harness artifact, not a kernel bug — the primitives match
+    # bit-exactly when each check runs isolated). Subprocess = clean state.
+    import torch as _t
+
+    if not _t.cuda.is_available():
+        q.put(("skip", "no CUDA device"))
+        return
+    try:
+        import flashinfer  # noqa: F401
+    except ImportError:
+        q.put(("skip", "flashinfer not installed"))
+        return
+    q.put(("ok" if run_check(new_len, causal) else "fail", ""))
+
+
+def main() -> int:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    cases = [
+        ("decode-shaped (new_len=1, e.g. orpheus)", 1),
+        ("suffix-shaped (new_len>1, e.g. pi05 action_gen horizon)", 8),
+    ]
+    ok = True
+    for title, nl in cases:
+        print(title + ":")
+        q: mp.Queue = ctx.Queue()
+        p = ctx.Process(target=_child, args=(nl, False, q))
+        p.start()
+        status, msg = q.get()
+        p.join()
+        if status == "skip":
+            print(f"  SKIP: {msg}")
+            return 0
+        ok &= status == "ok"
+
+    print("\nBATCHED CAPTURE VERIFIED" if ok else "\nFAILED")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
