@@ -12,12 +12,17 @@ This is one of two front-ends; they are complementary, not redundant:
   * **T5 (this file)** — FastAPI co-located with the conductor. Simplest to
     run (one process, no extra hop); right for dev / low concurrency. HTTP,
     tokenization, detokenization and JSON/SSE all run in Python under the GIL.
-  * **T6 (`crates/mstar-server`, axum)** — the *scale* path. It does NOT
-    replace the conductor (which must stay Python — it runs the model policy).
-    It moves the work that saturates a Python API server off the GIL: HTTP +
-    tokenize + per-token detokenize + SSE, in Rust, talking to the same Python
-    conductor over the Mailbox. That's exactly why vLLM and SGLang added Rust
-    front-ends; the extra process/hop buys GIL-free request handling.
+  * **T6 (`crates/mstar-server`, axum)** — the *scale* path, for **high
+    concurrency**. Under many concurrent requests a Python FastAPI/uvicorn
+    front-end saturates on the GIL — per-request tokenize + per-token
+    detokenize + JSON/SSE serialize all contend for one interpreter lock —
+    which is exactly why **both vLLM and SGLang moved their front-ends to
+    Rust**. T6 does the same: HTTP + tokenize + detokenize + SSE in Rust
+    (off the GIL), talking to the same Python conductor over the Mailbox. It
+    does NOT replace the conductor (which must stay Python — it runs the model
+    policy); the conductor is per-forward-pass and GPU-bound, not the
+    concurrency bottleneck. The extra process/hop buys GIL-free request
+    handling that scales with concurrent connections.
 
 Relation to mstar: mstar's front-end is 100% Python (FastAPI/uvicorn) and,
 notably, runs the api_server as a *separate process* from the conductor
