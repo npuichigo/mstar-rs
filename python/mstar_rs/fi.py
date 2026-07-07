@@ -17,6 +17,12 @@ The handle implements the cache-manager interface mstar's transformer
 modules call (`set_active_label / set_layer_idx / apply_rope /
 run_attention / advance_seq_lens` — the subset mstar's own parity tests
 mock), so those modules run unmodified on mstar-rs.
+
+`FlashInferAttention` is the single-request (bs=1) path used today.
+`BatchedFlashInferAttention` is the ragged-batch generalization (mstar's
+`BatchedCacheManager`: one plan/run over many requests) for compute-level
+batching — GPU-only and UNVERIFIED until `examples/verify_batched_capture.py`
+confirms it equals per-request attention on a GPU.
 """
 
 from __future__ import annotations
@@ -80,6 +86,7 @@ class FlashInferAttention:
         self.token_slot = torch.zeros(max_new_tokens, dtype=torch.long, device=device)
         self.pos_ids = torch.zeros(max_new_tokens, dtype=torch.long, device=device)
         self.new_len = 0
+        self.total_q = 0  # total query tokens planned (== new_len for bs=1)
         if cudagraph:
             self._qo_indptr_buf = torch.zeros(2, dtype=torch.int32, device=device)
             self._kv_indptr_buf = torch.zeros(2, dtype=torch.int32, device=device)
@@ -133,6 +140,138 @@ class FlashInferAttention:
         self.token_slot[:new_len].copy_(g % ps, non_blocking=True)
         self.pos_ids[:new_len].copy_(g, non_blocking=True)
         self.new_len = new_len
+        self.total_q = new_len
+
+
+class BatchedFlashInferAttention:
+    """Batched paged attention over a RAGGED batch of requests — one
+    FlashInfer plan + one run for the whole batch (mstar's
+    `BatchedCacheManager`, `engine/cache_manager.py`). The ragged batch's
+    per-request page tables are concatenated into one set of index tensors;
+    `wrapper.run()` issues a single kernel over all requests.
+
+    Sized for a FIXED `bs` (a capture bucket) with `new_len` query tokens per
+    request (decode: 1). All buffers are static so `run()` is CUDA-graph
+    capturable at that `bs`; `plan()` is always called OUTSIDE capture and
+    refills the fixed index buffers (the FlashInfer `use_cuda_graph` pattern —
+    identical to the single-request path, just wider).
+
+    GPU-ONLY AND UNVERIFIED: this is a faithful generalization of the bs=1
+    `FlashInferAttention`, but it has NOT been run against a GPU. Confirm it
+    equals per-request attention bit-exactly with
+    `examples/verify_batched_capture.py` before wiring a model to it, then drop
+    that (node, walk) from the model's `unbatchable()`.
+    """
+
+    def __init__(
+        self,
+        cache: FlashInferPagedKV,
+        num_qo_heads: int,
+        head_dim: int,
+        device: torch.device,
+        bs: int,
+        max_pages_per_req: int,
+        new_len: int = 1,
+        cudagraph: bool = True,
+        causal: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        import flashinfer
+
+        self.cache = cache
+        self.num_qo_heads = num_qo_heads
+        self.num_kv_heads = cache.kv.shape[4]
+        self.head_dim = head_dim
+        self.causal = causal
+        self.dtype = dtype
+        self.device = device
+        self.bs = bs
+        self.new_len = new_len
+        self.max_q = bs * new_len  # total query tokens across the batch
+        self._workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        # Token -> (page, slot) and rope positions, concatenated over the batch.
+        self.token_page = torch.zeros(self.max_q, dtype=torch.long, device=device)
+        self.token_slot = torch.zeros(self.max_q, dtype=torch.long, device=device)
+        self.pos_ids = torch.zeros(self.max_q, dtype=torch.long, device=device)
+        # Ragged batch index buffers, sized for the widest possible plan.
+        self._qo_indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        self._kv_indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+        self._kv_indices_buf = torch.zeros(
+            bs * max_pages_per_req, dtype=torch.int32, device=device
+        )
+        self._last_page_len_buf = torch.ones(bs, dtype=torch.int32, device=device)
+        if cudagraph:
+            self.wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self._workspace,
+                "NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=self._qo_indptr_buf,
+                paged_kv_indptr_buf=self._kv_indptr_buf,
+                paged_kv_indices_buf=self._kv_indices_buf,
+                paged_kv_last_page_len_buf=self._last_page_len_buf,
+            )
+        else:
+            self.wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                self._workspace, "NHD"
+            )
+
+    def plan(self, batch: list[tuple[list[int], int, int]]) -> None:
+        """Plan attention for a batch. `batch[i] = (pages, seq_pos, new_len)`
+        for request i. `len(batch)` must equal the fixed `bs` (pad with dummy
+        requests to the bucket before calling). Builds ragged CPU int32 index
+        tensors and writes the static buffers, exactly like the single-request
+        `FlashInferAttention.plan`, concatenated across the batch."""
+        assert len(batch) == self.bs, (len(batch), self.bs)
+        ps = self.cache.page_size
+        qo_indptr = [0]
+        kv_indptr = [0]
+        kv_indices: list[int] = []
+        last_page_len: list[int] = []
+        tok_page: list[int] = []
+        tok_slot: list[int] = []
+        pos: list[int] = []
+        for pages, seq_pos, new_len in batch:
+            assert new_len == self.new_len, (new_len, self.new_len)
+            total = seq_pos + new_len
+            n_pages = (total + ps - 1) // ps
+            assert n_pages <= len(pages) and n_pages <= (len(self._kv_indices_buf) // self.bs), (
+                n_pages, len(pages),
+            )
+            qo_indptr.append(qo_indptr[-1] + new_len)
+            kv_indptr.append(kv_indptr[-1] + n_pages)
+            kv_indices.extend(pages[:n_pages])
+            last_page_len.append(total % ps or ps)
+            for g in range(seq_pos, total):
+                tok_page.append(pages[g // ps])
+                tok_slot.append(g % ps)
+                pos.append(g)
+
+        n_idx = len(kv_indices)
+        self._qo_indptr_buf.copy_(torch.tensor(qo_indptr, dtype=torch.int32, device=self.device))
+        self._kv_indptr_buf.copy_(torch.tensor(kv_indptr, dtype=torch.int32, device=self.device))
+        self._kv_indices_buf[:n_idx].copy_(
+            torch.tensor(kv_indices, dtype=torch.int32, device=self.device)
+        )
+        self._last_page_len_buf.copy_(
+            torch.tensor(last_page_len, dtype=torch.int32, device=self.device)
+        )
+        nq = len(pos)
+        self.token_page[:nq].copy_(torch.tensor(tok_page, dtype=torch.long), non_blocking=True)
+        self.token_slot[:nq].copy_(torch.tensor(tok_slot, dtype=torch.long), non_blocking=True)
+        self.pos_ids[:nq].copy_(torch.tensor(pos, dtype=torch.long), non_blocking=True)
+        self.total_q = nq
+        self.wrapper.plan(
+            qo_indptr=torch.tensor(qo_indptr, dtype=torch.int32),
+            paged_kv_indptr=torch.tensor(kv_indptr, dtype=torch.int32),
+            paged_kv_indices=torch.tensor(kv_indices, dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor(last_page_len, dtype=torch.int32),
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim,
+            page_size=ps,
+            causal=self.causal,
+            q_data_type=self.dtype,
+        )
 
 
 class FlashInferCacheHandle:
@@ -161,7 +300,7 @@ class FlashInferCacheHandle:
         mstar's `cache_manager.apply_rope` does."""
         import flashinfer
 
-        n = self.attn.new_len
+        n = self.attn.total_q
         q, k = q.to(self.attn.dtype).contiguous(), k.to(self.attn.dtype).contiguous()
         pos_ids = self.attn.pos_ids[:n]
         llama31 = {
@@ -190,7 +329,7 @@ class FlashInferCacheHandle:
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         attn = self.attn
-        n = attn.new_len
+        n = attn.total_q
         layer = attn.cache.kv[self.layer_idx]
         layer[attn.token_page[:n], 0, attn.token_slot[:n]] = k.to(attn.dtype)
         layer[attn.token_page[:n], 1, attn.token_slot[:n]] = v.to(attn.dtype)

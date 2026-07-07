@@ -241,6 +241,28 @@ def test_compute_level_batching() -> None:
     )
 
 
+def test_batched_graph_buckets() -> None:
+    # Pure CPU check of the pad-to-bucket index logic used by batched CUDA-graph
+    # capture (the GPU capture/replay + batched attention are verified
+    # separately by examples/verify_batched_capture.py on a GPU).
+    from mstar_rs.batched_graph import DEFAULT_CAPTURE_BATCH_SIZES as B
+    from mstar_rs.batched_graph import padded_bucket
+
+    assert padded_bucket(1, B) == 1
+    assert padded_bucket(3, B) == 4
+    assert padded_bucket(5, B) == 8
+    assert padded_bucket(8, B) == 8
+    assert padded_bucket(9, B) == 16
+    assert padded_bucket(64, B) == 64
+    for bad in (0, -1, 65, 1000):
+        try:
+            padded_bucket(bad, B)
+            assert False, f"expected ValueError for {bad}"
+        except ValueError:
+            pass
+    print(f"7. BATCHED-BUCKETS OK — pad-to-bucket over {B} (3->4, 5->8, 9->16); rejects 0 and >max")
+
+
 def main() -> int:
     test_reclaim()
     test_error_no_hang()
@@ -248,6 +270,7 @@ def main() -> int:
     test_incremental_reclaim()
     test_loop_stop()
     test_compute_level_batching()
+    test_batched_graph_buckets()
     print("\nALL DIST CHECKS PASSED")
     return 0
 
