@@ -32,6 +32,7 @@ sys.path.insert(0, str(REPO / "python"))
 import torch  # noqa: E402
 
 from mstar_rs.dist import Conductor, Worker  # noqa: E402
+from mstar_rs.driver import Driver  # noqa: E402
 from mstar_rs.graph import edge, emit, loop, node  # noqa: E402
 from mstar_rs.model import Model  # noqa: E402
 from mstar_rs.models.echo import EchoEngine, EchoPolicy  # noqa: E402
@@ -178,12 +179,75 @@ def test_loop_stop() -> None:
     print(f"3. LOOP-STOP OK — EOS bridged; stopped at {len(toks)} tokens (max_iters=1000)")
 
 
+class _BatchStack(Model):
+    """A stateless model whose node does a real STACKED forward over the whole
+    batch (one op for all requests), and an unbatchable variant. Demonstrates
+    that the framework hands `execute` a multi-request batch and a model can
+    batch the compute (not just loop) — the compute-level batching mstar does
+    by default with forward_batched."""
+
+    def __init__(self, unbatch: bool = False) -> None:
+        self.unbatch = unbatch
+        self.seen_batch_sizes: list[int] = []
+
+    def walks(self):
+        return {"fwd": node("f", ["x"], [emit("y", modality="tensor", persist=True)])}
+
+    def unbatchable(self):
+        return [("f", "fwd")] if self.unbatch else []
+
+    def initial_inputs(self, request):
+        return "fwd", [("f", "x", [request["x"]])]
+
+    def execute(self, node_name, walk, inputs, kv=None):
+        self.seen_batch_sizes.append(len(inputs))
+        rids = list(inputs)
+        # STACKED forward: one op over the batch dimension, then split back.
+        stacked = torch.stack([inputs[r]["x"][0] for r in rids])  # [B, ...]
+        out = stacked * 2 + 1
+        return {r: {"y": [out[i]]} for i, r in enumerate(rids)}
+
+    def postprocess(self, name, modality, tensors):
+        return tensors[0]
+
+
+def test_compute_level_batching() -> None:
+    # Two requests ready at the same node are handed to execute together; the
+    # model stacks them into one forward. Results must match per-request math.
+    m = _BatchStack(unbatch=False)
+    drv = Driver(m, max_batch_size=8)
+    xs = {drv.submit({"x": torch.tensor([float(i), float(i + 1)])}): i for i in range(2)}
+    drv.run_until_idle()
+    for rid, i in xs.items():
+        got = drv.results[rid][0]
+        exp = torch.tensor([float(i), float(i + 1)]) * 2 + 1
+        assert torch.equal(got, exp), f"req {rid}: {got} != {exp}"
+    assert max(m.seen_batch_sizes) == 2, (
+        f"expected a stacked forward over 2 requests, saw {m.seen_batch_sizes}"
+    )
+
+    # The unbatchable variant is capped to one request per forward.
+    mu = _BatchStack(unbatch=True)
+    drvu = Driver(mu, max_batch_size=8)
+    for i in range(2):
+        drvu.submit({"x": torch.tensor([float(i)])})
+    drvu.run_until_idle()
+    assert max(mu.seen_batch_sizes) == 1, (
+        f"unbatchable node should never batch, saw {mu.seen_batch_sizes}"
+    )
+    print(
+        f"6. COMPUTE-BATCHING OK — batchable node stacked {max(m.seen_batch_sizes)} "
+        f"reqs into one forward; unbatchable capped at {max(mu.seen_batch_sizes)}"
+    )
+
+
 def main() -> int:
     test_reclaim()
     test_error_no_hang()
     test_conductor_is_weightless()
     test_incremental_reclaim()
     test_loop_stop()
+    test_compute_level_batching()
     print("\nALL DIST CHECKS PASSED")
     return 0
 

@@ -212,6 +212,12 @@ pub struct Runtime {
     requests: BTreeMap<u64, RequestState>,
     scheduler: MicroScheduler,
     inflight: BTreeMap<u64, InflightBatch>,
+    /// (node, walk) pairs that must run one request at a time — the engine's
+    /// compute for them can't batch (e.g. a bs=1 CUDA graph over static
+    /// buffers). The scheduler still groups by (node, walk), but next_batch
+    /// caps these to a single request. Mirrors mstar capping a submodule's
+    /// batch by its `can_batch()` / max_batch_size.
+    unbatchable: BTreeSet<(String, String)>,
     kv: Option<KvManager>,
     next_request_id: u64,
     next_batch_id: u64,
@@ -296,6 +302,7 @@ impl Runtime {
             requests: BTreeMap::new(),
             scheduler: MicroScheduler::new(),
             inflight: BTreeMap::new(),
+            unbatchable: BTreeSet::new(),
             kv: None,
             next_request_id: 0,
             next_batch_id: 0,
@@ -311,6 +318,13 @@ impl Runtime {
         node_labels: BTreeMap<String, String>,
     ) {
         self.kv = Some(KvManager::new(configs, node_labels));
+    }
+
+    /// Declare (node, walk) pairs whose compute can't batch — the scheduler
+    /// will hand them at most one request per batch (the rest stay ready and
+    /// run next tick). Mirrors mstar's per-submodule `can_batch()` = false.
+    pub fn configure_unbatchable(&mut self, pairs: Vec<(String, String)>) {
+        self.unbatchable = pairs.into_iter().collect();
     }
 
     /// Current (pages, seq_pos) for a request's cache label, for the data
@@ -518,11 +532,20 @@ impl Runtime {
             .expect("scheduled walk is known")
             .clone();
 
+        // Cap unbatchable (node, walk) pairs to a single request: their
+        // engine compute can't take a batch (e.g. a bs=1 CUDA graph). The
+        // rest of the grouped requests stay ready and run on later ticks.
+        let cap = if self.unbatchable.contains(&(plan.node.clone(), plan.walk.clone())) {
+            1
+        } else {
+            usize::MAX
+        };
+
         let mut inputs = BTreeMap::new();
         let mut kv_views = BTreeMap::new();
         let mut kv_advances = Vec::new();
         let mut scheduled_rids = Vec::new();
-        for &rid in &plan.request_ids {
+        for &rid in plan.request_ids.iter().take(cap) {
             let req = self.requests.get_mut(&rid).expect("rid from ready scan");
             let pstate = req.partitions.get_mut(&partition).expect("known partition");
             // Reserve KV pages FIRST: earlier requests in this same batch may
@@ -942,6 +965,36 @@ mod tests {
         let batch = rt.next_batch(1).unwrap().unwrap();
         assert_eq!(batch.node, "predictor");
         assert_eq!(batch.inputs.len(), 1, "max_batch_size clamps");
+    }
+
+    #[test]
+    fn unbatchable_node_capped_to_one() {
+        // Same setup as two_requests_batch_together, but video_encoder is
+        // declared unbatchable: the scheduler still groups both requests, yet
+        // next_batch hands the node only one (the other stays ready).
+        let mut rt = Runtime::from_walks_json(VJEPA2_WALKS).unwrap();
+        rt.configure_unbatchable(vec![("video_encoder".into(), "prefill_video".into())]);
+        for _ in 0..2 {
+            let rid = rt.add_request();
+            let frames = tref(&mut rt);
+            rt.start_walk(
+                rid,
+                "prefill_video",
+                vec![IncomingInput {
+                    node: "video_encoder".into(),
+                    name: "video_frames".into(),
+                    tensors: vec![frames],
+                }],
+            )
+            .unwrap();
+        }
+        let batch = rt.next_batch(8).unwrap().unwrap();
+        assert_eq!(batch.node, "video_encoder");
+        assert_eq!(batch.inputs.len(), 1, "unbatchable node capped to one request");
+        // The second request is still ready — a follow-up batch picks it up.
+        let batch2 = rt.next_batch(8).unwrap().unwrap();
+        assert_eq!(batch2.node, "video_encoder");
+        assert_eq!(batch2.inputs.len(), 1);
     }
 
     #[test]

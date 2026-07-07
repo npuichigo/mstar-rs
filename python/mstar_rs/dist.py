@@ -201,6 +201,8 @@ class Conductor:
         self.runtime = Runtime(_spec_json(policy))
         if (kv := policy.kv_config()) is not None:
             self.runtime.configure_kv(*kv)
+        if unbatchable := policy.unbatchable():
+            self.runtime.configure_unbatchable([tuple(p) for p in unbatchable])
         self.mbox = Mailbox("conductor", socket_dir)
         self.shm = ShmPool("conductor")
         # uuid -> descriptor for every tensor the runtime is routing.

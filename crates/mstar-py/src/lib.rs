@@ -124,6 +124,11 @@ impl PyRuntime {
         );
     }
 
+    /// (node, walk) pairs whose compute can't batch — scheduled 1 req/batch.
+    fn configure_unbatchable(&mut self, pairs: Vec<(String, String)>) {
+        self.inner.configure_unbatchable(pairs);
+    }
+
     /// (pages, seq_pos) for a request's cache label.
     fn kv_state(&self, request_id: u64, label: &str) -> (Vec<u32>, u64) {
         let st = self.inner.kv_state(request_id, label);

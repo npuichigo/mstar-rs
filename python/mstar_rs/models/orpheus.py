@@ -176,6 +176,15 @@ class Orpheus(Model):
     def kv_config(self):
         return [(KV_LABEL, NUM_PAGES, PAGE_SIZE)], {"LLM": KV_LABEL}
 
+    def unbatchable(self):
+        # In cuda_graph mode every node replays single-slot bs=1 graphs
+        # (sampler / decode / SNAC over static buffers), so the scheduler must
+        # serialize requests through them. The eager path could batch (the
+        # per-request sampler is keyed by rid), so it declares nothing.
+        if not self.cuda_graph:
+            return []
+        return [("LLM", "prefill"), ("LLM", "decode"), ("snac_decoder", "snac_chunk")]
+
     def partitions(self):
         return (
             [

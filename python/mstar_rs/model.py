@@ -55,6 +55,17 @@ class ModelPolicy(ABC):
         Every walk from `walks()` must belong to exactly one partition."""
         return None
 
+    def unbatchable(self) -> list[tuple[str, str]]:
+        """(node, walk) pairs whose engine compute can NOT batch across
+        requests — the scheduler hands them one request at a time (the rest
+        queue). Mirrors mstar capping a submodule whose `can_batch()` is False.
+        Return the nodes backed by a bs=1 CUDA graph over static buffers (e.g.
+        pi05 action_gen, orpheus decode/snac). Default: everything may batch
+        (the runtime groups by (node, walk); a model's `execute` that loops
+        per-request still handles any batch size, just without a stacked
+        forward)."""
+        return []
+
     def initial_inputs(self, request: dict[str, Any]) -> NextWalk:
         """First walk (+ optional kv_appends) for a new single-partition
         request. Implement this OR `initial_walks` (streaming models seed

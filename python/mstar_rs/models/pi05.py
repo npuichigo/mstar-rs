@@ -105,6 +105,12 @@ class PI05(Model):
     def kv_config(self):
         return [(KV_LABEL, NUM_PAGES, PAGE_SIZE)], {"LLM": KV_LABEL}
 
+    def unbatchable(self):
+        # action_gen replays a single-slot bs=1 CUDA graph over static buffers,
+        # so the scheduler must hand it one request at a time. (prefill batches
+        # fine — it writes per-request KV.)
+        return [("LLM", "action_gen")]
+
     # -- request ingestion (mirrors Pi05Model.process_prompt) --------------
 
     def tokenize(self, prompt: str, robot_state) -> torch.Tensor:

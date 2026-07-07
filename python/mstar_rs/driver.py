@@ -35,6 +35,8 @@ class Driver:
         if (kv := model.kv_config()) is not None:
             configs, node_labels = kv
             self.runtime.configure_kv(configs, node_labels)
+        if unbatchable := model.unbatchable():
+            self.runtime.configure_unbatchable([tuple(p) for p in unbatchable])
         self.store = TensorStore(self.runtime)
         # request_id -> list of postprocessed emissions
         self.results: dict[int, list[Any]] = {}
