@@ -25,7 +25,12 @@ from typing import Any
 
 import torch
 
-from ..fi import FlashInferAttention, FlashInferCacheHandle, FlashInferPagedKV
+from ..fi import (
+    BatchedFlashInferAttention,
+    FlashInferAttention,
+    FlashInferCacheHandle,
+    FlashInferPagedKV,
+)
 from ..graph import (
     connection,
     edge,
@@ -46,6 +51,8 @@ NUM_PAGES = 256  # 32k tokens; prompt is short, decode up to max_output_tokens
 # Last page, reserved for CUDA-graph capture warmup writes (a real request's
 # ascending page allocation never reaches it: prompt + 2048 decode < 20 pages).
 SCRATCH_PAGE = NUM_PAGES - 1
+MAX_DECODE_BATCH = 8       # largest batch we'll capture a decode graph for
+MAX_PAGES_PER_REQ = 40     # ceil((prompt + max_output_tokens) / PAGE_SIZE) bound
 
 
 class Orpheus(Model):
@@ -59,7 +66,13 @@ class Orpheus(Model):
     ) -> None:
         from mstar.distributed.communication import TPCommGroup
         from mstar.model.orpheus.orpheus_model import OrpheusModel
-        from mstar.utils.sampling import CudaGraphableSampler, Sampler
+        from mstar.utils.sampling import (
+            CudaGraphableSampler,
+            Sampler,
+            SamplerBuffers,
+            SamplingConfig,
+            SeenTokenMask,
+        )
 
         self.device = torch.device(device)
         self.max_output_tokens = max_output_tokens
@@ -100,35 +113,32 @@ class Orpheus(Model):
             self.device, max_new_tokens=1, cudagraph=cuda_graph, causal=True,
         )
         self.sampler = Sampler(device=self.device)  # eager path (cuda_graph=False)
-        # In-graph sampler (bs=1): pre-allocated per-request buffers sampled
-        # INSIDE the decode graph, exactly as mstar's decode graph captures its
-        # `sampler.sample`. Per-step offset advance + seen-token scatter are
-        # both capturable in-place ops. Greedy is encoded as (temp=1, top_k=1).
         dev = self.device
         V = self.cfg.vocab_size
-        self._g_sampler = CudaGraphableSampler(
-            temperature_buf=torch.ones(1, device=dev),
-            top_k_buf=torch.zeros(1, dtype=torch.int32, device=dev),
-            top_p_buf=torch.ones(1, device=dev),
-            seed_buf=torch.zeros(1, dtype=torch.long, device=dev),
-            offset_buf=torch.zeros(1, dtype=torch.long, device=dev),
-            rep_penalty_buf=torch.ones(1, device=dev),
-            seen_tokens_buf=torch.zeros(1, V, dtype=torch.bool, device=dev),
-            tp_group=TPCommGroup.trivial(),
+        # Batched in-graph sampler (mstar's SamplerBuffers): per-request slots
+        # for temperature/top_k/top_p/seed/rep_penalty + a [max_bs, V]
+        # seen-token mask for the repetition penalty (orpheus defaults to
+        # rep_penalty=1.3, so this is live — NOT the greedy no-penalty path).
+        # gather_for_request_ids fills the per-step [bs] buffers before replay;
+        # the in-graph sample scatters the new token into seen_tokens; we sync
+        # it back into each request's SeenTokenMask after. Exactly mstar's
+        # cuda_graph_runner decode dance.
+        self._SamplingConfig = SamplingConfig
+        self._SeenTokenMask = SeenTokenMask
+        self._sbuf = SamplerBuffers.allocate(
+            MAX_DECODE_BATCH, dev, tp_group=TPCommGroup.trivial(), vocab_size=V
         )
-        self._g_sampled = torch.zeros(1, dtype=torch.long, device=dev)
+        self._seen: dict[int, Any] = {}  # request_id -> SeenTokenMask
         self._pending_stops: list[tuple[int, str]] = []
-        # In cuda_graph mode the sampler/decode/SNAC graphs are single-slot
-        # (bs=1 static buffers), so only ONE request may be in flight through
-        # the LLM partition at a time — a second would reset `_g_sampler` state
-        # mid-decode and corrupt the first. Tracked on the conductor instance.
-        self._active_llm_rid: int | None = None
-        # CUDA-graph decode state: one graph captures the single-token forward
-        # (embed -> 28 layers over the paged cache -> lm_head -> logits) with
-        # static token input + logits output. Plan runs outside the graph and
-        # updates the wrapper's fixed page/pos buffers; sampling runs outside.
-        self._g_token = torch.zeros(1, dtype=torch.long, device=self.device)
-        self._decode_graph: torch.cuda.CUDAGraph | None = None
+        # Batched decode CUDA-graph state, sized for the largest batch. Rows
+        # [0:N] hold the N requests of the current batch (one prev-token each);
+        # one captured graph + BatchedFlashInferAttention + capture-time sampler
+        # per distinct batch size N.
+        self._g_tokens = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
+        self._g_sampled = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
+        self._dec_attn: dict[int, Any] = {}       # N -> BatchedFlashInferAttention
+        self._dec_graph: dict[int, Any] = {}      # N -> CUDAGraph
+        self._dec_sampler: dict[int, Any] = {}    # N -> capture-time CudaGraphableSampler
         # CUDA-graph SNAC state: every window is <= snac_window_tokens (the
         # final partial flush is padded up to it), so one fixed-shape graph
         # covers all chunks. Static token input, static PCM output.
@@ -141,6 +151,11 @@ class Orpheus(Model):
         # Debug: when set, `execute` records the LLM token stream per request
         # (for verification against an independent reference decode).
         self.token_log: dict[int, list[int]] | None = None
+        # Debug: when set, batched decode also records per-request pre-sample
+        # logits (an extra eager forward), for verifying batched == per-request
+        # at the LOGIT level — greedy token streams can't bit-match across
+        # batch sizes because bf16 kernel-order noise flips the argmax.
+        self.logit_log: dict[int, list[torch.Tensor]] | None = None
 
     # -- graph + topology -------------------------------------------------
 
@@ -177,13 +192,14 @@ class Orpheus(Model):
         return [(KV_LABEL, NUM_PAGES, PAGE_SIZE)], {"LLM": KV_LABEL}
 
     def unbatchable(self):
-        # In cuda_graph mode every node replays single-slot bs=1 graphs
-        # (sampler / decode / SNAC over static buffers), so the scheduler must
-        # serialize requests through them. The eager path could batch (the
-        # per-request sampler is keyed by rid), so it declares nothing.
+        # decode now batches (BatchedFlashInferAttention + a [max_bs] batched
+        # sampler). prefill still can't (per-request prefix lengths differ, so
+        # no shared new_len) and SNAC still replays a single-slot graph, so both
+        # stay capped to one request per batch in cuda_graph mode. The eager
+        # path batches nothing special (per-request sampler keyed by rid).
         if not self.cuda_graph:
             return []
-        return [("LLM", "prefill"), ("LLM", "decode"), ("snac_decoder", "snac_chunk")]
+        return [("LLM", "prefill"), ("snac_decoder", "snac_chunk")]
 
     def partitions(self):
         return (
@@ -209,35 +225,28 @@ class Orpheus(Model):
         end = torch.tensor(self.cfg.end_token_ids, dtype=torch.long)
         return torch.cat([start, toks, end]).to(self.device)
 
-    def _config_g_sampler(self, seed: int) -> None:
-        """Reset the in-graph sampler for a new request (bs=1): seed, offset,
-        seen mask, and the sampling params. Greedy -> (temp=1, top_k=1) argmax,
-        as `sample_cuda_graphable_gpu` documents (temp==0 would div-by-zero)."""
-        temp = 1.0 if self.greedy else self.cfg.temperature
-        top_k = 1 if self.greedy else 0  # 0 -> disabled (full vocab) in-kernel
-        top_p = 1.0 if self.greedy else self.cfg.top_p
-        rep = 1.0 if self.greedy else self.cfg.repetition_penalty
-        self._g_sampler.temperature_buf.fill_(temp)
-        self._g_sampler.top_k_buf.fill_(top_k)
-        self._g_sampler.top_p_buf.fill_(top_p)
-        self._g_sampler.rep_penalty_buf.fill_(rep)
-        self._g_sampler.seed_buf.fill_(seed)
-        self._g_sampler.offset_buf.zero_()
-        self._g_sampler.seen_tokens_buf.zero_()
+    def _register_batched(self, rid: int, seed: int) -> None:
+        """Register a request with the batched sampler: allocate its slot +
+        seed its config (greedy -> temperature=0, which SamplerBuffers encodes
+        as top_k=1 argmax), and create its per-request seen-token mask."""
+        cfg = self._SamplingConfig(
+            vocab_size=self.cfg.vocab_size,
+            temperature=0.0 if self.greedy else self.cfg.temperature,
+            top_k=1 if self.greedy else 0,
+            top_p=1.0 if self.greedy else self.cfg.top_p,
+            repetition_penalty=1.0 if self.greedy else self.cfg.repetition_penalty,
+            ignore_eos=False,
+        )
+        cfg.set_seed(seed)
+        self._sbuf.register_request(str(rid), cfg)
+        self._seen[rid] = self._SeenTokenMask.new(str(rid), self.cfg.vocab_size, self.device)
 
     def initial_walks(self, request: dict[str, Any]) -> list[NextWalk]:
         rid = request["request_id"]
         text_ids = self._tokenize(request.get("prompt", ""), request.get("voice", "tara"))
         seed = request.get("seed", 0)
         if self.cuda_graph:
-            if self._active_llm_rid is not None:
-                raise RuntimeError(
-                    "orpheus cuda_graph mode is single-in-flight (bs=1 sampler/"
-                    f"decode/SNAC graphs); request {self._active_llm_rid} is "
-                    f"still active when {rid} was submitted — serialize requests"
-                )
-            self._active_llm_rid = rid
-            self._config_g_sampler(seed)
+            self._register_batched(rid, seed)
         else:
             # Per-request eager sampler state (faithful to mstar's config + seed).
             srid = str(rid)
@@ -270,45 +279,51 @@ class Orpheus(Model):
             logits = self.lm_head(hidden[-1:])  # (1, vocab)
         return logits
 
-    def _decode_forward(self, handle: FlashInferCacheHandle) -> None:
-        """The capturable single-token decode step over static buffers: reads
-        `_g_token`, runs the 28-layer paged decode + lm_head, then SAMPLES
-        in-graph into `_g_sampled` (matching mstar, whose decode graph captures
-        its `sampler.sample`). The 28 per-layer KV reads/writes and the
-        sampler's offset-advance + seen-token scatter all bake into the graph;
-        KV writes target the wrapper's static token_page/token_slot buffers,
-        so replay lands at whatever plan() set them to."""
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            emb = self.embed_tokens(self._g_token)
-            hidden = self.language_model(emb, cache_handle=handle)
-            logits = self.lm_head(hidden[-1:])
-        token = self._g_sampler.sample(["_"], logits, apply_penalty=True)
-        self._g_sampled.copy_(token.view(1))
+    def _ensure_decode_graph(self, n: int, batch_plan: list, srids: list, seen_masks: list):
+        """Return the capture-time sampler for batch size `n`, capturing its
+        decode graph on first use. The graph reads `_g_tokens[:n]`, runs the
+        batched paged decode + lm_head -> logits [n, V], and SAMPLES in-graph
+        (per-request temperature/top_p/rep_penalty via the gathered
+        SamplerBuffers) into `_g_sampled[:n]`. Attention is (re)planned outside
+        capture over every request's page table. The sampler offset/seen state
+        touched by warmup is restored so the first real decode continues the
+        request's stream (mstar's decode dance)."""
+        if n in self._dec_graph:
+            self._dec_attn[n].plan(batch_plan)
+            return self._dec_sampler[n]
+        attn = BatchedFlashInferAttention(
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim, self.device,
+            bs=n, max_pages_per_req=MAX_PAGES_PER_REQ, new_len=1, cudagraph=True, causal=True,
+        )
+        self._dec_attn[n] = attn
+        handle = FlashInferCacheHandle(attn)
+        attn.plan(batch_plan)
+        self._sbuf.stage_seen_token_masks(srids, seen_masks)
+        sampler = self._sbuf.gather_for_request_ids(srids, n, gather_seen_tokens=True)
+        self._dec_sampler[n] = sampler
 
-    def _capture_decode(self) -> None:
-        """Capture the decode graph once. Warmup writes go to SCRATCH_PAGE
-        (a real request never allocates it), so the committed cache is
-        untouched; the graph records writes to the static buffers, which real
-        replays repoint at the request's actual pages via plan()."""
-        handle = FlashInferCacheHandle(self._decode_attn)
-        self._decode_attn.plan([SCRATCH_PAGE], seq_pos=0, new_len=1)
-        self._g_token.fill_(self.cfg.start_token_id)
-        # The warmup passes run the in-graph sampler, advancing offset_buf and
-        # scattering into seen_tokens_buf. Snapshot both and restore after
-        # capture so the first real decode continues the request's RNG/seen
-        # stream (the prefill already sampled token 0 -> offset=1).
-        saved_offset = self._g_sampler.offset_buf.clone()
-        saved_seen = self._g_sampler.seen_tokens_buf.clone()
+        def dec_fn() -> None:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                emb = self.embed_tokens(self._g_tokens[:n])
+                hidden = self.language_model(emb, cache_handle=handle)
+                logits = self.lm_head(hidden)  # [n, V] — each row is a last token
+            token = sampler.sample(srids, logits, apply_penalty=True)
+            self._g_sampled[:n].copy_(token.view(n))
+
+        saved_off = self._sbuf.offset_buf[:n].clone()
+        saved_seen = self._sbuf.seen_tokens.buf[:n].clone()
         torch.cuda.synchronize()
-        for _ in range(2):  # warmup (writes to scratch page; triggers autotune)
-            self._decode_forward(handle)
+        for _ in range(2):  # warmup (autotune); writes to the current pages
+            dec_fn()
+        self._sbuf.offset_buf[:n].copy_(saved_off)
+        self._sbuf.seen_tokens.buf[:n].copy_(saved_seen)
         torch.cuda.synchronize()
-        self._decode_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._decode_graph):
-            self._decode_forward(handle)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dec_fn()
         torch.cuda.synchronize()
-        self._g_sampler.offset_buf.copy_(saved_offset)
-        self._g_sampler.seen_tokens_buf.copy_(saved_seen)
+        self._dec_graph[n] = graph
+        return sampler
 
     def _snac_forward(self) -> None:
         """Capturable SNAC decode over the static `_g_snac_tokens` (always
@@ -336,39 +351,75 @@ class Orpheus(Model):
             self._snac_forward()
         torch.cuda.synchronize()
 
+    def _execute_decode_batched(self, inputs, kv) -> dict:
+        """One decode step for a BATCH of requests: load each prev-token into
+        its row, plan batched attention over every request's pages, replay the
+        per-batch-size graph (batched paged decode + in-graph batched sample),
+        split per request. The per-step seen-mask stage/gather (before) and
+        sync (after) mirror mstar's cuda_graph_runner decode dance."""
+        rids = list(inputs)
+        n = len(rids)
+        assert n <= MAX_DECODE_BATCH, f"decode batch {n} > {MAX_DECODE_BATCH}"
+        srids = [str(r) for r in rids]
+        batch_plan = []
+        for j, rid in enumerate(rids):
+            self._g_tokens[j] = inputs[rid]["text_inputs"][0].view(())
+            v = kv[rid]
+            batch_plan.append((v["pages"], v["seq_pos"], 1))
+        seen_masks = [self._seen[r] for r in rids]
+        self._ensure_decode_graph(n, batch_plan, srids, seen_masks)
+        if self.logit_log is not None:
+            self._record_decode_logits(n, batch_plan, rids)  # extra eager forward
+        self._sbuf.stage_seen_token_masks(srids, seen_masks)
+        self._sbuf.gather_for_request_ids(srids, n, gather_seen_tokens=True)
+        self._dec_graph[n].replay()
+        self._dec_sampler[n].sync_seen_token_masks(seen_masks)
+        out = {}
+        for j, rid in enumerate(rids):
+            tok = self._g_sampled[j : j + 1].clone().to(torch.long)
+            ti = int(tok.item())
+            if ti == self.cfg.stop_token_id:
+                self._pending_stops.append((rid, "decode_loop"))
+            if self.token_log is not None:
+                self.token_log.setdefault(rid, []).append(ti)
+            out[rid] = {"new_token": [tok], "text_inputs": [tok]}
+        return out
+
+    def _record_decode_logits(self, n: int, batch_plan: list, rids: list) -> None:
+        """Verification hook: run one EAGER batched decode forward (no graph)
+        to capture per-request pre-sample logits. Writes the same new-token K/V
+        the graph replay will (idempotent), so running it just before replay is
+        safe. Only used when `logit_log` is set."""
+        eattn = BatchedFlashInferAttention(
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim, self.device,
+            bs=n, max_pages_per_req=MAX_PAGES_PER_REQ, new_len=1, cudagraph=False, causal=True,
+        )
+        eattn.plan(batch_plan)
+        eh = FlashInferCacheHandle(eattn)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            emb = self.embed_tokens(self._g_tokens[:n])
+            hidden = self.language_model(emb, cache_handle=eh)
+            logits = self.lm_head(hidden)  # [n, V]
+        for j, rid in enumerate(rids):
+            self.logit_log.setdefault(rid, []).append(logits[j].detach().float().cpu())
+
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
-        # cuda_graph mode replays single-slot graphs (sampler/decode/SNAC) over
-        # bs=1 static buffers; batching >1 request in one execute call would
-        # interleave their state and corrupt every output. Fail loud. (This is
-        # the bs=1 path verified bit-exact; per-request graph state is future
-        # work — see the [bs,V] buffers mstar uses.)
-        if self.cuda_graph and len(inputs) > 1:
-            raise RuntimeError(
-                f"orpheus cuda_graph execute is single-request; got {len(inputs)}"
-            )
+        if node_name == "LLM" and walk == "decode" and self.cuda_graph:
+            return self._execute_decode_batched(inputs, kv)
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
             if node_name == "LLM":
-                if self.cuda_graph and walk == "decode":
-                    view = kv[rid]
-                    if self._decode_graph is None:
-                        self._capture_decode()  # one-time (uses scratch page)
-                    # Plan the real step (append 1) into the fixed buffers,
-                    # load the token, replay — the token is sampled IN-GRAPH.
-                    self._decode_attn.plan(view["pages"], view["seq_pos"], 1)
-                    self._g_token.copy_(named["text_inputs"][0].view(1))
-                    self._decode_graph.replay()
-                    token = self._g_sampled.clone()
-                elif self.cuda_graph:  # prefill: eager forward, in-graph sampler
+                if self.cuda_graph:  # prefill: eager forward + batched sampler (bs=1)
                     logits = self._run_llm(named["text_inputs"][0], kv[rid], self._prefill_attn)
-                    token = self._g_sampler.sample(["_"], logits, apply_penalty=True).view(1)
+                    self._sbuf.stage_seen_token_masks([str(rid)], [self._seen[rid]])
+                    sampler = self._sbuf.gather_for_request_ids([str(rid)], 1, gather_seen_tokens=True)
+                    token = sampler.sample([str(rid)], logits, apply_penalty=True).view(1).to(torch.long)
+                    self._seen[rid].add_tokens(token)  # so decode penalises token 0
                 else:  # eager path (cuda_graph=False)
                     attn = self._prefill_attn if walk == "prefill" else self._decode_attn
                     logits = self._run_llm(named["text_inputs"][0], kv[rid], attn)
-                    token = self.sampler.sample([str(rid)], logits, apply_penalty=True)
-                token = token.view(1).to(torch.long)  # (1,)
-                # EOS -> stop the decode loop (mstar's check_stop).
+                    token = self.sampler.sample([str(rid)], logits, apply_penalty=True).view(1).to(torch.long)
                 if walk == "decode" and int(token.item()) == self.cfg.stop_token_id:
                     self._pending_stops.append((rid, "decode_loop"))
                 if self.token_log is not None:
@@ -420,9 +471,11 @@ class Orpheus(Model):
                     [("LLM", "text_inputs", first)],
                     {KV_LABEL: 1},
                 )
-            self.sampler.remove_request(str(request_id))
-            if self._active_llm_rid == request_id:
-                self._active_llm_rid = None  # sampler free; a new request may start
+            if self.cuda_graph:
+                self._sbuf.unregister_request(str(request_id))
+                self._seen.pop(request_id, None)
+            else:
+                self.sampler.remove_request(str(request_id))
             return None  # decode finished -> LLM partition done
         # SNAC: re-arm until the final window is consumed.
         return None if stream_done else ("snac_chunk", [])
