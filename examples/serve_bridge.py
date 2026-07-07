@@ -1,5 +1,5 @@
 """End-to-end streaming demo: the Rust (axum) frontend in front of the Python
-conductor, over the `mstar-comm` Mailbox mesh.
+conductor, over the `mstar-comm` ZmqCommunicator mesh.
 
     HTTP  →  axum frontend (Rust)  →  conductor (Python)  →  worker (Python)
              tokenize + SSE            model policy           model.execute

@@ -19,7 +19,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum MailboxError {
+pub enum CommError {
     #[error("zmq: {0}")]
     Zmq(#[from] zmq::Error),
     #[error("serialize: {0}")]
@@ -42,7 +42,7 @@ fn sock_path(dir: &Path, id: &str) -> PathBuf {
 ///
 /// Field order matters for `Drop`: the sockets must close before the
 /// `Context` is dropped (`zmq_ctx_term` blocks until its sockets are gone).
-pub struct Mailbox<M> {
+pub struct ZmqCommunicator<M> {
     my_id: String,
     dir: PathBuf,
     // PULL inbox. Behind a Mutex because a zmq `Socket` is `!Sync` (and must be
@@ -54,12 +54,12 @@ pub struct Mailbox<M> {
     _marker: PhantomData<fn() -> M>,
 }
 
-impl<M> Mailbox<M>
+impl<M> ZmqCommunicator<M>
 where
     M: Serialize + DeserializeOwned + Send + 'static,
 {
     /// Bind this entity's PULL inbox at `ipc://<dir>/<my_id>.ipc`.
-    pub fn bind(my_id: impl Into<String>, dir: impl Into<PathBuf>) -> Result<Self, MailboxError> {
+    pub fn bind(my_id: impl Into<String>, dir: impl Into<PathBuf>) -> Result<Self, CommError> {
         let my_id = my_id.into();
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -85,8 +85,8 @@ where
     /// Send `msg` to peer `peer_id` (fire-and-forget). Queues if the peer
     /// isn't bound yet and reconnects transparently if it restarted — libzmq
     /// owns both, so this never reports "unreachable".
-    pub fn send(&self, peer_id: &str, msg: &M) -> Result<(), MailboxError> {
-        let bytes = bincode::serialize(msg).map_err(MailboxError::Serialize)?;
+    pub fn send(&self, peer_id: &str, msg: &M) -> Result<(), CommError> {
+        let bytes = bincode::serialize(msg).map_err(CommError::Serialize)?;
         let mut peers = self.peers.lock().expect("peers lock");
         if !peers.contains_key(peer_id) {
             let push = self.ctx.socket(zmq::PUSH)?;
@@ -145,7 +145,7 @@ where
     }
 }
 
-impl<M> Drop for Mailbox<M> {
+impl<M> Drop for ZmqCommunicator<M> {
     fn drop(&mut self) {
         // Sockets (pull + peers) close first via field-drop order; zmq unlinks
         // the bound ipc file on close, but remove it defensively too.
@@ -172,7 +172,7 @@ mod tests {
         dir
     }
 
-    fn wait_for<M, F: Fn(&Mailbox<M>) -> Option<Msg>>(mb: &Mailbox<M>, f: F) -> Msg
+    fn wait_for<M, F: Fn(&ZmqCommunicator<M>) -> Option<Msg>>(mb: &ZmqCommunicator<M>, f: F) -> Msg
     where
         M: Serialize + DeserializeOwned + Send + 'static,
     {
@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn two_entities_exchange_messages() {
         let dir = tmpdir("exch");
-        let conductor: Mailbox<Msg> = Mailbox::bind("conductor", &dir).unwrap();
-        let worker: Mailbox<Msg> = Mailbox::bind("worker_0", &dir).unwrap();
+        let conductor: ZmqCommunicator<Msg> = ZmqCommunicator::bind("conductor", &dir).unwrap();
+        let worker: ZmqCommunicator<Msg> = ZmqCommunicator::bind("worker_0", &dir).unwrap();
 
         conductor
             .send("worker_0", &Msg::Batch {
@@ -208,8 +208,8 @@ mod tests {
     #[test]
     fn many_messages_arrive_in_order_from_one_sender() {
         let dir = tmpdir("order");
-        let a: Mailbox<Msg> = Mailbox::bind("a", &dir).unwrap();
-        let b: Mailbox<Msg> = Mailbox::bind("b", &dir).unwrap();
+        let a: ZmqCommunicator<Msg> = ZmqCommunicator::bind("a", &dir).unwrap();
+        let b: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
         for i in 0..100 {
             a.send("b", &Msg::Batch { id: i, node: "n".into() }).unwrap();
         }
@@ -235,9 +235,9 @@ mod tests {
         // Unlike the old UDS transport (which errored on a missing peer), zmq
         // PUSH queues to a not-yet-bound endpoint and delivers once it binds.
         let dir = tmpdir("queue");
-        let a: Mailbox<Msg> = Mailbox::bind("a", &dir).unwrap();
+        let a: ZmqCommunicator<Msg> = ZmqCommunicator::bind("a", &dir).unwrap();
         a.send("late", &Msg::Hello("queued".into())).unwrap(); // no peer yet — no error
-        let late: Mailbox<Msg> = Mailbox::bind("late", &dir).unwrap();
+        let late: ZmqCommunicator<Msg> = ZmqCommunicator::bind("late", &dir).unwrap();
         let got = wait_for(&late, |m| m.try_recv());
         assert_eq!(got, Msg::Hello("queued".into()));
     }
@@ -245,15 +245,15 @@ mod tests {
     #[test]
     fn reconnects_after_peer_restart() {
         let dir = tmpdir("restart");
-        let a: Mailbox<Msg> = Mailbox::bind("a", &dir).unwrap();
+        let a: ZmqCommunicator<Msg> = ZmqCommunicator::bind("a", &dir).unwrap();
         {
-            let b: Mailbox<Msg> = Mailbox::bind("b", &dir).unwrap();
+            let b: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
             a.send("b", &Msg::Hello("1".into())).unwrap();
             wait_for(&b, |b| b.try_recv());
         } // b drops; zmq unlinks its inbox
         std::thread::sleep(Duration::from_millis(20));
         // New b at the same id: a's cached PUSH auto-reconnects to it.
-        let b2: Mailbox<Msg> = Mailbox::bind("b", &dir).unwrap();
+        let b2: ZmqCommunicator<Msg> = ZmqCommunicator::bind("b", &dir).unwrap();
         a.send("b", &Msg::Hello("2".into())).unwrap();
         let got = wait_for(&b2, |b| b.try_recv());
         assert_eq!(got, Msg::Hello("2".into()));

@@ -9,11 +9,11 @@
 //! so the envelope schema is explicit and cross-process-stable.
 //!
 //! Transport is deliberately the only thing here; message *types* are the
-//! runtime's concern, so [`Mailbox`] is generic over any
+//! runtime's concern, so [`ZmqCommunicator`] is generic over any
 //! `Serialize + DeserializeOwned` message.
 
-mod mailbox;
+mod communicator;
 pub mod shm;
 
-pub use mailbox::{Mailbox, MailboxError};
+pub use communicator::{ZmqCommunicator, CommError};
 pub use shm::{ShmArena, ShmError, ALIGN};

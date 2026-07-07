@@ -1,5 +1,5 @@
 """Multi-process runtime: a **conductor** process drives one or more
-**worker** processes over the ZeroMQ control mesh (`Mailbox`), with tensors
+**worker** processes over the ZeroMQ control mesh (`ZmqCommunicator`), with tensors
 moving through shared memory (`ShmArena`).
 
 Split of responsibilities (mirroring mstar's conductor/worker):
@@ -32,7 +32,7 @@ from typing import Any
 import msgpack
 import torch
 
-from mstar_rs._core import Mailbox, Runtime, ShmArena
+from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
 # ---- tensor <-> shared-memory codec -----------------------------------------
 
@@ -113,7 +113,7 @@ class Worker:
         self.worker_id = worker_id
         self.engine = engine
         self.device = device
-        self.mbox = Mailbox(worker_id, socket_dir)
+        self.mbox = ZmqCommunicator(worker_id, socket_dir)
         self.shm = ShmPool(worker_id)
 
     def run(self) -> None:
@@ -203,7 +203,7 @@ class Conductor:
             self.runtime.configure_kv(*kv)
         if unbatchable := policy.unbatchable():
             self.runtime.configure_unbatchable([tuple(p) for p in unbatchable])
-        self.mbox = Mailbox("conductor", socket_dir)
+        self.mbox = ZmqCommunicator("conductor", socket_dir)
         self.shm = ShmPool("conductor")
         # uuid -> descriptor for every tensor the runtime is routing.
         self.desc: dict[int, list] = {}
@@ -439,7 +439,7 @@ class Conductor:
 
         The frontend sends `submit` messages (token-ids) on our inbox; we wire
         each per-token emission and the request-complete signal back to it over
-        the same `Mailbox` mesh as msgpack. `submit`/`done`/`token` are the
+        the same `ZmqCommunicator` mesh as msgpack. `submit`/`done`/`token` are the
         only messages that cross this seam — tensor bytes never do (those move
         worker<->conductor through SHM)."""
         self.on_token = lambda front_rid, value: self.mbox.send(

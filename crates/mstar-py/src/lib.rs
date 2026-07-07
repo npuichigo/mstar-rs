@@ -17,7 +17,7 @@ use std::collections::BTreeMap as StdBTreeMap;
 
 use std::time::Duration;
 
-use mstar_comm::{Mailbox, ShmArena};
+use mstar_comm::{ZmqCommunicator, ShmArena};
 use mstar_core::{IncomingInput, TensorRef};
 use mstar_runtime::{Event, KvCacheConfig, Runtime, RuntimeError};
 
@@ -372,19 +372,19 @@ impl PyShmArena {
 
 /// The control-plane message mesh for the conductor + worker processes.
 /// Carries opaque `bytes` payloads (the Python side frames its protocol with
-/// msgpack); transport is the ZeroMQ PUSH/PULL `Mailbox` (ordered, reconnecting).
-#[pyclass(name = "Mailbox")]
-struct PyMailbox {
-    inner: Mailbox<Vec<u8>>,
+/// msgpack); transport is the ZeroMQ PUSH/PULL `ZmqCommunicator` (ordered, reconnecting).
+#[pyclass(name = "ZmqCommunicator")]
+struct PyZmqCommunicator {
+    inner: ZmqCommunicator<Vec<u8>>,
 }
 
 #[pymethods]
-impl PyMailbox {
+impl PyZmqCommunicator {
     /// Bind this entity's PULL inbox at `ipc://<dir>/<my_id>.ipc`.
     #[new]
     fn new(my_id: &str, dir: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: Mailbox::bind(my_id, dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            inner: ZmqCommunicator::bind(my_id, dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         })
     }
 
@@ -412,7 +412,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyBatch>()?;
     m.add_class::<PyShmArena>()?;
-    m.add_class::<PyMailbox>()?;
+    m.add_class::<PyZmqCommunicator>()?;
     m.add("EMIT_TO_CLIENT", mstar_core::EMIT_TO_CLIENT)?;
     m.add("EMPTY_DESTINATION", mstar_core::EMPTY_DESTINATION)?;
     Ok(())

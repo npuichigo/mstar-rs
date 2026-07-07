@@ -1,5 +1,5 @@
 //! Bridge from the axum frontend to the Python conductor over the
-//! `mstar-comm` `Mailbox`.
+//! `mstar-comm` `ZmqCommunicator`.
 //!
 //! The frontend tokenizes the prompt (Rust), submits the token-ids to the
 //! conductor, and receives a stream of generated token-ids back — which it
@@ -8,7 +8,7 @@
 //! policy per forward pass.
 //!
 //! Wire format is msgpack (the conductor is Python and speaks msgpack), sent
-//! as the `Mailbox`'s opaque byte payload. Messages are dynamic
+//! as the `ZmqCommunicator`'s opaque byte payload. Messages are dynamic
 //! `serde_json::Value` maps, so the schema is shared by convention:
 //!   frontend -> conductor: {"t":"submit","rid":u64,"tokens":[u32],"max_tokens":u32}
 //!   conductor -> frontend: {"t":"token","rid":u64,"id":u32} | {"t":"done","rid":u64}
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mstar_comm::Mailbox;
+use mstar_comm::ZmqCommunicator;
 use serde_json::json;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -30,7 +30,7 @@ pub enum StreamItem {
 }
 
 pub struct Bridge {
-    mbox: Arc<Mailbox<Vec<u8>>>,
+    mbox: Arc<ZmqCommunicator<Vec<u8>>>,
     next_rid: AtomicU64,
     // rid -> the SSE task's sender; the demux thread routes tokens here.
     routes: Arc<Mutex<HashMap<u64, UnboundedSender<StreamItem>>>>,
@@ -41,7 +41,7 @@ impl Bridge {
     /// conductor messages out to per-request channels.
     pub fn new(socket_dir: &str) -> Result<Self, String> {
         let mbox = Arc::new(
-            Mailbox::<Vec<u8>>::bind("frontend", socket_dir).map_err(|e| e.to_string())?,
+            ZmqCommunicator::<Vec<u8>>::bind("frontend", socket_dir).map_err(|e| e.to_string())?,
         );
         let routes: Arc<Mutex<HashMap<u64, UnboundedSender<StreamItem>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -57,7 +57,7 @@ impl Bridge {
         })
     }
 
-    fn demux_loop(mbox: Arc<Mailbox<Vec<u8>>>, routes: Arc<Mutex<HashMap<u64, UnboundedSender<StreamItem>>>>) {
+    fn demux_loop(mbox: Arc<ZmqCommunicator<Vec<u8>>>, routes: Arc<Mutex<HashMap<u64, UnboundedSender<StreamItem>>>>) {
         loop {
             let Some(payload) = mbox.recv_timeout(Duration::from_millis(500)) else {
                 continue;

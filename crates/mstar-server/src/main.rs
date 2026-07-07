@@ -5,13 +5,13 @@
 //! Python), and **per-token detokenization + SSE streaming**. This is
 //! exactly the layer vLLM and SGLang moved to Rust. The conductor stays
 //! Python (model policy, per-forward-pass, off the hot path); this frontend
-//! talks to it over the `mstar-comm` `Mailbox` (submit token-ids, receive a
+//! talks to it over the `mstar-comm` `ZmqCommunicator` (submit token-ids, receive a
 //! token-id stream) — see `bridge`.
 //!
 //! Two token sources, selected at startup by whether a conductor socket dir
 //! is passed:
 //!   - **real** (socket dir given): submit token-ids to the Python conductor
-//!     over the Mailbox, stream the generated token-ids back (`sse_from_stream`).
+//!     over the ZmqCommunicator, stream the generated token-ids back (`sse_from_stream`).
 //!   - **mock** (no socket dir): a self-contained generator that echoes the
 //!     prompt tokens (`mockgen`) — proves the HTTP/tokenize/detok/SSE layer
 //!     standalone, no conductor needed.
@@ -40,7 +40,7 @@ use tokenizer::{IncrementalDecoder, Tok};
 struct AppState {
     tok: Arc<Tok>,
     /// Present when a conductor socket dir is given: real streaming via the
-    /// Mailbox bridge. Absent: the self-contained mock generator.
+    /// ZmqCommunicator bridge. Absent: the self-contained mock generator.
     bridge: Option<Arc<Bridge>>,
 }
 
@@ -144,7 +144,7 @@ struct ChatMessage {
 /// Stream generated tokens as OpenAI-style SSE `chat.completion.chunk`s. The
 /// token source here is a mock generator (echoes the prompt's tokens); the
 /// real path replaces it with a stream of token-ids arriving from the
-/// conductor over the Mailbox. Either way, tokenization, incremental
+/// conductor over the ZmqCommunicator. Either way, tokenization, incremental
 /// detokenization, and SSE serialization all happen in Rust.
 async fn chat_completions(
     State(st): State<AppState>,
@@ -220,7 +220,7 @@ fn sse_from_stream(
 /// Mock token source: build the per-token SSE events eagerly and replay them
 /// as a stream. Used when no conductor is attached — the real path
 /// (`sse_from_stream`) produces the same SSE from token-ids arriving over the
-/// Mailbox; only the token *source* differs (tokenization, incremental
+/// ZmqCommunicator; only the token *source* differs (tokenization, incremental
 /// detokenization, and SSE serialization stay identical, all Rust off the GIL).
 mod mockgen {
     use super::*;

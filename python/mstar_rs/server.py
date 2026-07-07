@@ -18,7 +18,7 @@ This is one of two front-ends; they are complementary, not redundant:
     detokenize + JSON/SSE serialize all contend for one interpreter lock —
     which is exactly why **both vLLM and SGLang moved their front-ends to
     Rust**. T6 does the same: HTTP + tokenize + detokenize + SSE in Rust
-    (off the GIL), talking to the same Python conductor over the Mailbox. It
+    (off the GIL), talking to the same Python conductor over the ZmqCommunicator. It
     does NOT replace the conductor (which must stay Python — it runs the model
     policy); the conductor is per-forward-pass and GPU-bound, not the
     concurrency bottleneck. The extra process/hop buys GIL-free request
