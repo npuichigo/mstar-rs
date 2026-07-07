@@ -111,5 +111,10 @@ class Driver:
                     self.store.free_request(rid)
             else:
                 self._start_walk(rid, nxt)
+        elif event["type"] == "free":
+            # Per-tensor reclaim: the runtime says these tensors are now
+            # unreachable (consumed + not persisted/buffered). Emitted after
+            # this batch's emission/walk_done events, so reads already happened.
+            self.store.free(event["uuids"])
         else:
             raise RuntimeError(f"unknown event type: {event['type']}")

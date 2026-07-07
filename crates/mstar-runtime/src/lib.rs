@@ -14,7 +14,7 @@
 pub mod kv;
 pub mod stream;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mstar_core::{
     CompiledWalk, CoreError, IncomingInput, RouteEvent, TensorRef, WalkSet, WalkState,
@@ -111,6 +111,10 @@ pub enum Event {
         persist: Vec<(String, Vec<TensorRef>)>,
         stream_done: bool,
     },
+    /// Tensors that became unreachable while routing this batch — their
+    /// shared-memory buffers can be freed now (per-tensor reclaim, rather than
+    /// waiting for request finish). The driver owns the uuid->buffer mapping.
+    Free { request_id: u64, uuids: Vec<u64> },
 }
 
 /// A scheduled batch: one node, one walk, with per-request input tensors for
@@ -149,7 +153,43 @@ struct RequestState {
     /// Stream buffers, one per connection (indexed like `connections`).
     buffers: Vec<StreamBuffer>,
     persist: BTreeMap<String, Vec<TensorRef>>,
+    /// Every uuid this request has introduced (seeds + routed outputs) that
+    /// the driver still holds a buffer for. The reclaim sweep frees any that
+    /// are no longer reachable; the rest are freed at request finish.
+    introduced: BTreeSet<u64>,
     finished: bool,
+}
+
+impl RequestState {
+    /// Union of every uuid still reachable in this request: any node input
+    /// slot / loop capture in any partition's walk, any persist signal, or any
+    /// buffered stream item. Anything `introduced` but not here is dead.
+    fn reachable_uuids(&self) -> BTreeSet<u64> {
+        let mut live = BTreeSet::new();
+        for pstate in self.partitions.values() {
+            if let Some(walk) = &pstate.walk {
+                walk.collect_live_uuids(&mut live);
+            }
+        }
+        for tensors in self.persist.values() {
+            live.extend(tensors.iter().map(|t| t.uuid));
+        }
+        for buf in &self.buffers {
+            buf.collect_live_uuids(&mut live);
+        }
+        live
+    }
+
+    /// Reclaim: uuids introduced but no longer reachable. Removes them from
+    /// `introduced` and returns them for the driver to free.
+    fn sweep_unreachable(&mut self) -> Vec<u64> {
+        let live = self.reachable_uuids();
+        let dead: Vec<u64> = self.introduced.difference(&live).copied().collect();
+        for uuid in &dead {
+            self.introduced.remove(uuid);
+        }
+        dead
+    }
 }
 
 #[derive(Debug)]
@@ -306,6 +346,7 @@ impl Runtime {
                     .map(|c| StreamBuffer::new(c.policy.clone()))
                     .collect(),
                 persist: BTreeMap::new(),
+                introduced: BTreeSet::new(),
                 finished: false,
             },
         );
@@ -356,6 +397,9 @@ impl Runtime {
         }
         if pstate.walk.is_some() {
             return Err(RuntimeError::WalkActive(request_id, partition));
+        }
+        for input in &inputs {
+            req.introduced.extend(input.tensors.iter().map(|t| t.uuid));
         }
         let mut walk = WalkState::new(graph);
         walk.seed(inputs)?;
@@ -585,6 +629,11 @@ impl Runtime {
             }
             let out = outputs.get(&rid).expect("validated live above").clone();
             let req = self.requests.get_mut(&rid).expect("live rid");
+            // Every routed output is a tensor the driver now holds a buffer
+            // for — track it so the reclaim sweep can free it once dead.
+            for tensors in out.values() {
+                req.introduced.extend(tensors.iter().map(|t| t.uuid));
+            }
             let pstate = req.partitions.get_mut(&partition).expect("live partition");
             let walk = pstate.walk.as_mut().expect("live walk");
             let result = walk.complete_node(&inflight.node, out)?;
@@ -643,6 +692,17 @@ impl Runtime {
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect(),
                     stream_done,
+                });
+            }
+            // Reclaim: free any tensor this request introduced that is no
+            // longer reachable (consumed by its node, past a loop iteration,
+            // and not persisted/buffered) — per-tensor, not per-request.
+            let req = self.requests.get_mut(&rid).expect("live rid");
+            let freed = req.sweep_unreachable();
+            if !freed.is_empty() {
+                events.push(Event::Free {
+                    request_id: rid,
+                    uuids: freed,
                 });
             }
         }
@@ -809,7 +869,9 @@ mod tests {
                 )]),
             )
             .unwrap();
-        assert!(events.is_empty());
+        // No emission/walk-done yet (encoder_hidden routes on to predictor);
+        // the consumed seed frames are reclaimed.
+        assert!(events.iter().all(|e| matches!(e, Event::Free { .. })));
 
         let batch = rt.next_batch(8).unwrap().unwrap();
         assert_eq!(batch.node, "predictor");
@@ -824,10 +886,16 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], Event::Emission { request_id, name, .. }
+        // Emission + WalkDone (plus reclaim of the now-dead encoder_hidden;
+        // predicted_hidden is persisted, so it survives).
+        let structural: Vec<&Event> = events
+            .iter()
+            .filter(|e| !matches!(e, Event::Free { .. }))
+            .collect();
+        assert_eq!(structural.len(), 2);
+        assert!(matches!(structural[0], Event::Emission { request_id, name, .. }
             if *request_id == rid && name == "predicted_hidden"));
-        assert!(matches!(&events[1], Event::WalkDone { request_id, walk, fwd_index, persist, partition, stream_done }
+        assert!(matches!(structural[1], Event::WalkDone { request_id, walk, fwd_index, persist, partition, stream_done }
             if *request_id == rid && walk == "prefill_video" && *fwd_index == 1
                && persist.len() == 1 && partition == DEFAULT_PARTITION && !stream_done));
 
@@ -1006,7 +1074,9 @@ mod tests {
         let events = rt
             .complete_batch(b.batch_id, BTreeMap::from([(rid, BTreeMap::new())]))
             .unwrap();
-        assert!(matches!(events.last(), Some(Event::WalkDone { walk, .. }) if walk == "prefill"));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::WalkDone { walk, .. } if walk == "prefill")));
         assert_eq!(rt.kv_state(rid, "LLM").seq_pos, 40);
 
         // action_gen: read-only loop over the cached prefix.
@@ -1179,6 +1249,7 @@ mod tests {
         let mut snac_windows: Vec<Vec<u64>> = Vec::new();
         let mut request_done = false;
         let mut audio_chunks = 0u64;
+        let mut freed: Vec<u64> = Vec::new();
 
         while !request_done {
             let Some(batch) = rt.next_batch(8).unwrap() else {
@@ -1261,9 +1332,14 @@ mod tests {
                         }
                         other => panic!("unexpected partition {other}"),
                     },
+                    Event::Free { uuids, .. } => freed.extend(uuids),
                 }
             }
         }
+        // Per-tensor reclaim happened mid-request (not just at finish): the LLM
+        // decode tokens get freed as the loop advances past them and SNAC
+        // consumes their windows.
+        assert!(!freed.is_empty(), "expected mid-request tensor reclaim");
         rt.finish_request(rid).unwrap();
 
         // 40 tokens, window 28 stride 7: pops at [0..28),[7..35), then

@@ -358,6 +358,11 @@ class Conductor:
             # Stream this emission to the frontend, if one is attached.
             if self.on_token is not None and rid in self._front_rid:
                 self.on_token(self._front_rid[rid], value)
+        elif event["type"] == "free":
+            # Per-tensor reclaim: free SHM for tensors the runtime reports
+            # unreachable. Emitted after this batch's emission/walk_done events,
+            # so any read of these buffers already happened.
+            self._free_uuids(event["uuids"])
         elif event["type"] == "walk_done":
             persist = {
                 name: [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in refs]
@@ -388,14 +393,14 @@ class Conductor:
         else:
             self.finished.add(rid)  # FastAPI drive thread consumes + pops
 
-    def _reclaim(self, rid: int) -> None:
-        """Free every SHM offset + descriptor minted for `rid`. Conductor-owned
-        offsets are freed locally; worker-owned offsets are freed by messaging
-        the owning worker (safe now — by request-finish every tensor has been
-        read/cloned out of SHM). Without this the arenas fill and `desc` grows
-        unbounded across a serving run."""
+    def _free_uuids(self, uuids) -> None:
+        """Free SHM for a set of uuids: conductor-owned offsets locally,
+        worker-owned offsets via a `free` message to the owning worker.
+        Idempotent — a uuid already freed is no longer in `desc` and is
+        skipped (so the request-finish backstop and the incremental Free
+        events compose without double-freeing)."""
         by_worker: dict[str, list[int]] = {}
-        for uuid in self._req_uuids.pop(rid, []):
+        for uuid in uuids:
             desc = self.desc.pop(uuid, None)
             if desc is None:
                 continue
@@ -406,6 +411,13 @@ class Conductor:
                 by_worker.setdefault(arena_name[len("mstar_rs_"):], []).append(off)
         for worker_id, offs in by_worker.items():
             self.mbox.send(worker_id, msgpack.packb({"t": "free", "offs": offs}))
+
+    def _reclaim(self, rid: int) -> None:
+        """Backstop at request finish: free whatever this request still holds.
+        The incremental Free events reclaim most tensors mid-request (per
+        mstar's refcount reclaim); this sweeps the remainder (persisted /
+        cross-partition tensors), mirroring mstar's cleanup_request."""
+        self._free_uuids(self._req_uuids.pop(rid, []))
 
     # -- frontend serving --
 

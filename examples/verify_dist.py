@@ -126,6 +126,32 @@ class _LoopStop(Model):
         return int(tensors[0].item())
 
 
+def test_incremental_reclaim() -> None:
+    # Per-tensor reclaim must free tensors DURING the request (as the runtime
+    # reports them unreachable), not only at finish — so the conductor's live
+    # descriptor set stays bounded even for a long generation.
+    d = tempfile.mkdtemp(prefix="verify_incr_")
+    _start_worker(EchoAR(), d)
+    cond = Conductor(EchoAR(), {"step": "worker_0"}, d)
+    n_tokens = 60
+    cond.submit({"tokens": list(range(n_tokens)), "max_tokens": n_tokens})
+    peak_desc = 0
+    t0 = time.time()
+    while time.time() - t0 < 8.0:
+        cond.poll(timeout_ms=50)
+        peak_desc = max(peak_desc, len(cond.desc))
+        if cond._inflight == 0 and not cond.desc:
+            break
+    assert not cond.desc, f"desc not fully reclaimed: {len(cond.desc)}"
+    # Without incremental reclaim, desc would grow ~linearly toward 2*n_tokens.
+    assert peak_desc < n_tokens, (
+        f"desc peaked at {peak_desc} for {n_tokens} tokens — reclaim is not "
+        f"incremental (tensors held until request finish)"
+    )
+    cond.shutdown_workers()
+    print(f"4. INCREMENTAL-RECLAIM OK — desc peaked at {peak_desc} for {n_tokens} tokens (bounded)")
+
+
 def test_loop_stop() -> None:
     d = tempfile.mkdtemp(prefix="verify_loop_")
     _start_worker(_LoopStop(stop_at=5), d)
@@ -141,6 +167,7 @@ def test_loop_stop() -> None:
 def main() -> int:
     test_reclaim()
     test_error_no_hang()
+    test_incremental_reclaim()
     test_loop_stop()
     print("\nALL DIST CHECKS PASSED")
     return 0

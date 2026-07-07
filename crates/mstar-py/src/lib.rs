@@ -264,6 +264,11 @@ impl PyRuntime {
                     }
                     d.set_item("persist", p)?;
                 }
+                Event::Free { request_id, uuids } => {
+                    d.set_item("type", "free")?;
+                    d.set_item("request_id", request_id)?;
+                    d.set_item("uuids", uuids)?;
+                }
             }
             list.append(d)?;
         }

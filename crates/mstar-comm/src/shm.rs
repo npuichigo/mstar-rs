@@ -8,7 +8,11 @@
 //!
 //! - Producer: [`ShmArena::create`], [`ShmArena::reserve`] -> offset, copy
 //!   D2H bytes into `arena[off..off+n]`, send the offset as a descriptor,
-//!   [`ShmArena::free`] on the consumer's ACK.
+//!   [`ShmArena::free`] the offset once the tensor is reclaimed. The conductor
+//!   drives reclaim per-tensor: the runtime reports a tensor unreachable
+//!   (`Event::Free`) and the conductor frees the owning arena's offset (its
+//!   own directly, a worker's via a `free` message), with a per-request sweep
+//!   as the backstop.
 //! - Consumer: [`ShmArena::open`] the same name, read `arena[off..off+n]`
 //!   (H2D). Zero syscalls per tensor, one memcpy each way.
 

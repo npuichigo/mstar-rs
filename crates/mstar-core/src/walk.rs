@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::error::{CoreError, Result};
@@ -271,10 +271,41 @@ impl WalkState {
             if all_members_done {
                 self.complete_loop_iter(idx, &mut result.events);
             }
+        } else {
+            // A completed non-loop node will never re-read its inputs (a
+            // re-arrival routes into `next_iter`, not `current`). Drop them so
+            // the runtime's reclaim sweep can free any tensor now unreferenced
+            // — otherwise every intermediate lingers until request finish.
+            self.nodes
+                .get_mut(node)
+                .expect("node validated")
+                .current
+                .clear();
         }
 
         result.walk_done = self.is_done();
         Ok(result)
+    }
+
+    /// Collect the uuids of every tensor this walk still holds in a node input
+    /// slot (`current`/`next_iter`) or a loop-output capture. Used by the
+    /// runtime's per-request reachability sweep to reclaim shared-memory
+    /// buffers as soon as a tensor is no longer referenced (rather than at
+    /// request finish).
+    pub fn collect_live_uuids(&self, out: &mut BTreeSet<u64>) {
+        for st in self.nodes.values() {
+            for tensors in st.current.values().chain(st.next_iter.values()) {
+                out.extend(tensors.iter().map(|t| t.uuid));
+            }
+        }
+        for lst in &self.loops {
+            for tensors in lst.last_values.values().chain(lst.accumulated.values()) {
+                out.extend(tensors.iter().map(|t| t.uuid));
+            }
+            for (_, _, tensors) in &lst.external_inputs {
+                out.extend(tensors.iter().map(|t| t.uuid));
+            }
+        }
     }
 
     /// mstar `Loop.complete_iter`: terminate on max_iters/finish signal,

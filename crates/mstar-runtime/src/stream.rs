@@ -202,6 +202,13 @@ impl StreamBuffer {
         self.producer_done = true;
     }
 
+    /// uuids of tensors still buffered here (a reachability root for the
+    /// runtime's reclaim sweep — a streamed tensor is live until its window
+    /// is consumed by the downstream partition).
+    pub fn collect_live_uuids(&self, out: &mut std::collections::BTreeSet<u64>) {
+        out.extend(self.buffer.iter().map(|t| t.uuid));
+    }
+
     /// Total items the consumer has advanced past (mstar's `_consumed`,
     /// reported as `stream_tokens_consumed`).
     pub fn consumed(&self) -> usize {
