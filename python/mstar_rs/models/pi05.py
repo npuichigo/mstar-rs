@@ -41,6 +41,7 @@ NUM_PAGES = 64   # 8192 tokens — plenty for prefix (768 img + <=220 text) + su
 MAX_PREFILL_TOKENS = 2048
 MAX_ACTION_BATCH = 8       # largest batch we'll capture an action_gen graph for
 MAX_PAGES_PER_REQ = 32     # ceil((prefix + scratch) / PAGE_SIZE) upper bound
+MAX_PREFILL_BATCH_TOKENS = MAX_ACTION_BATCH * MAX_PREFILL_TOKENS  # ragged prefill cap
 
 
 class PI05(Model):
@@ -67,6 +68,10 @@ class PI05(Model):
             self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
             self.device, max_new_tokens=MAX_PREFILL_TOKENS, cudagraph=False,
         )
+        # Ragged batched prefill attention (eager): one forward over the
+        # concatenated per-request prefixes, cached per batch size N. Mirrors
+        # mstar's _forward_prefill_batched.
+        self._prefill_battn: dict[int, Any] = {}
         # Batched CUDA-graph state for the euler step, sized for the largest
         # batch. Rows [0:N*horizon] / [0:N] hold the N requests of the current
         # batch (request-major); one captured graph per distinct batch size N.
@@ -209,36 +214,54 @@ class PI05(Model):
 
     # -- node execution ------------------------------------------------------
 
+    def _get_prefill_battn(self, n: int):
+        if n not in self._prefill_battn:
+            self._prefill_battn[n] = BatchedFlashInferAttention(
+                self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim, self.device,
+                bs=n, max_pages_per_req=MAX_PAGES_PER_REQ, new_len=None, cudagraph=False,
+                causal=False, max_total_q=MAX_PREFILL_BATCH_TOKENS,
+            )
+        return self._prefill_battn[n]
+
+    def _execute_prefill_batched(self, inputs, kv) -> dict:
+        """Batched prefill: one PaliGemma forward over the concatenated
+        per-request prefixes (ragged batched attention), writing each request's
+        KV to its own pages. Mirrors mstar's _forward_prefill_batched."""
+        rids = list(inputs)
+        n = len(rids)
+        prefix_embs = []
+        batch_plan = []
+        for rid in rids:
+            named, view = inputs[rid], kv[rid]
+            img_emb = named["img_emb"][0] * self.llm._image_embed_scale
+            text_emb = self.llm._embed_tokens_scaled(named["text_inputs"][0])
+            pe = torch.cat([img_emb, text_emb], dim=0)
+            assert pe.shape[0] == view["append_len"], (pe.shape, view)
+            prefix_embs.append(pe)
+            batch_plan.append((view["pages"], view["seq_pos"], view["append_len"]))
+        attn = self._get_prefill_battn(n)
+        attn.plan(batch_plan)
+        handle = FlashInferCacheHandle(attn)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            self.llm.paligemma(
+                query_sequence=torch.cat(prefix_embs, dim=0),
+                cache_handle=handle,
+                write_cache=True,
+            )
+        return {rid: {} for rid in rids}  # KV side effect only
+
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
         if node_name == "LLM" and walk == "action_gen":
             return self._execute_action_gen(inputs, kv)
+        if node_name == "LLM" and walk == "prefill":
+            return self._execute_prefill_batched(inputs, kv)
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
             if node_name == "vit_encoder":
                 pv = self.vit._prepare_one(named["image_inputs"][0])
                 features = self.vit.encoder(pv.float())  # (cams, 256, 2048)
                 outputs[rid] = {"img_emb": [features.reshape(-1, features.shape[-1])]}
-            elif node_name == "LLM" and walk == "prefill":
-                view = kv[rid]
-                img_emb = named["img_emb"][0] * self.llm._image_embed_scale
-                text_emb = self.llm._embed_tokens_scaled(named["text_inputs"][0])
-                prefix_emb = torch.cat([img_emb, text_emb], dim=0)
-                assert prefix_emb.shape[0] == view["append_len"], (
-                    prefix_emb.shape,
-                    view,
-                )
-                self._prefill_attn.plan(
-                    view["pages"], view["seq_pos"], view["append_len"]
-                )
-                handle = FlashInferCacheHandle(self._prefill_attn)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    self.llm.paligemma(
-                        query_sequence=prefix_emb,
-                        cache_handle=handle,
-                        write_cache=True,
-                    )
-                outputs[rid] = {}  # KV side effect only
             else:
                 raise ValueError(f"unknown node/walk: {node_name}/{walk}")
         return outputs

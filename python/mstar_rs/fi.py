@@ -172,10 +172,11 @@ class BatchedFlashInferAttention:
         device: torch.device,
         bs: int,
         max_pages_per_req: int,
-        new_len: int = 1,
+        new_len: int | None = 1,
         cudagraph: bool = True,
         causal: bool = False,
         dtype: torch.dtype = torch.bfloat16,
+        max_total_q: int | None = None,
     ) -> None:
         import flashinfer
 
@@ -187,8 +188,17 @@ class BatchedFlashInferAttention:
         self.dtype = dtype
         self.device = device
         self.bs = bs
+        # `new_len` fixed (decode: 1 token/request, graph-capturable) OR None
+        # for a RAGGED batch — variable query length per request (prefill over
+        # concatenated prefixes). Ragged is eager only (cudagraph=False); its
+        # total query count varies, so `max_total_q` sizes the token buffers.
         self.new_len = new_len
-        self.max_q = bs * new_len  # total query tokens across the batch
+        if new_len is None:
+            assert not cudagraph, "ragged batch (new_len=None) is eager-only"
+            assert max_total_q is not None, "ragged batch needs max_total_q"
+            self.max_q = max_total_q
+        else:
+            self.max_q = bs * new_len  # total query tokens across the batch
         self._workspace = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
         # Token -> (page, slot) and rope positions, concatenated over the batch.
         self.token_page = torch.zeros(self.max_q, dtype=torch.long, device=device)
@@ -232,7 +242,7 @@ class BatchedFlashInferAttention:
         tok_slot: list[int] = []
         pos: list[int] = []
         for pages, seq_pos, new_len in batch:
-            assert new_len == self.new_len, (new_len, self.new_len)
+            assert self.new_len is None or new_len == self.new_len, (new_len, self.new_len)
             total = seq_pos + new_len
             n_pages = (total + ps - 1) // ps
             assert n_pages <= len(pages) and n_pages <= (len(self._kv_indices_buf) // self.bs), (
