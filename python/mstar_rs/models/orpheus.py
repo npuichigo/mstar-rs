@@ -112,6 +112,9 @@ class Orpheus(Model):
             self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
             self.device, max_new_tokens=1, cudagraph=cuda_graph, causal=True,
         )
+        # Ragged batched prefill attention (eager, causal): one forward over
+        # the concatenated per-request prompts, cached per batch size N.
+        self._prefill_battn: dict[int, Any] = {}
         self.sampler = Sampler(device=self.device)  # eager path (cuda_graph=False)
         dev = self.device
         V = self.cfg.vocab_size
@@ -192,14 +195,13 @@ class Orpheus(Model):
         return [(KV_LABEL, NUM_PAGES, PAGE_SIZE)], {"LLM": KV_LABEL}
 
     def unbatchable(self):
-        # decode now batches (BatchedFlashInferAttention + a [max_bs] batched
-        # sampler). prefill still can't (per-request prefix lengths differ, so
-        # no shared new_len) and SNAC still replays a single-slot graph, so both
-        # stay capped to one request per batch in cuda_graph mode. The eager
-        # path batches nothing special (per-request sampler keyed by rid).
+        # decode + prefill both batch now (decode: per-N cuda graph + batched
+        # sampler; prefill: one eager ragged forward over concatenated prompts).
+        # SNAC still replays a single-slot graph, so it stays capped to one
+        # request per batch in cuda_graph mode.
         if not self.cuda_graph:
             return []
-        return [("LLM", "prefill"), ("snac_decoder", "snac_chunk")]
+        return [("snac_decoder", "snac_chunk")]
 
     def partitions(self):
         return (
@@ -403,23 +405,60 @@ class Orpheus(Model):
         for j, rid in enumerate(rids):
             self.logit_log.setdefault(rid, []).append(logits[j].detach().float().cpu())
 
+    def _get_prefill_battn(self, n: int):
+        if n not in self._prefill_battn:
+            self._prefill_battn[n] = BatchedFlashInferAttention(
+                self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim, self.device,
+                bs=n, max_pages_per_req=MAX_PAGES_PER_REQ, new_len=None, cudagraph=False,
+                causal=True, max_total_q=MAX_DECODE_BATCH * 2048,
+            )
+        return self._prefill_battn[n]
+
+    def _execute_prefill_batched(self, inputs, kv) -> dict:
+        """Batched prefill: one causal forward over the concatenated per-request
+        prompts (ragged batched attention), take each request's LAST-token
+        logits, and sample its first audio token via the batched sampler."""
+        rids = list(inputs)
+        n = len(rids)
+        srids = [str(r) for r in rids]
+        embs, batch_plan, last = [], [], []
+        off = 0
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            for rid in rids:
+                view = kv[rid]
+                embs.append(self.embed_tokens(inputs[rid]["text_inputs"][0]))
+                batch_plan.append((view["pages"], view["seq_pos"], view["append_len"]))
+                off += view["append_len"]
+                last.append(off - 1)
+            attn = self._get_prefill_battn(n)
+            attn.plan(batch_plan)
+            handle = FlashInferCacheHandle(attn)
+            hidden = self.language_model(torch.cat(embs, dim=0), cache_handle=handle)
+            logits = self.lm_head(hidden[torch.tensor(last, device=self.device)])  # [n, V]
+        self._sbuf.stage_seen_token_masks(srids, [self._seen[r] for r in rids])
+        sampler = self._sbuf.gather_for_request_ids(srids, n, gather_seen_tokens=True)
+        tokens = sampler.sample(srids, logits, apply_penalty=True)  # [n]
+        out = {}
+        for j, rid in enumerate(rids):
+            tok = tokens[j : j + 1].view(1).to(torch.long)
+            self._seen[rid].add_tokens(tok)  # so decode penalises token 0
+            if self.token_log is not None:
+                self.token_log.setdefault(rid, []).append(int(tok.item()))
+            out[rid] = {"new_token": [tok]}
+        return out
+
     @torch.inference_mode()
     def execute(self, node_name, walk, inputs, kv=None):
-        if node_name == "LLM" and walk == "decode" and self.cuda_graph:
-            return self._execute_decode_batched(inputs, kv)
+        if node_name == "LLM" and self.cuda_graph:
+            if walk == "decode":
+                return self._execute_decode_batched(inputs, kv)
+            return self._execute_prefill_batched(inputs, kv)
         outputs: dict[int, dict[str, list[torch.Tensor]]] = {}
         for rid, named in inputs.items():
-            if node_name == "LLM":
-                if self.cuda_graph:  # prefill: eager forward + batched sampler (bs=1)
-                    logits = self._run_llm(named["text_inputs"][0], kv[rid], self._prefill_attn)
-                    self._sbuf.stage_seen_token_masks([str(rid)], [self._seen[rid]])
-                    sampler = self._sbuf.gather_for_request_ids([str(rid)], 1, gather_seen_tokens=True)
-                    token = sampler.sample([str(rid)], logits, apply_penalty=True).view(1).to(torch.long)
-                    self._seen[rid].add_tokens(token)  # so decode penalises token 0
-                else:  # eager path (cuda_graph=False)
-                    attn = self._prefill_attn if walk == "prefill" else self._decode_attn
-                    logits = self._run_llm(named["text_inputs"][0], kv[rid], attn)
-                    token = self.sampler.sample([str(rid)], logits, apply_penalty=True).view(1).to(torch.long)
+            if node_name == "LLM":  # eager path (cuda_graph=False)
+                attn = self._prefill_attn if walk == "prefill" else self._decode_attn
+                logits = self._run_llm(named["text_inputs"][0], kv[rid], attn)
+                token = self.sampler.sample([str(rid)], logits, apply_penalty=True).view(1).to(torch.long)
                 if walk == "decode" and int(token.item()) == self.cfg.stop_token_id:
                     self._pending_stops.append((rid, "decode_loop"))
                 if self.token_log is not None:
