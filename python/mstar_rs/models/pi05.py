@@ -32,7 +32,7 @@ from ..fi import (
     FlashInferPagedKV,
 )
 from ..graph import edge, emit, loop, node, sequential
-from ..model import Model, NextWalk
+from ..model import ModelEngine, ModelPolicy, NextWalk
 
 DEFAULT_MODEL_ID = "lerobot/pi05_base"
 KV_LABEL = "main"
@@ -44,59 +44,21 @@ MAX_PAGES_PER_REQ = 32     # ceil((prefix + scratch) / PAGE_SIZE) upper bound
 MAX_PREFILL_BATCH_TOKENS = MAX_ACTION_BATCH * MAX_PREFILL_TOKENS  # ragged prefill cap
 
 
-class PI05(Model):
+class Pi05Policy(ModelPolicy):
+    """Control plane (conductor): graph, KV declaration, request ingestion,
+    the flow-loop policy, postprocess. Constructs mstar's `Pi05Model` for its
+    config + tokenizer ONLY — no `get_submodule`, so no GPU weights load here
+    (weights live in `Pi05Engine`, mirroring mstar's lazy submodule build)."""
+
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda") -> None:
         from mstar.model.pi05.pi05_model import Pi05Model
 
         self.device = torch.device(device)
-        # Reuse mstar's model wholesale: config, tokenizer, weight remapping,
-        # submodule construction (fp32 with selective-precision to() overrides).
+        # config + tokenizer only (Pi05Model defers weight loading to
+        # get_submodule, which the engine — not this policy — calls).
         self._mstar = Pi05Model(model_path_hf=model_id)
         self.cfg = self._mstar.config
-        self.vit = self._mstar.get_submodule("vit_encoder", device=str(device))
-        self.llm = self._mstar.get_submodule("LLM", device=str(device))
-        self.kv_cache = FlashInferPagedKV(
-            num_layers=self.cfg.num_layers,
-            num_pages=NUM_PAGES,
-            page_size=PAGE_SIZE,
-            num_kv_heads=self.cfg.num_kv_heads,
-            head_dim=self.cfg.head_dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        self._prefill_attn = FlashInferAttention(
-            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
-            self.device, max_new_tokens=MAX_PREFILL_TOKENS, cudagraph=False,
-        )
-        # Ragged batched prefill attention (eager): one forward over the
-        # concatenated per-request prefixes, cached per batch size N. Mirrors
-        # mstar's _forward_prefill_batched.
-        self._prefill_battn: dict[int, Any] = {}
-        # Batched CUDA-graph state for the euler step, sized for the largest
-        # batch. Rows [0:N*horizon] / [0:N] hold the N requests of the current
-        # batch (request-major); one captured graph per distinct batch size N.
-        H = self.cfg.action_horizon
-        self._g_noisy = torch.zeros(
-            MAX_ACTION_BATCH * H, self.cfg.action_dim, device=self.device
-        )
-        self._g_ts = torch.zeros(MAX_ACTION_BATCH, device=self.device, dtype=torch.long)
-        # N -> (BatchedFlashInferAttention, FlashInferCacheHandle, CUDAGraph)
-        self._agraphs: dict[int, tuple] = {}
-        # Timestep-embedding basis (fp64, matching openpi) + write buffers.
-        half = self.cfg.action_hidden_size // 2
-        self._fraction = torch.linspace(
-            0.0, 1.0, half, device=self.device, dtype=torch.float64
-        )
-        # [1, hidden] for the dense reference / bs=1 caller; [MAX, hidden] for
-        # the batched euler step (sincos writes one row per request).
-        self._time_emb_buffer = torch.empty(
-            1, self.cfg.action_hidden_size, device=self.device, dtype=torch.float32
-        )
-        self._g_time_emb = torch.empty(
-            MAX_ACTION_BATCH, self.cfg.action_hidden_size, device=self.device, dtype=torch.float32
-        )
-        # request_id -> seed for the initial action noise.
-        self._seeds: dict[int, int] = {}
+        self._seeds: dict[int, int] = {}  # request_id -> action-noise seed
 
     # -- graph + KV declaration -------------------------------------------
 
@@ -158,6 +120,82 @@ class PI05(Model):
                 ("LLM", "text_inputs", [text_ids]),
             ],
             {KV_LABEL: prefix_len},
+        )
+
+    # -- policy: prefill -> action_gen -> done ------------------------------
+
+    def next_forward(
+        self, request_id, partition, walk, fwd_index, persist, stream_done
+    ) -> NextWalk | None:
+        if walk == "prefill":
+            seed = self._seeds.pop(request_id)  # consumed once; don't leak
+            generator = torch.Generator(device=self.device).manual_seed(seed)
+            noisy = torch.randn(
+                self.cfg.action_horizon,
+                self.cfg.action_dim,
+                device=self.device,
+                generator=generator,
+            )
+            ts = torch.zeros(1, device=self.device, dtype=torch.long)
+            return (
+                "action_gen",
+                [
+                    ("LLM", "noisy_actions", [noisy]),
+                    ("LLM", "timestep_index", [ts]),
+                ],
+                {KV_LABEL: 0},
+                # Scratch pages for the transient suffix K/V each euler step
+                # (mstar plans prefix+suffix pages with write_store=False).
+                {KV_LABEL: self.cfg.action_horizon},
+            )
+        return None  # action_gen done -> request done
+
+    def postprocess(self, name, modality, tensors):
+        assert modality == "action"
+        return tensors[0].detach().to(torch.float32).cpu()
+
+
+class Pi05Engine(Pi05Policy, ModelEngine):
+    """Data plane (worker): loads the GPU weights (via get_submodule) + KV
+    cache + CUDA-graph state, and runs `execute`. Being a `Pi05Policy` too, it
+    is also a full `Model` for the single-process Driver."""
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda") -> None:
+        super().__init__(model_id, device)  # cheap config/tokenizer/policy state
+        dev = str(device)
+        self.vit = self._mstar.get_submodule("vit_encoder", device=dev)
+        self.llm = self._mstar.get_submodule("LLM", device=dev)
+        self.kv_cache = FlashInferPagedKV(
+            num_layers=self.cfg.num_layers,
+            num_pages=NUM_PAGES,
+            page_size=PAGE_SIZE,
+            num_kv_heads=self.cfg.num_kv_heads,
+            head_dim=self.cfg.head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._prefill_attn = FlashInferAttention(
+            self.kv_cache, self.cfg.num_qo_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=MAX_PREFILL_TOKENS, cudagraph=False,
+        )
+        # Ragged batched prefill attention (eager), cached per batch size N.
+        self._prefill_battn: dict[int, Any] = {}
+        # Batched CUDA-graph euler state (request-major rows), one graph per N.
+        H = self.cfg.action_horizon
+        self._g_noisy = torch.zeros(
+            MAX_ACTION_BATCH * H, self.cfg.action_dim, device=self.device
+        )
+        self._g_ts = torch.zeros(MAX_ACTION_BATCH, device=self.device, dtype=torch.long)
+        self._agraphs: dict[int, tuple] = {}
+        half = self.cfg.action_hidden_size // 2
+        self._fraction = torch.linspace(
+            0.0, 1.0, half, device=self.device, dtype=torch.float64
+        )
+        self._time_emb_buffer = torch.empty(
+            1, self.cfg.action_hidden_size, device=self.device, dtype=torch.float32
+        )
+        self._g_time_emb = torch.empty(
+            MAX_ACTION_BATCH, self.cfg.action_hidden_size, device=self.device, dtype=torch.float32
         )
 
     # -- batched CUDA-graph euler step --------------------------------------
@@ -293,34 +331,7 @@ class PI05(Model):
             for j, rid in enumerate(rids)
         }
 
-    # -- policy: prefill -> action_gen -> done ------------------------------
 
-    def next_forward(
-        self, request_id, partition, walk, fwd_index, persist, stream_done
-    ) -> NextWalk | None:
-        if walk == "prefill":
-            seed = self._seeds.pop(request_id)  # consumed once; don't leak
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            noisy = torch.randn(
-                self.cfg.action_horizon,
-                self.cfg.action_dim,
-                device=self.device,
-                generator=generator,
-            )
-            ts = torch.zeros(1, device=self.device, dtype=torch.long)
-            return (
-                "action_gen",
-                [
-                    ("LLM", "noisy_actions", [noisy]),
-                    ("LLM", "timestep_index", [ts]),
-                ],
-                {KV_LABEL: 0},
-                # Scratch pages for the transient suffix K/V each euler step
-                # (mstar plans prefix+suffix pages with write_store=False).
-                {KV_LABEL: self.cfg.action_horizon},
-            )
-        return None  # action_gen done -> request done
-
-    def postprocess(self, name, modality, tensors):
-        assert modality == "action"
-        return tensors[0].detach().to(torch.float32).cpu()
+PI05 = Pi05Engine  # the full model (policy + engine) — for the single-process
+# Driver and for handing one instance to both roles. Multi-process: give the
+# conductor a Pi05Policy (weightless) and each worker a Pi05Engine.

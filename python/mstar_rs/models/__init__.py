@@ -7,10 +7,10 @@ def __getattr__(name: str):
         from .vjepa2 import VJEPA2
 
         return VJEPA2
-    if name == "PI05":
-        from .pi05 import PI05
+    if name in ("PI05", "Pi05Policy", "Pi05Engine"):
+        from . import pi05
 
-        return PI05
+        return getattr(pi05, name)
     if name == "Orpheus":
         from .orpheus import Orpheus
 
@@ -18,4 +18,4 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
-__all__ = ["VJEPA2", "PI05", "Orpheus"]
+__all__ = ["VJEPA2", "PI05", "Pi05Policy", "Pi05Engine", "Orpheus"]
