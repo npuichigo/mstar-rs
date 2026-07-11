@@ -42,7 +42,7 @@ from ..graph import (
     stream_edge,
     EMPTY_DESTINATION,
 )
-from ..model import Model, NextWalk
+from ..model import ModelEngine, ModelPolicy, NextWalk
 
 DEFAULT_MODEL_ID = "canopylabs/orpheus-3b-0.1-ft"
 KV_LABEL = "main"
@@ -55,7 +55,15 @@ MAX_DECODE_BATCH = 8       # largest batch we'll capture a decode graph for
 MAX_PAGES_PER_REQ = 40     # ceil((prompt + max_output_tokens) / PAGE_SIZE) bound
 
 
-class Orpheus(Model):
+class OrpheusPolicy(ModelPolicy):
+    """Control plane (conductor): topology, request ingestion, the LLM->SNAC
+    continuation policy, postprocess. Builds mstar's `OrpheusModel` for config
+    + tokenizer ONLY (no get_submodule -> no GB model weights). Holds the small
+    (~1 MB) batched-sampler buffers, which register/next_forward touch; the GB
+    OrpheusForCausalLM + SNAC weights live in `OrpheusEngine`. So the conductor
+    is weightless of the model (the point of the split), even though it carries
+    the tiny sampler state."""
+
     def __init__(
         self,
         model_id: str = DEFAULT_MODEL_ID,
@@ -67,7 +75,6 @@ class Orpheus(Model):
         from mstar.distributed.communication import TPCommGroup
         from mstar.model.orpheus.orpheus_model import OrpheusModel
         from mstar.utils.sampling import (
-            CudaGraphableSampler,
             Sampler,
             SamplerBuffers,
             SamplingConfig,
@@ -78,87 +85,23 @@ class Orpheus(Model):
         self.max_output_tokens = max_output_tokens
         self.greedy = greedy
         self.cuda_graph = cuda_graph
+        # config + tokenizer only (weights load lazily via get_submodule, which
+        # the engine — not this policy — calls).
         self._mstar = OrpheusModel(model_path_hf=model_id)
         self.cfg = self._mstar.config
         self.tokenizer = self._mstar.tokenizer
-        # Orpheus' lm_head is a ColumnParallelLinear; it needs a TP comm
-        # group even at world_size 1 (mstar's engine passes trivial()).
-        llm_sub = self._mstar.get_submodule(
-            "LLM",
-            device=str(device),
-            tp_group=TPCommGroup.trivial(),
-            autocast_dtype=torch.bfloat16,
-        )
-        self.embed_tokens = llm_sub.embed_tokens
-        self.language_model = llm_sub.language_model  # OrpheusForCausalLM
-        self.lm_head = llm_sub.lm_head
-        self.snac_sub = self._mstar.get_submodule("snac_decoder", device=str(device))
-
-        self.kv_cache = FlashInferPagedKV(
-            num_layers=self.cfg.num_hidden_layers,
-            num_pages=NUM_PAGES,
-            page_size=PAGE_SIZE,
-            num_kv_heads=self.cfg.num_key_value_heads,
-            head_dim=self.cfg.head_dim,
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
-        # Causal attention for both prefill (multi-token) and decode (1 token).
-        self._prefill_attn = FlashInferAttention(
-            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
-            self.device, max_new_tokens=2048, cudagraph=False, causal=True,
-        )
-        self._decode_attn = FlashInferAttention(
-            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
-            self.device, max_new_tokens=1, cudagraph=cuda_graph, causal=True,
-        )
-        # Ragged batched prefill attention (eager, causal): one forward over
-        # the concatenated per-request prompts, cached per batch size N.
-        self._prefill_battn: dict[int, Any] = {}
         self.sampler = Sampler(device=self.device)  # eager path (cuda_graph=False)
         dev = self.device
         V = self.cfg.vocab_size
-        # Batched in-graph sampler (mstar's SamplerBuffers): per-request slots
-        # for temperature/top_k/top_p/seed/rep_penalty + a [max_bs, V]
-        # seen-token mask for the repetition penalty (orpheus defaults to
-        # rep_penalty=1.3, so this is live — NOT the greedy no-penalty path).
-        # gather_for_request_ids fills the per-step [bs] buffers before replay;
-        # the in-graph sample scatters the new token into seen_tokens; we sync
-        # it back into each request's SeenTokenMask after. Exactly mstar's
-        # cuda_graph_runner decode dance.
+        # Batched in-graph sampler (mstar's SamplerBuffers): per-request slots +
+        # a [max_bs, V] seen-token mask for the repetition penalty (orpheus
+        # defaults to rep_penalty=1.3, so this is live). ~1 MB, not the model.
         self._SamplingConfig = SamplingConfig
         self._SeenTokenMask = SeenTokenMask
         self._sbuf = SamplerBuffers.allocate(
             MAX_DECODE_BATCH, dev, tp_group=TPCommGroup.trivial(), vocab_size=V
         )
         self._seen: dict[int, Any] = {}  # request_id -> SeenTokenMask
-        self._pending_stops: list[tuple[int, str]] = []
-        # Batched decode CUDA-graph state, sized for the largest batch. Rows
-        # [0:N] hold the N requests of the current batch (one prev-token each);
-        # one captured graph + BatchedFlashInferAttention + capture-time sampler
-        # per distinct batch size N.
-        self._g_tokens = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
-        self._g_sampled = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
-        self._dec_attn: dict[int, Any] = {}       # N -> BatchedFlashInferAttention
-        self._dec_graph: dict[int, Any] = {}      # N -> CUDAGraph
-        self._dec_sampler: dict[int, Any] = {}    # N -> capture-time CudaGraphableSampler
-        # CUDA-graph SNAC state: every window is <= snac_window_tokens (the
-        # final partial flush is padded up to it), so one fixed-shape graph
-        # covers all chunks. Static token input, static PCM output.
-        self._g_snac_tokens = torch.zeros(
-            self.cfg.snac_window_tokens, dtype=torch.long, device=self.device
-        )
-        n_pcm = self.cfg.snac_audio_slice_end - self.cfg.snac_audio_slice_start
-        self._g_snac_pcm = torch.zeros(n_pcm, dtype=torch.int16, device=self.device)
-        self._snac_graph: torch.cuda.CUDAGraph | None = None
-        # Debug: when set, `execute` records the LLM token stream per request
-        # (for verification against an independent reference decode).
-        self.token_log: dict[int, list[int]] | None = None
-        # Debug: when set, batched decode also records per-request pre-sample
-        # logits (an extra eager forward), for verifying batched == per-request
-        # at the LOGIT level — greedy token streams can't bit-match across
-        # batch sizes because bf16 kernel-order noise flips the argmax.
-        self.logit_log: dict[int, list[torch.Tensor]] | None = None
 
     # -- graph + topology -------------------------------------------------
 
@@ -267,6 +210,96 @@ class Orpheus(Model):
             ("prefill", [("LLM", "text_inputs", [text_ids])], {KV_LABEL: text_ids.shape[0]}),
             ("snac_chunk", []),
         ]
+
+    # -- policy: LLM prefill -> decode -> done; SNAC re-arm ------------------
+
+    def next_forward(
+        self, request_id, partition, walk, fwd_index, persist, stream_done
+    ) -> NextWalk | None:
+        if partition == "LLM":
+            if walk == "prefill":
+                # Seed decode's first token with the token sampled at prefill.
+                first = persist["new_token"]
+                return (
+                    "decode",
+                    [("LLM", "text_inputs", first)],
+                    {KV_LABEL: 1},
+                )
+            if self.cuda_graph:
+                self._sbuf.unregister_request(str(request_id))
+                self._seen.pop(request_id, None)
+            else:
+                self.sampler.remove_request(str(request_id))
+            return None  # decode finished -> LLM partition done
+        # SNAC: re-arm until the final window is consumed.
+        return None if stream_done else ("snac_chunk", [])
+
+    def postprocess(self, name, modality, tensors):
+        assert modality == "audio"
+        return tensors[0].detach().cpu()  # int16 PCM, 24 kHz
+
+
+class OrpheusEngine(OrpheusPolicy, ModelEngine):
+    """Data plane (worker): loads the GB OrpheusForCausalLM + SNAC weights (via
+    get_submodule) + KV cache + CUDA-graph state, and runs `execute`. Being an
+    `OrpheusPolicy` too, it is also a full `Model` for the single-process
+    Driver."""
+
+    def __init__(
+        self,
+        model_id: str = DEFAULT_MODEL_ID,
+        device: str = "cuda",
+        max_output_tokens: int = 2048,
+        greedy: bool = False,
+        cuda_graph: bool = True,
+    ) -> None:
+        from mstar.distributed.communication import TPCommGroup
+
+        super().__init__(model_id, device, max_output_tokens, greedy, cuda_graph)
+        # lm_head is a ColumnParallelLinear; needs a TP group even at ws 1.
+        llm_sub = self._mstar.get_submodule(
+            "LLM", device=str(device), tp_group=TPCommGroup.trivial(),
+            autocast_dtype=torch.bfloat16,
+        )
+        self.embed_tokens = llm_sub.embed_tokens
+        self.language_model = llm_sub.language_model  # OrpheusForCausalLM
+        self.lm_head = llm_sub.lm_head
+        self.snac_sub = self._mstar.get_submodule("snac_decoder", device=str(device))
+        self.kv_cache = FlashInferPagedKV(
+            num_layers=self.cfg.num_hidden_layers,
+            num_pages=NUM_PAGES,
+            page_size=PAGE_SIZE,
+            num_kv_heads=self.cfg.num_key_value_heads,
+            head_dim=self.cfg.head_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._prefill_attn = FlashInferAttention(
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=2048, cudagraph=False, causal=True,
+        )
+        self._decode_attn = FlashInferAttention(
+            self.kv_cache, self.cfg.num_attention_heads, self.cfg.head_dim,
+            self.device, max_new_tokens=1, cudagraph=cuda_graph, causal=True,
+        )
+        self._prefill_battn: dict[int, Any] = {}  # ragged batched prefill, per N
+        self._pending_stops: list[tuple[int, str]] = []
+        dev = self.device
+        # Batched decode CUDA-graph state (request-major rows), per N.
+        self._g_tokens = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
+        self._g_sampled = torch.zeros(MAX_DECODE_BATCH, dtype=torch.long, device=dev)
+        self._dec_attn: dict[int, Any] = {}
+        self._dec_graph: dict[int, Any] = {}
+        self._dec_sampler: dict[int, Any] = {}
+        # SNAC single-slot graph state.
+        self._g_snac_tokens = torch.zeros(
+            self.cfg.snac_window_tokens, dtype=torch.long, device=self.device
+        )
+        n_pcm = self.cfg.snac_audio_slice_end - self.cfg.snac_audio_slice_start
+        self._g_snac_pcm = torch.zeros(n_pcm, dtype=torch.int16, device=self.device)
+        self._snac_graph: torch.cuda.CUDAGraph | None = None
+        self.token_log: dict[int, list[int]] | None = None  # debug: token stream
+        self.logit_log: dict[int, list[torch.Tensor]] | None = None  # debug: logits
 
     # -- node execution ----------------------------------------------------
 
@@ -496,34 +529,12 @@ class Orpheus(Model):
                 raise ValueError(f"unknown node: {node_name}")
         return outputs
 
-    # -- policy ------------------------------------------------------------
-
-    def next_forward(
-        self, request_id, partition, walk, fwd_index, persist, stream_done
-    ) -> NextWalk | None:
-        if partition == "LLM":
-            if walk == "prefill":
-                # Seed decode's first token with the token sampled at prefill.
-                first = persist["new_token"]
-                return (
-                    "decode",
-                    [("LLM", "text_inputs", first)],
-                    {KV_LABEL: 1},
-                )
-            if self.cuda_graph:
-                self._sbuf.unregister_request(str(request_id))
-                self._seen.pop(request_id, None)
-            else:
-                self.sampler.remove_request(str(request_id))
-            return None  # decode finished -> LLM partition done
-        # SNAC: re-arm until the final window is consumed.
-        return None if stream_done else ("snac_chunk", [])
-
     def loops_to_finish(self) -> list[tuple[int, str]]:
         stops = self._pending_stops
         self._pending_stops = []
         return stops
 
-    def postprocess(self, name, modality, tensors):
-        assert modality == "audio"
-        return tensors[0].detach().cpu()  # int16 PCM, 24 kHz
+
+Orpheus = OrpheusEngine  # full model (policy + engine) — single-process Driver
+# / both roles. Multi-process: conductor gets an OrpheusPolicy (no model
+# weights), each worker an OrpheusEngine.
