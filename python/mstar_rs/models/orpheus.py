@@ -300,6 +300,11 @@ class OrpheusEngine(OrpheusPolicy, ModelEngine):
         self._snac_graph: torch.cuda.CUDAGraph | None = None
         self.token_log: dict[int, list[int]] | None = None  # debug: token stream
         self.logit_log: dict[int, list[torch.Tensor]] | None = None  # debug: logits
+        # Perf probe: when set to {"wall":0,"gpu":0,"host":0,"n":0}, each decode
+        # step accumulates wall time, GPU-replay time, and host = wall - gpu.
+        # host is the per-step work (stage/gather/sync/EOS/build) that runs
+        # SERIALLY with the replay today — the ceiling an overlap (L2) can hide.
+        self.prof: dict | None = None
 
     # -- node execution ----------------------------------------------------
 
@@ -405,9 +410,19 @@ class OrpheusEngine(OrpheusPolicy, ModelEngine):
         self._ensure_decode_graph(n, batch_plan, srids, seen_masks)
         if self.logit_log is not None:
             self._record_decode_logits(n, batch_plan, rids)  # extra eager forward
+        prof = self.prof
+        if prof is not None:
+            import time as _time
+
+            _t0 = _time.perf_counter()
+            _e0, _e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         self._sbuf.stage_seen_token_masks(srids, seen_masks)
         self._sbuf.gather_for_request_ids(srids, n, gather_seen_tokens=True)
+        if prof is not None:
+            _e0.record()
         self._dec_graph[n].replay()
+        if prof is not None:
+            _e1.record()
         self._dec_sampler[n].sync_seen_token_masks(seen_masks)
         out = {}
         for j, rid in enumerate(rids):
@@ -418,6 +433,14 @@ class OrpheusEngine(OrpheusPolicy, ModelEngine):
             if self.token_log is not None:
                 self.token_log.setdefault(rid, []).append(ti)
             out[rid] = {"new_token": [tok], "text_inputs": [tok]}
+        if prof is not None:
+            torch.cuda.synchronize()
+            wall = (_time.perf_counter() - _t0) * 1000.0
+            gpu = _e0.elapsed_time(_e1)
+            prof["wall"] += wall
+            prof["gpu"] += gpu
+            prof["host"] += wall - gpu
+            prof["n"] += 1
         return out
 
     def _record_decode_logits(self, n: int, batch_plan: list, rids: list) -> None:
