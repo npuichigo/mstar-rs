@@ -15,10 +15,15 @@ def __getattr__(name: str):
         from . import orpheus
 
         return getattr(orpheus, name)
+    if name == "Qwen3OmniPolicy":
+        from .qwen3_omni import Qwen3OmniPolicy
+
+        return Qwen3OmniPolicy
     raise AttributeError(name)
 
 
 __all__ = [
     "VJEPA2", "PI05", "Pi05Policy", "Pi05Engine",
     "Orpheus", "OrpheusPolicy", "OrpheusEngine",
+    "Qwen3OmniPolicy",
 ]
