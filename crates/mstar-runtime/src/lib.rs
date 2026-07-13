@@ -395,6 +395,48 @@ impl Runtime {
         Ok(())
     }
 
+    /// Consumer side of a cross-worker connection: mark the producer done on the
+    /// local buffer, after the producing worker (which owns `from_partition`)
+    /// finished its partition. This is what lets a `continue_after_done` stream
+    /// keep yielding empty chunks so the consumer's own AR loop can drain — in
+    /// the single-process case `finish_partition` does this locally, but across
+    /// workers the producer-done must be shipped and applied here.
+    pub fn signal_stream_done(
+        &mut self,
+        request_id: u64,
+        from_partition: &str,
+        edge: &str,
+        target_partition: &str,
+    ) -> Result<()> {
+        let idx = self
+            .connections
+            .iter()
+            .position(|c| c.from == from_partition && c.to == target_partition && c.edge_name == edge)
+            .ok_or_else(|| RuntimeError::UnknownConnection {
+                from: from_partition.to_string(),
+                edge: edge.to_string(),
+                to: target_partition.to_string(),
+            })?;
+        let req = self
+            .requests
+            .get_mut(&request_id)
+            .ok_or(RuntimeError::UnknownRequest(request_id))?;
+        req.buffers[idx].signal_done();
+        Ok(())
+    }
+
+    /// Connections whose producer is `partition` but whose consumer is NOT local
+    /// (decentralized): (edge, target_partition) pairs. The worker owning
+    /// `partition` ships a producer-done to each consumer worker when its
+    /// partition finishes.
+    pub fn outgoing_cross_worker(&self, partition: &str) -> Vec<(String, String)> {
+        self.connections
+            .iter()
+            .filter(|c| c.from == partition && !self.is_local(&c.to))
+            .map(|c| (c.edge_name.clone(), c.to.clone()))
+            .collect()
+    }
+
     /// Current (pages, seq_pos) for a request's cache label, for the data
     /// plane / debugging.
     pub fn kv_state(&self, request_id: u64, label: &str) -> KvRequestState {

@@ -221,3 +221,15 @@ class Driver:
         refs = [self.store.put(t, request_id) for t in tensors]
         self.runtime.inject_stream_chunk(request_id, from_partition, edge,
                                          target_partition, refs)
+
+    def signal_stream_done(self, request_id: int, from_partition: str, edge: str,
+                           target_partition: str) -> None:
+        """Consumer side: a peer worker's producer partition finished — mark it
+        done on the local connection buffer so a continue_after_done stream
+        keeps the consumer's own loop alive on empty chunks."""
+        self.runtime.signal_stream_done(request_id, from_partition, edge, target_partition)
+
+    def outgoing_cross_worker(self, partition: str):
+        """(edge, target_partition) for this partition's connections whose
+        consumer is a different worker."""
+        return self.runtime.outgoing_cross_worker(partition)

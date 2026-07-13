@@ -157,6 +157,22 @@ impl PyRuntime {
             .map_err(to_py_err)
     }
 
+    /// Consumer side: mark the producer done on a cross-worker connection buffer
+    /// (the producing worker shipped a producer-done after finishing its
+    /// partition). Lets a continue_after_done stream keep yielding empties.
+    fn signal_stream_done(&mut self, request_id: u64, from_partition: &str,
+                          edge: &str, target_partition: &str) -> PyResult<()> {
+        self.inner
+            .signal_stream_done(request_id, from_partition, edge, target_partition)
+            .map_err(to_py_err)
+    }
+
+    /// (edge, target_partition) for connections out of `partition` whose
+    /// consumer is a different worker — where a producer-done must be shipped.
+    fn outgoing_cross_worker(&self, partition: &str) -> Vec<(String, String)> {
+        self.inner.outgoing_cross_worker(partition)
+    }
+
     /// (pages, seq_pos) for a request's cache label.
     fn kv_state(&self, request_id: u64, label: &str) -> (Vec<u32>, u64) {
         let st = self.inner.kv_state(request_id, label);

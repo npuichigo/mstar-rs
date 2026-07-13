@@ -26,11 +26,19 @@ dtype)` descriptors.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
 import msgpack
 import torch
+
+_DISAGG_DEBUG = bool(os.environ.get("MSTAR_DISAGG_DEBUG"))
+
+
+def _dbg(who: str, msg: str) -> None:
+    if _DISAGG_DEBUG:
+        print(f"[{who}] {msg}", flush=True)
 
 from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
@@ -527,15 +535,26 @@ class DisaggWorker:
     loop; ships stream outputs to peer workers; injects peer chunks locally."""
 
     def __init__(self, worker_id, engine, local_partitions, partition_to_worker,
-                 socket_dir, device: str = "cpu") -> None:
+                 socket_dir, device: str = "cpu", io_leader: bool = True) -> None:
+        self.worker_id = worker_id
         self.driver = Driver(engine, local_partitions=local_partitions)
         self.mbox = ZmqCommunicator(worker_id, socket_dir)
         self.shm = ShmPool(worker_id)
         self.partition_to_worker = partition_to_worker
         self.device = device
+        # io_leader=False: a tensor-parallel FOLLOWER rank. It runs the SAME
+        # deterministic schedule + compute as the leader (so the per-layer NCCL
+        # all-reduces stay in lockstep), but suppresses all outward I/O —
+        # shipping stream chunks, emissions, and partition-done — because its
+        # outputs are replicas of the leader's. Only rank 0 of a TP group ships.
+        self.io_leader = io_leader
+        self.device = device
         self._g2l: dict[int, int] = {}   # global request id -> local runtime id
         self._l2g: dict[int, int] = {}
         self._stop = False
+        # producer-done notifications to ship AFTER this tick's stream chunks
+        # (order: chunks first, then done) — (gid, from, edge, to).
+        self._pending_done: list[tuple] = []
         # emissions + partition-done fire from inside driver.poll(); relay them.
         self.driver.on_token = self._emit
         self.driver.on_partition_done = self._partition_done
@@ -543,12 +562,20 @@ class DisaggWorker:
     def run(self) -> None:
         while not self._stop:
             raw = self.mbox.recv_timeout(50)   # block when idle (no busy spin)
-            while raw is not None:
+            # Drain a BOUNDED number of queued messages, then always poll — an
+            # unbounded drain would starve poll() when a peer floods this worker
+            # with stream chunks faster than it can consume them (the consumer
+            # would buffer forever and never drive its own partition).
+            n = 0
+            while raw is not None and n < 16:
                 self._handle(raw)
                 if self._stop:
                     return
+                n += 1
                 raw = self.mbox.try_recv()
-            self.driver.poll()                 # one in-process step, no round-trip
+            did = self.driver.poll()           # one in-process step, no round-trip
+            if did:
+                _dbg(self.worker_id, "poll ran a batch")
             self._ship_outbox()
 
     def _handle(self, raw: bytes) -> None:
@@ -558,19 +585,32 @@ class DisaggWorker:
             self._stop = True
         elif t == "seed":
             gid = int(msg["gid"])
-            local = self.driver.new_request()
-            self._g2l[gid] = local
-            self._l2g[local] = gid
-            self.driver._front_rid[local] = gid  # so on_token fires with gid
+            _dbg(self.worker_id, f"seed gid={gid} walk={msg['walk']}")
+            # A worker owning several partitions gets ONE seed per partition for
+            # the same request — they all share a single local request, so only
+            # create it on the first seed and reuse it thereafter (else each
+            # partition's walk lands in a separate request and cross-partition
+            # streams never meet their consumer).
+            local = self._g2l.get(gid)
+            if local is None:
+                local = self.driver.new_request()
+                self._g2l[gid] = local
+                self._l2g[local] = gid
+                self.driver._front_rid[local] = gid  # so on_token fires with gid
             inputs = [
                 (node, name, [self.shm.read(d).to(self.device) for d in descs])
                 for node, name, descs in msg["inputs"]
             ]
             self.driver.start(local, msg["walk"], inputs, *msg["kv"])
         elif t == "stream":
+            _dbg(self.worker_id, f"stream gid={msg['gid']} {msg['from']}->{msg['to']}")
             local = self._g2l[int(msg["gid"])]
             tensors = [self.shm.read(d).to(self.device) for d in msg["descs"]]
             self.driver.inject(local, msg["from"], msg["edge"], msg["to"], tensors)
+        elif t == "stream_done":
+            _dbg(self.worker_id, f"stream_done gid={msg['gid']} {msg['from']}->{msg['to']}")
+            local = self._g2l[int(msg["gid"])]
+            self.driver.signal_stream_done(local, msg["from"], msg["edge"], msg["to"])
         elif t == "finish":
             local = self._g2l.pop(int(msg["gid"]), None)
             if local is not None:
@@ -580,8 +620,12 @@ class DisaggWorker:
                 self.driver.store.free_request(local)
 
     def _ship_outbox(self) -> None:
+        if not self.io_leader:
+            self.driver.outbox.clear()   # follower: replica output, don't ship
+            return
         for frm, edge, to, tensors, local in self.driver.outbox:
             gid = self._l2g[local]
+            _dbg(self.worker_id, f"ship {frm}->{to} gid={gid} -> {self.partition_to_worker[to]}")
             descs = [self.shm.stage(t) for t in tensors]
             self.mbox.send(
                 self.partition_to_worker[to],
@@ -589,8 +633,18 @@ class DisaggWorker:
                                "edge": edge, "to": to, "descs": descs}),
             )
         self.driver.outbox.clear()
+        # ship queued producer-done AFTER the chunks (chunks first, then done)
+        for gid, frm, edge, to in self._pending_done:
+            self.mbox.send(
+                self.partition_to_worker[to],
+                msgpack.packb({"t": "stream_done", "gid": gid, "from": frm,
+                               "edge": edge, "to": to}),
+            )
+        self._pending_done.clear()
 
     def _emit(self, gid: int, value) -> None:
+        if not self.io_leader:
+            return   # follower: replica emission, leader already sent it
         if isinstance(value, torch.Tensor):
             self.mbox.send("coordinator", msgpack.packb(
                 {"t": "emission", "gid": gid, "desc": self.shm.stage(value)}))
@@ -599,10 +653,18 @@ class DisaggWorker:
                 {"t": "emission", "gid": gid, "value": value}))
 
     def _partition_done(self, local: int, partition: str) -> None:
+        if not self.io_leader:
+            return   # follower: leader reports the partition done
         gid = self._l2g.get(local)
-        if gid is not None:
-            self.mbox.send("coordinator", msgpack.packb(
-                {"t": "partition_done", "gid": gid, "partition": partition}))
+        if gid is None:
+            return
+        # Tell each consumer worker this producer partition is done, so its
+        # continue_after_done streams switch to yielding empties (keeping its own
+        # AR loop alive). Queued to ship AFTER this tick's stream chunks.
+        for edge, to in self.driver.outgoing_cross_worker(partition):
+            self._pending_done.append((gid, partition, edge, to))
+        self.mbox.send("coordinator", msgpack.packb(
+            {"t": "partition_done", "gid": gid, "partition": partition}))
 
 
 class DisaggCoordinator:
@@ -612,7 +674,13 @@ class DisaggCoordinator:
 
     def __init__(self, policy, partition_to_worker, socket_dir) -> None:
         self.policy = policy
-        self.partition_to_worker = partition_to_worker
+        # A partition maps to a LIST of workers (its TP ranks; a bare string is
+        # a 1-rank group). Seeds go to ALL ranks (they run in lockstep); the
+        # first is the I/O leader (peers ship stream chunks to it).
+        self.partition_to_workers = {
+            p: ([w] if isinstance(w, str) else list(w))
+            for p, w in partition_to_worker.items()
+        }
         self.walk_partition = {
             w: p["name"] for p in policy.partitions()[0] for w in p["walks"]
         }
@@ -632,11 +700,13 @@ class DisaggCoordinator:
         req = dict(request, request_id=gid)
         for nxt in self.policy.initial_walks(req):
             walk, inputs, *kv = nxt
-            worker = self.partition_to_worker[self.walk_partition[walk]]
             seeded = [[node, name, [self.shm.stage(t) for t in tensors]]
                       for node, name, tensors in inputs]
-            self.mbox.send(worker, msgpack.packb(
-                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded, "kv": list(kv)}))
+            msg = msgpack.packb(
+                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded, "kv": list(kv)})
+            # seed every rank of the partition (TP group runs in lockstep)
+            for worker in self.partition_to_workers[self.walk_partition[walk]]:
+                self.mbox.send(worker, msg)
         return gid
 
     def poll(self, timeout_ms: int = 20) -> None:
@@ -653,7 +723,7 @@ class DisaggCoordinator:
                 self._pending[gid].discard(msg["partition"])
                 if not self._pending[gid]:
                     self.finished.add(gid)
-                    for worker in set(self.partition_to_worker.values()):
+                    for worker in self._all_workers():
                         self.mbox.send(worker, msgpack.packb({"t": "finish", "gid": gid}))
             raw = self.mbox.try_recv()
 
@@ -662,6 +732,9 @@ class DisaggCoordinator:
             self.poll()
         return self.results
 
+    def _all_workers(self) -> set:
+        return {w for ws in self.partition_to_workers.values() for w in ws}
+
     def shutdown_workers(self) -> None:
-        for worker in set(self.partition_to_worker.values()):
+        for worker in self._all_workers():
             self.mbox.send(worker, msgpack.packb({"t": "shutdown"}))
