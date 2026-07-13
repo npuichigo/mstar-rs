@@ -3,6 +3,17 @@
 This replaces (for the in-process case) mstar's conductor round-trips: the
 Rust core picks batches and routes outputs; the driver executes nodes with
 torch and answers WalkDone events by consulting the model's policy.
+
+The scheduler (the Rust `Runtime`) and the model compute live in the SAME
+process here, so the per-step loop — `next_batch` -> `execute` -> `complete_
+batch` -> `next_forward` — is all in-process calls with NO IPC, msgpack, or
+SHM round-trip per step. This is the co-located / single-node serving path
+(mirrors mstar's in-worker `MicroScheduler`, which each worker drives itself);
+the multi-process `Conductor` in `dist.py` — which dispatches a batch to a
+worker over ZeroMQ *every step* — is only for genuinely-distributed
+deployments (separate GPUs/partitions, multi-node), and pays a per-step round
+trip that this path avoids. `poll`/`finished`/`errors`/`shutdown_workers`
+mirror the Conductor's surface so `server.ServingEngine` can drive either one.
 """
 
 from __future__ import annotations
@@ -40,6 +51,13 @@ class Driver:
         self.store = TensorStore(self.runtime)
         # request_id -> list of postprocessed emissions
         self.results: dict[int, list[Any]] = {}
+        # Serving surface (parity with dist.Conductor, so ServingEngine can
+        # drive an in-process Driver with no per-step IPC).
+        self.finished: set[int] = set()   # request ids whose request completed
+        self.errors: dict[int, str] = {}  # request id -> error message
+        self.on_token = None              # callable(front_rid, value) — stream hook
+        self.on_done = None               # callable(front_rid)
+        self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
 
     def submit(self, request: dict[str, Any]) -> int:
         request_id = self.runtime.add_request()
@@ -59,39 +77,51 @@ class Driver:
         ]
         self.runtime.start_walk(request_id, walk, seeded, kv_appends, kv_scratch)
 
+    def poll(self, timeout_ms: int = 0) -> bool:
+        """Run the next ready batch IN-PROCESS (no IPC) and route its outputs.
+        Returns True if a batch ran. One batch per call so a serving loop can
+        ingest new requests between steps (continuous batching emerges from the
+        runtime grouping every ready request's same-(node,walk) work into one
+        batch). `timeout_ms` is accepted for Conductor-API parity and ignored —
+        in-process there is nothing to block on."""
+        batch = self.runtime.next_batch(self.max_batch_size)
+        if batch is None:
+            return False
+        inputs = {
+            rid: {name: self.store.get_all(refs) for name, refs in named.items()}
+            for rid, named in batch.inputs.items()
+        }
+        outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+        # check_stop -> STOP_LOOPS: must land before complete_batch so the
+        # loop terminates on this iteration rather than advancing.
+        for rid, loop_name in self.model.loops_to_finish():
+            self.runtime.signal_loop_finish(rid, loop_name)
+        out_refs = {
+            rid: {name: [self.store.put(t, rid) for t in tensors]
+                  for name, tensors in named.items()}
+            for rid, named in outputs.items()
+        }
+        for event in self.runtime.complete_batch(batch.batch_id, out_refs):
+            self._handle_event(event)
+        return True
+
     def run_until_idle(self) -> dict[int, list[Any]]:
         """Drive the runtime until no request has schedulable work left."""
-        while (batch := self.runtime.next_batch(self.max_batch_size)) is not None:
-            inputs = {
-                rid: {
-                    name: self.store.get_all(refs)
-                    for name, refs in named.items()
-                }
-                for rid, named in batch.inputs.items()
-            }
-            outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
-            # check_stop -> STOP_LOOPS: must land before complete_batch so the
-            # loop terminates on this iteration rather than advancing.
-            for rid, loop_name in self.model.loops_to_finish():
-                self.runtime.signal_loop_finish(rid, loop_name)
-            out_refs = {
-                rid: {
-                    name: [self.store.put(t, rid) for t in tensors]
-                    for name, tensors in named.items()
-                }
-                for rid, named in outputs.items()
-            }
-            for event in self.runtime.complete_batch(batch.batch_id, out_refs):
-                self._handle_event(event)
+        while self.poll():
+            pass
         return self.results
+
+    def shutdown_workers(self) -> None:
+        pass  # in-process: no workers to shut down
 
     def _handle_event(self, event: dict[str, Any]) -> None:
         rid = event["request_id"]
         if event["type"] == "emission":
             tensors = self.store.get_all(event["tensors"])
-            self.results[rid].append(
-                self.model.postprocess(event["name"], event["modality"], tensors)
-            )
+            value = self.model.postprocess(event["name"], event["modality"], tensors)
+            self.results[rid].append(value)
+            if self.on_token is not None and rid in self._front_rid:
+                self.on_token(self._front_rid[rid], value)  # stream, no per-step IPC
         elif event["type"] == "walk_done":
             persist = {
                 name: self.store.get_all(refs)
@@ -111,6 +141,9 @@ class Driver:
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
                     self.store.free_request(rid)
+                    self.finished.add(rid)   # ServingEngine consumes this
+                    if self.on_done is not None and rid in self._front_rid:
+                        self.on_done(self._front_rid.pop(rid))
             else:
                 self._start_walk(rid, nxt)
         elif event["type"] == "free":

@@ -40,9 +40,15 @@ from .dist import Conductor
 
 
 class ServingEngine:
-    """Owns the conductor on a background thread; HTTP handlers submit here."""
+    """Owns the request-driver on a background thread; HTTP handlers submit here.
 
-    def __init__(self, conductor: Conductor) -> None:
+    Drives either a multi-process `dist.Conductor` (batches dispatched to worker
+    processes over ZeroMQ every step — for genuinely-distributed deployments) or
+    an in-process `driver.Driver` (scheduler + engine co-located, no per-step
+    IPC — the co-located fast path). Both expose the same submit/poll/finished/
+    errors/shutdown_workers surface, so the HTTP layer is identical for both."""
+
+    def __init__(self, conductor) -> None:  # Conductor | Driver
         self.cond = conductor
         self._submit_q: queue.Queue = queue.Queue()
         self._futures: dict[int, threading.Event] = {}
