@@ -251,7 +251,7 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str | None = None,
                  tp_rank: int = 0, tp_world: int = 1, max_output_tokens: int = 256,
                  greedy: bool = True, tp_port: int = 29700,
-                 audio_output: bool = False) -> None:
+                 audio_output: bool = False, cuda_graph: bool = True) -> None:
         import torch
 
         from mstar.distributed.communication import TPCommGroup, WorkerTPGroups
@@ -308,6 +308,71 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         self._generated: dict[int, int] = {}
         self._pending_stops: list[tuple[int, str]] = []
 
+        # --- CUDA-graph capture of the per-token decode (TP-safe) ---------
+        # Capture embed -> Thinker forward (incl. the 2 NCCL all-reduces/layer,
+        # graph-capturable) -> lm_head -> greedy argmax, over static buffers. My
+        # fi decode wrapper is in cudagraph mode (plan() outside); MRoPE cos/sin
+        # are recomputed per token and copied in (position advances each step).
+        self.cuda_graph = cuda_graph
+        self._head_dim = head_dim
+        self._g_tok = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._g_cos = torch.zeros(1, head_dim, dtype=torch.bfloat16, device=self.device)
+        self._g_sin = torch.zeros(1, head_dim, dtype=torch.bfloat16, device=self.device)
+        self._g_out_tok = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._g_layer0 = torch.zeros(1, tc.hidden_size, dtype=torch.bfloat16, device=self.device)
+        self._decode_attn = FlashInferAttention(
+            self._cache, qo, head_dim, self.device, max_new_tokens=1,
+            cudagraph=cuda_graph, causal=True, dtype=torch.bfloat16,
+        )
+        self._decode_graph = None
+
+    def _mrope(self, seq_pos: int):
+        torch = self._torch
+        pos3d = torch.full((3, 1), float(seq_pos), dtype=torch.float, device=self.device)
+        return self._cos_sin(pos3d, self._inv_freq, MROPE_SECTION, target_dtype=torch.bfloat16)
+
+    def _capture_decode(self, pages, seq_pos: int) -> None:
+        torch = self._torch
+        handle = self._Handle(self._decode_attn)
+        self._decode_attn.plan(pages, seq_pos, 1)
+
+        def dec_fn() -> None:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                hidden, layer_0, _ = self._tmodel(
+                    input_embeds=self._embed(self._g_tok).to(torch.bfloat16),
+                    cache_handle=handle, cos_sin_3d=(self._g_cos, self._g_sin),
+                    mrope_section=MROPE_SECTION,
+                )
+                self._g_out_tok.copy_(self._lm_head(hidden[-1:]).argmax(-1).reshape(1))
+                if self.audio_output:
+                    self._g_layer0.copy_(layer_0)
+
+        torch.cuda.synchronize()
+        for _ in range(2):
+            dec_fn()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            dec_fn()
+        torch.cuda.synchronize()
+        self._decode_graph = g
+
+    def _decode_graphed(self, tok_id: int, pages, seq_pos: int):
+        """Replay the captured Thinker decode for one token. Returns
+        (sampled_token:int, layer_0_hidden or None)."""
+        torch = self._torch
+        cos, sin = self._mrope(seq_pos)
+        if self._decode_graph is None:
+            self._g_cos.copy_(cos); self._g_sin.copy_(sin)
+            self._capture_decode(pages, seq_pos)
+        self._decode_attn.plan(pages, seq_pos, 1)   # growing KV, outside the graph
+        self._g_tok.copy_(torch.as_tensor([tok_id], device=self.device))
+        self._g_cos.copy_(cos); self._g_sin.copy_(sin)
+        self._decode_graph.replay()
+        tok = int(self._g_out_tok.item())   # .item() syncs; no explicit sync needed
+        layer0 = self._g_layer0.clone() if self.audio_output else None
+        return tok, layer0
+
     def execute(self, node_name, walk, inputs, kv=None):
         torch = self._torch
         out: dict[int, dict[str, list]] = {}
@@ -315,6 +380,22 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
             ids = named["text_inputs"][0].to(self.device).reshape(-1)
             view = kv[rid]
             seq_pos, n = view["seq_pos"], view["append_len"]
+            # per-token decode: the CUDA-graph path (embed + Thinker forward
+            # incl. NCCL all-reduces + lm_head + argmax, captured over static
+            # buffers; MRoPE cos/sin copied in per token).
+            if walk == "thinker_decode" and self.cuda_graph:
+                tok, layer0 = self._decode_graphed(int(ids[0].item()), view["pages"], seq_pos)
+                o = {"new_token": [torch.tensor([tok], dtype=torch.long)],
+                     "text_inputs": [torch.tensor([tok], dtype=torch.long)]}
+                if self.audio_output:
+                    o["thinker_states"] = [layer0]
+                    o["thinker_mask"] = [torch.zeros(1, dtype=torch.bool, device=self.device)]
+                cnt = self._generated.get(rid, 0) + 1
+                self._generated[rid] = cnt
+                if tok == self._eos or cnt >= self.max_output_tokens:
+                    self._pending_stops.append((rid, "thinker_decode_loop"))
+                out[rid] = o
+                continue
             if n > 1:
                 pos3d = self._rope_index(n, seq_pos, self.device)
             else:
@@ -688,7 +769,8 @@ class Qwen3OmniAudioEngine(ModelEngine):
         self._decode_attn.plan(pages, seq_pos, 1)   # growing KV, outside the graph
         self._g_ie.copy_(input_embeds)
         self._decode_graph.replay()
-        torch.cuda.synchronize()
+        # clones are stream-ordered after replay; the downstream .item()/SHM
+        # staging syncs — no explicit per-step device sync needed.
         return (self._g_all_codes.clone(), self._g_csum.clone(),
                 self._g_all_codes[:, 0].clone())
 
