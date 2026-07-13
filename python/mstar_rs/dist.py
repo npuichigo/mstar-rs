@@ -34,6 +34,8 @@ import torch
 
 from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
+from .driver import Driver
+
 # ---- tensor <-> shared-memory codec -----------------------------------------
 
 _DTYPE_TO_STR = {
@@ -505,3 +507,161 @@ def _spec_json(policy) -> str:
             {"walks": policy.walks(), "partitions": partition_specs, "connections": connection_specs}
         )
     return json.dumps(policy.walks())
+
+
+# ---- decentralized (in-worker scheduler) multi-process runtime --------------
+#
+# The DECENTRALIZED alternative to the Conductor above. Each worker owns a
+# partition, holds its OWN scheduler (a `Driver` scoped via local_partitions),
+# and drives its own loop — so the per-step decode loop pays NO conductor round
+# trip (mstar's in-worker MicroScheduler model). Cross-partition tensors stream
+# worker->worker peer-to-peer (SHM descriptor + a ZMQ `stream` notify), never
+# through a scheduler. A thin coordinator only ingests requests (seeds each
+# partition's worker once), relays emissions, and finishes a request when every
+# partition reports done. Phase-2 of the per-step-dispatch work; see
+# examples/verify_disagg.py.
+
+
+class DisaggWorker:
+    """Self-driving worker for one (or more) partition(s). Runs its own Driver
+    loop; ships stream outputs to peer workers; injects peer chunks locally."""
+
+    def __init__(self, worker_id, engine, local_partitions, partition_to_worker,
+                 socket_dir, device: str = "cpu") -> None:
+        self.driver = Driver(engine, local_partitions=local_partitions)
+        self.mbox = ZmqCommunicator(worker_id, socket_dir)
+        self.shm = ShmPool(worker_id)
+        self.partition_to_worker = partition_to_worker
+        self.device = device
+        self._g2l: dict[int, int] = {}   # global request id -> local runtime id
+        self._l2g: dict[int, int] = {}
+        self._stop = False
+        # emissions + partition-done fire from inside driver.poll(); relay them.
+        self.driver.on_token = self._emit
+        self.driver.on_partition_done = self._partition_done
+
+    def run(self) -> None:
+        while not self._stop:
+            raw = self.mbox.recv_timeout(50)   # block when idle (no busy spin)
+            while raw is not None:
+                self._handle(raw)
+                if self._stop:
+                    return
+                raw = self.mbox.try_recv()
+            self.driver.poll()                 # one in-process step, no round-trip
+            self._ship_outbox()
+
+    def _handle(self, raw: bytes) -> None:
+        msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+        t = msg["t"]
+        if t == "shutdown":
+            self._stop = True
+        elif t == "seed":
+            gid = int(msg["gid"])
+            local = self.driver.new_request()
+            self._g2l[gid] = local
+            self._l2g[local] = gid
+            self.driver._front_rid[local] = gid  # so on_token fires with gid
+            inputs = [
+                (node, name, [self.shm.read(d).to(self.device) for d in descs])
+                for node, name, descs in msg["inputs"]
+            ]
+            self.driver.start(local, msg["walk"], inputs, *msg["kv"])
+        elif t == "stream":
+            local = self._g2l[int(msg["gid"])]
+            tensors = [self.shm.read(d).to(self.device) for d in msg["descs"]]
+            self.driver.inject(local, msg["from"], msg["edge"], msg["to"], tensors)
+        elif t == "finish":
+            local = self._g2l.pop(int(msg["gid"]), None)
+            if local is not None:
+                self._l2g.pop(local, None)
+                self.driver._front_rid.pop(local, None)
+                self.driver.runtime.finish_request(local)
+                self.driver.store.free_request(local)
+
+    def _ship_outbox(self) -> None:
+        for frm, edge, to, tensors, local in self.driver.outbox:
+            gid = self._l2g[local]
+            descs = [self.shm.stage(t) for t in tensors]
+            self.mbox.send(
+                self.partition_to_worker[to],
+                msgpack.packb({"t": "stream", "gid": gid, "from": frm,
+                               "edge": edge, "to": to, "descs": descs}),
+            )
+        self.driver.outbox.clear()
+
+    def _emit(self, gid: int, value) -> None:
+        if isinstance(value, torch.Tensor):
+            self.mbox.send("coordinator", msgpack.packb(
+                {"t": "emission", "gid": gid, "desc": self.shm.stage(value)}))
+        else:
+            self.mbox.send("coordinator", msgpack.packb(
+                {"t": "emission", "gid": gid, "value": value}))
+
+    def _partition_done(self, local: int, partition: str) -> None:
+        gid = self._l2g.get(local)
+        if gid is not None:
+            self.mbox.send("coordinator", msgpack.packb(
+                {"t": "partition_done", "gid": gid, "partition": partition}))
+
+
+class DisaggCoordinator:
+    """Per-request ingest + egress for the decentralized workers. NOT per-step:
+    it seeds each partition's worker once, relays emissions to the caller, and
+    completes a request when all partitions report done."""
+
+    def __init__(self, policy, partition_to_worker, socket_dir) -> None:
+        self.policy = policy
+        self.partition_to_worker = partition_to_worker
+        self.walk_partition = {
+            w: p["name"] for p in policy.partitions()[0] for w in p["walks"]
+        }
+        self._all_partitions = [p["name"] for p in policy.partitions()[0]]
+        self.mbox = ZmqCommunicator("coordinator", socket_dir)
+        self.shm = ShmPool("coordinator")
+        self._gid = 0
+        self.results: dict[int, list[Any]] = {}
+        self._pending: dict[int, set] = {}   # gid -> partitions not yet done
+        self.finished: set[int] = set()
+
+    def submit(self, request: dict[str, Any]) -> int:
+        gid = self._gid
+        self._gid += 1
+        self.results[gid] = []
+        self._pending[gid] = set(self._all_partitions)
+        req = dict(request, request_id=gid)
+        for nxt in self.policy.initial_walks(req):
+            walk, inputs, *kv = nxt
+            worker = self.partition_to_worker[self.walk_partition[walk]]
+            seeded = [[node, name, [self.shm.stage(t) for t in tensors]]
+                      for node, name, tensors in inputs]
+            self.mbox.send(worker, msgpack.packb(
+                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded, "kv": list(kv)}))
+        return gid
+
+    def poll(self, timeout_ms: int = 20) -> None:
+        raw = self.mbox.recv_timeout(timeout_ms)
+        while raw is not None:
+            msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
+            t = msg["t"]
+            if t == "emission":
+                gid = int(msg["gid"])
+                value = self.shm.read(msg["desc"]) if "desc" in msg else msg["value"]
+                self.results[gid].append(value)   # worker already postprocessed
+            elif t == "partition_done":
+                gid = int(msg["gid"])
+                self._pending[gid].discard(msg["partition"])
+                if not self._pending[gid]:
+                    self.finished.add(gid)
+                    for worker in set(self.partition_to_worker.values()):
+                        self.mbox.send(worker, msgpack.packb({"t": "finish", "gid": gid}))
+            raw = self.mbox.try_recv()
+
+    def run_until_idle(self) -> dict[int, list[Any]]:
+        while len(self.finished) < self._gid:
+            self.poll()
+        return self.results
+
+    def shutdown_workers(self) -> None:
+        for worker in set(self.partition_to_worker.values()):
+            self.mbox.send(worker, msgpack.packb({"t": "shutdown"}))

@@ -74,7 +74,25 @@ class Driver:
         self.errors: dict[int, str] = {}  # request id -> error message
         self.on_token = None              # callable(front_rid, value) — stream hook
         self.on_done = None               # callable(front_rid)
+        # callable(rid, partition) — a locally-owned partition finished. In the
+        # decentralized/multi-worker case each worker owns one partition, so
+        # finish_partition never returns all-done here; the coordinator collects
+        # these to decide request completion across workers.
+        self.on_partition_done = None
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
+
+    def new_request(self) -> int:
+        """Create a request slot without seeding (the coordinator drives ingest
+        in the decentralized path). Returns the local runtime request id."""
+        rid = self.runtime.add_request()
+        self.results[rid] = []
+        return rid
+
+    def start(self, request_id: int, walk: str, inputs, kv_appends=None,
+              kv_scratch=None) -> None:
+        """Seed one walk for an existing request (coordinator-driven ingest)."""
+        nxt = (walk, inputs) if kv_appends is None else (walk, inputs, kv_appends, kv_scratch)
+        self._start_walk(request_id, nxt)
 
     def _owns(self, walk: str) -> bool:
         """Whether this driver schedules `walk` (its partition is local)."""
@@ -161,8 +179,13 @@ class Driver:
                 event["stream_done"],
             )
             if nxt is None:
-                # Partition finished; the request completes only when every
-                # partition is done (finish_partition returns all-done).
+                # Partition finished. A local partition-done hook lets the
+                # decentralized coordinator track completion across workers
+                # (where finish_partition never sees the peers' partitions).
+                if self.on_partition_done is not None:
+                    self.on_partition_done(rid, event["partition"])
+                # The request completes only when every partition is done here
+                # (all-owned / single-process); returns all-done then.
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
                     self.store.free_request(rid)
