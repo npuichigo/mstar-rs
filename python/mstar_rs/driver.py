@@ -28,13 +28,28 @@ from .store import TensorStore
 
 
 class Driver:
-    def __init__(self, model: Model, max_batch_size: int = 8) -> None:
+    def __init__(self, model: Model, max_batch_size: int = 8,
+                 local_partitions: list[str] | None = None) -> None:
         self.model = model
         self.max_batch_size = max_batch_size
+        # Decentralized / per-worker mode: this driver OWNS only these
+        # partitions (schedules + executes them). Stream outputs to other
+        # partitions surface as `stream_out` events collected in `self.outbox`
+        # for the owning worker to ship; incoming chunks arrive via `inject`.
+        # None = own all (single-process). This is the per-partition in-worker
+        # scheduler (mstar's MicroScheduler model) — each worker drives its own
+        # loop with peer-to-peer streaming, no per-step conductor round-trip.
+        self._local_partitions = local_partitions
+        # (from_partition, edge, target_partition, [torch tensors], request_id)
+        self.outbox: list[tuple] = []
         # A model spec with partitions is passed as {"walks", "partitions",
         # "connections"}; a bare model just as the walk dict.
+        self._walk_partition: dict[str, str] = {}
         if (topo := model.partitions()) is not None:
             partition_specs, connection_specs = topo
+            for p in partition_specs:
+                for w in p["walks"]:
+                    self._walk_partition[w] = p["name"]
             spec = {
                 "walks": model.walks(),
                 "partitions": partition_specs,
@@ -48,6 +63,8 @@ class Driver:
             self.runtime.configure_kv(configs, node_labels)
         if unbatchable := model.unbatchable():
             self.runtime.configure_unbatchable([tuple(p) for p in unbatchable])
+        if local_partitions is not None:
+            self.runtime.set_local_partitions(local_partitions)
         self.store = TensorStore(self.runtime)
         # request_id -> list of postprocessed emissions
         self.results: dict[int, list[Any]] = {}
@@ -59,11 +76,19 @@ class Driver:
         self.on_done = None               # callable(front_rid)
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
 
+    def _owns(self, walk: str) -> bool:
+        """Whether this driver schedules `walk` (its partition is local)."""
+        return (self._local_partitions is None
+                or self._walk_partition.get(walk) in self._local_partitions)
+
     def submit(self, request: dict[str, Any]) -> int:
         request_id = self.runtime.add_request()
         request = dict(request, request_id=request_id)
+        # Seed only the initial walks for partitions this driver owns; peers
+        # seed their own (decentralized ingest). Single-process owns all.
         for nxt in self.model.initial_walks(request):
-            self._start_walk(request_id, nxt)
+            if self._owns(nxt[0]):
+                self._start_walk(request_id, nxt)
         self.results[request_id] = []
         return request_id
 
@@ -146,6 +171,15 @@ class Driver:
                         self.on_done(self._front_rid.pop(rid))
             else:
                 self._start_walk(rid, nxt)
+        elif event["type"] == "stream_out":
+            # A stream chunk for a partition another worker owns: read the
+            # tensors and stage them for shipping to that worker (which calls
+            # `inject`). No conductor per-step round-trip — this is peer-to-peer.
+            tensors = self.store.get_all(event["tensors"])
+            self.outbox.append((
+                event["from_partition"], event["edge"],
+                event["target_partition"], tensors, rid,
+            ))
         elif event["type"] == "free":
             # Per-tensor reclaim: the runtime says these tensors are now
             # unreachable (consumed + not persisted/buffered). Emitted after
@@ -153,3 +187,14 @@ class Driver:
             self.store.free(event["uuids"])
         else:
             raise RuntimeError(f"unknown event type: {event['type']}")
+
+    def inject(self, request_id: int, from_partition: str, edge: str,
+               target_partition: str, tensors: list) -> None:
+        """Consumer side: a peer worker shipped a stream chunk for a partition
+        this driver owns. Stage the tensors locally and hand them to the
+        runtime, which delivers them to the waiting consumer walk on the next
+        poll. Mirrors mstar's peer-to-peer stream delivery into a worker's
+        local ready-queue."""
+        refs = [self.store.put(t, request_id) for t in tensors]
+        self.runtime.inject_stream_chunk(request_id, from_partition, edge,
+                                         target_partition, refs)

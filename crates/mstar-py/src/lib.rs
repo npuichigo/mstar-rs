@@ -129,6 +129,34 @@ impl PyRuntime {
         self.inner.configure_unbatchable(pairs);
     }
 
+    /// Decentralized / per-worker: own only these partitions. Stream outputs to
+    /// other partitions surface as `stream_out` events (ship to the owning
+    /// worker); unset = own all (single-process / centralized).
+    fn set_local_partitions(&mut self, names: Vec<String>) {
+        self.inner.set_local_partitions(names);
+    }
+
+    /// Consumer side: inject a stream chunk shipped from another worker (which
+    /// emitted a `stream_out` event). `tensors` is the event's `tensors` list
+    /// of (uuid, dims, dtype) refs, passed straight back.
+    fn inject_stream_chunk(
+        &mut self,
+        request_id: u64,
+        from_partition: &str,
+        edge: &str,
+        target_partition: &str,
+        tensors: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let list = tensors.downcast::<PyList>()?;
+        let mut refs = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            refs.push(tensor_ref_from_py(&item)?);
+        }
+        self.inner
+            .inject_stream_chunk(request_id, from_partition, edge, target_partition, refs)
+            .map_err(to_py_err)
+    }
+
     /// (pages, seq_pos) for a request's cache label.
     fn kv_state(&self, request_id: u64, label: &str) -> (Vec<u32>, u64) {
         let st = self.inner.kv_state(request_id, label);
@@ -273,6 +301,20 @@ impl PyRuntime {
                     d.set_item("type", "free")?;
                     d.set_item("request_id", request_id)?;
                     d.set_item("uuids", uuids)?;
+                }
+                Event::StreamOut {
+                    request_id,
+                    from_partition,
+                    edge,
+                    target_partition,
+                    tensors,
+                } => {
+                    d.set_item("type", "stream_out")?;
+                    d.set_item("request_id", request_id)?;
+                    d.set_item("from_partition", from_partition)?;
+                    d.set_item("edge", edge)?;
+                    d.set_item("target_partition", target_partition)?;
+                    d.set_item("tensors", tensors_to_py(py, &tensors)?)?;
                 }
             }
             list.append(d)?;

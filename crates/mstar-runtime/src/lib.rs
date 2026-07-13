@@ -115,6 +115,18 @@ pub enum Event {
     /// shared-memory buffers can be freed now (per-tensor reclaim, rather than
     /// waiting for request finish). The driver owns the uuid->buffer mapping.
     Free { request_id: u64, uuids: Vec<u64> },
+    /// A stream chunk was produced for a partition that is NOT local to this
+    /// runtime (decentralized / per-worker scheduling): the driver must ship it
+    /// to the worker that owns `target_partition`, which injects it via
+    /// `inject_stream_chunk`. Replaces the local buffer push for cross-worker
+    /// connections (mstar's peer-to-peer streaming).
+    StreamOut {
+        request_id: u64,
+        from_partition: String,
+        edge: String,
+        target_partition: String,
+        tensors: Vec<TensorRef>,
+    },
 }
 
 /// A scheduled batch: one node, one walk, with per-request input tensors for
@@ -157,6 +169,10 @@ struct RequestState {
     /// the driver still holds a buffer for. The reclaim sweep frees any that
     /// are no longer reachable; the rest are freed at request finish.
     introduced: BTreeSet<u64>,
+    /// Uuids shipped to another worker via a StreamOut event. Kept reachable
+    /// (the peer holds them until it consumes) so the local reclaim sweep does
+    /// not free their SHM out from under the consumer; freed at request finish.
+    exported: BTreeSet<u64>,
     finished: bool,
 }
 
@@ -177,6 +193,7 @@ impl RequestState {
         for buf in &self.buffers {
             buf.collect_live_uuids(&mut live);
         }
+        live.extend(&self.exported);  // shipped to a peer; alive until request end
         live
     }
 
@@ -209,6 +226,12 @@ pub struct Runtime {
     walk_partition: BTreeMap<String, String>,
     partition_names: Vec<String>,
     connections: Vec<ConnectionSpec>,
+    /// Partitions this runtime instance OWNS (schedules + executes). `None` =
+    /// all (single-process / centralized). `Some(set)` = decentralized: only
+    /// these partitions' walks are scheduled here; stream outputs to non-local
+    /// partitions become `Event::StreamOut` (shipped to the owning worker),
+    /// and incoming chunks arrive via `inject_stream_chunk`.
+    local_partitions: Option<BTreeSet<String>>,
     requests: BTreeMap<u64, RequestState>,
     scheduler: MicroScheduler,
     inflight: BTreeMap<u64, InflightBatch>,
@@ -299,6 +322,7 @@ impl Runtime {
             walk_partition,
             partition_names,
             connections,
+            local_partitions: None,
             requests: BTreeMap::new(),
             scheduler: MicroScheduler::new(),
             inflight: BTreeMap::new(),
@@ -325,6 +349,50 @@ impl Runtime {
     /// run next tick). Mirrors mstar's per-submodule `can_batch()` = false.
     pub fn configure_unbatchable(&mut self, pairs: Vec<(String, String)>) {
         self.unbatchable = pairs.into_iter().collect();
+    }
+
+    /// Restrict this runtime to OWN only `names` (decentralized / per-worker).
+    /// Only these partitions' walks are scheduled here; stream outputs to other
+    /// partitions become `Event::StreamOut`. Unset = own all (centralized).
+    pub fn set_local_partitions(&mut self, names: Vec<String>) {
+        self.local_partitions = Some(names.into_iter().collect());
+    }
+
+    /// Whether `partition` is owned by this runtime (all owned when unset).
+    fn is_local(&self, partition: &str) -> bool {
+        self.local_partitions
+            .as_ref()
+            .is_none_or(|s| s.contains(partition))
+    }
+
+    /// Consumer side of a cross-worker connection: inject a stream chunk shipped
+    /// from the producing worker (which emitted it as `Event::StreamOut`). Pushes
+    /// into the matching connection buffer; `next_batch`'s stream pump then
+    /// delivers it to the local consumer walk.
+    pub fn inject_stream_chunk(
+        &mut self,
+        request_id: u64,
+        from_partition: &str,
+        edge: &str,
+        target_partition: &str,
+        tensors: Vec<TensorRef>,
+    ) -> Result<()> {
+        let idx = self
+            .connections
+            .iter()
+            .position(|c| c.from == from_partition && c.to == target_partition && c.edge_name == edge)
+            .ok_or_else(|| RuntimeError::UnknownConnection {
+                from: from_partition.to_string(),
+                edge: edge.to_string(),
+                to: target_partition.to_string(),
+            })?;
+        let req = self
+            .requests
+            .get_mut(&request_id)
+            .ok_or(RuntimeError::UnknownRequest(request_id))?;
+        req.introduced.extend(tensors.iter().map(|t| t.uuid));
+        req.buffers[idx].push(tensors);
+        Ok(())
     }
 
     /// Current (pages, seq_pos) for a request's cache label, for the data
@@ -361,6 +429,7 @@ impl Runtime {
                     .collect(),
                 persist: BTreeMap::new(),
                 introduced: BTreeSet::new(),
+                exported: BTreeSet::new(),
                 finished: false,
             },
         );
@@ -456,7 +525,10 @@ impl Runtime {
             if req.finished {
                 continue;
             }
-            for pstate in req.partitions.values() {
+            for (pname, pstate) in &req.partitions {
+                if !self.is_local(pname) {
+                    continue; // decentralized: another worker owns this partition
+                }
                 let Some(walk) = &pstate.walk else { continue };
                 for node in walk.ready_nodes() {
                     if let Some(kv) = &self.kv {
@@ -694,7 +766,27 @@ impl Runtime {
                                 edge: name.clone(),
                                 to: target_partition.clone(),
                             })?;
-                        req.buffers[idx].push(tensors);
+                        // Field-level access (not self.is_local()) so this
+                        // immutable read of `local_partitions` co-exists with
+                        // the mutable `req` borrow of `self.requests`.
+                        let target_local = self
+                            .local_partitions
+                            .as_ref()
+                            .map_or(true, |s| s.contains(&target_partition));
+                        if target_local {
+                            req.buffers[idx].push(tensors);
+                        } else {
+                            // Cross-worker: keep the tensors alive locally (peer
+                            // holds them until consumed) and ship the chunk out.
+                            req.exported.extend(tensors.iter().map(|t| t.uuid));
+                            events.push(Event::StreamOut {
+                                request_id: rid,
+                                from_partition: partition.clone(),
+                                edge: name,
+                                target_partition,
+                                tensors,
+                            });
+                        }
                     }
                 }
             }
@@ -1386,6 +1478,7 @@ mod tests {
                         other => panic!("unexpected partition {other}"),
                     },
                     Event::Free { uuids, .. } => freed.extend(uuids),
+                    Event::StreamOut { .. } => {}  // centralized test: never emitted
                 }
             }
         }
