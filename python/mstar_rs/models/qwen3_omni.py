@@ -47,13 +47,15 @@ from ..graph import (
     sequential,
     stream_edge,
 )
-from ..model import ModelPolicy
+from ..model import ModelEngine, ModelPolicy
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 THINKER_KV = "thinker"
 TALKER_KV = "talker"
 PAGE_SIZE = 128
 THINKER_PAGES = 512   # 64k text-context tokens
+THINKER_TEXT_PAGES = 64   # 8k context for the text-only Thinker AR slice
+MROPE_SECTION = [24, 20, 20]  # for head_dim 128
 TALKER_PAGES = 256
 MAX_OUTPUT_TOKENS = 2048  # mstar: get_max_output_tokens() (both AR loops)
 # Talker→Code2Wav windowing (mstar: codec_chunk_frames / codec_left_context).
@@ -164,3 +166,660 @@ class Qwen3OmniPolicy(ModelPolicy):
             [(THINKER_KV, THINKER_PAGES, PAGE_SIZE), (TALKER_KV, TALKER_PAGES, PAGE_SIZE)],
             {"Thinker": THINKER_KV, "Talker": TALKER_KV},
         )
+
+
+# =========================================================================
+# Stage 2, slice 1: the Thinker text-only AR engine (multi-GPU / TP).
+#
+# The Thinker (~39B MoE, ~78 GB) does not fit one 80 GB card, so it MUST run
+# tensor-parallel — the engine builds it SHARDED across `tp_world` ranks (NCCL
+# SPMD via mstar's WorkerTPGroups; ~31 GB/rank shard-on-load). This is mstar's
+# `output_modalities='text'` mode: the Thinker generates text with no Talker /
+# Code2Wav, a single-partition prefill -> decode loop (the same control shape
+# as orpheus). It is driven through the TP-aware conductor/worker in dist.py
+# (a node maps to the LIST of its ranks; only rank 0's output is routed) —
+# see examples/verify_thinker_tp_dist.py. The full 3-partition audio path
+# (Qwen3OmniPolicy above) layers on top later.
+# =========================================================================
+
+
+class Qwen3OmniThinkerPolicy(ModelPolicy):
+    """Conductor-side (weightless) control plane for text-only Thinker AR:
+    config + tokenizer only, the prefill->decode graph, and the AR loop
+    policy. Qwen3OmniThinkerEngine adds the sharded weights + execute."""
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID,
+                 max_output_tokens: int = 256, greedy: bool = True) -> None:
+        from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+        self._mstar = Qwen3OmniModel(model_path_hf=model_id)
+        self.cfg = self._mstar.config
+        self.tokenizer = self._mstar.tokenizer
+        self.max_output_tokens = max_output_tokens
+        self.greedy = greedy
+
+    def walks(self) -> dict[str, Any]:
+        return {
+            "prefill_text": node(
+                "Thinker", ["text_inputs"],
+                [emit("new_token", modality="text", persist=True)],
+            ),
+            "thinker_decode": loop(
+                "thinker_decode_loop",
+                node("Thinker", ["text_inputs"],
+                     [edge("Thinker", "text_inputs"),
+                      emit("new_token", modality="text", persist=True)]),
+                max_iters=self.max_output_tokens,
+            ),
+        }
+
+    def kv_config(self):
+        return [(THINKER_KV, THINKER_TEXT_PAGES, PAGE_SIZE)], {"Thinker": THINKER_KV}
+
+    def _tokenize(self, prompt: str):
+        text = self._mstar._processor.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        return self.tokenizer(text, return_tensors="pt")["input_ids"][0]
+
+    def initial_walks(self, request: dict[str, Any]):
+        ids = self._tokenize(request.get("prompt") or request.get("text", ""))
+        return [("prefill_text", [("Thinker", "text_inputs", [ids])],
+                 {THINKER_KV: int(ids.shape[0])})]
+
+    def next_forward(self, request_id, partition, walk, fwd_index, persist, stream_done):
+        # prefill sampled the first token (persisted); seed the decode loop with
+        # it (KV append = 1). decode returning None finishes the request.
+        if walk == "prefill_text":
+            return ("thinker_decode", [("Thinker", "text_inputs", persist["new_token"])],
+                    {THINKER_KV: 1})
+        return None
+
+    def postprocess(self, name, modality, tensors):
+        return int(tensors[0].reshape(-1)[0].item())  # emitted token id
+
+
+class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
+    """Worker-side data plane: builds the Thinker SHARDED across `tp_world`
+    ranks (get_submodule with a real TPCommGroup, NCCL-initialized via
+    WorkerTPGroups in this __init__ — the same pattern the toy engine uses),
+    a per-rank head-sharded fi KV pool, and runs execute. MRoPE is applied by
+    the model, so the same FlashInferCacheHandle used for pi05/orpheus drives
+    the Thinker unchanged."""
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str | None = None,
+                 tp_rank: int = 0, tp_world: int = 1, max_output_tokens: int = 256,
+                 greedy: bool = True, tp_port: int = 29700,
+                 audio_output: bool = False) -> None:
+        import torch
+
+        from mstar.distributed.communication import TPCommGroup, WorkerTPGroups
+        from mstar.model.qwen3_omni.components.rope import (
+            compute_3d_cos_sin,
+            compute_rope_freqs,
+            get_rope_index_text,
+        )
+
+        from ..fi import (
+            FlashInferAttention,
+            FlashInferCacheHandle,
+            FlashInferPagedKV,
+        )
+
+        super().__init__(model_id, max_output_tokens, greedy)
+        self._torch = torch
+        self._Handle = FlashInferCacheHandle
+        self._cos_sin = compute_3d_cos_sin
+        self._rope_index = get_rope_index_text
+
+        # comm group + NCCL init (mstar's WorkerTPGroups); init_dist sets cuda:rank.
+        members = list(range(tp_world))
+        cg = TPCommGroup(my_global_rank=tp_rank, my_group_rank=tp_rank, group_members=members)
+        tp = WorkerTPGroups(num_workers=tp_world, global_rank=tp_rank,
+                            any_tp=(tp_world > 1), world_tp_groups=[tuple(members)])
+        tp.add("Thinker", cg)
+        tp.init_dist(init_method=f"tcp://127.0.0.1:{tp_port}")
+        self.device = torch.device(f"cuda:{tp_rank}")
+
+        thinker = self._mstar.get_submodule(
+            "Thinker", device=str(self.device), tp_group=cg, autocast_dtype=torch.bfloat16,
+        )
+        self._thinker_sub = thinker                        # for _get_talker_text_mask
+        self.audio_output = audio_output
+        self._tmodel = thinker.model                       # Qwen3OmniThinkerModel
+        self._embed = thinker.model.model.embed_tokens
+        self._lm_head = thinker.model.lm_head
+
+        tc = self.cfg.thinker_text
+        head_dim = getattr(self.cfg, "thinker_head_dim", None) or getattr(tc, "head_dim", 128)
+        qo = tc.num_attention_heads // tp_world            # per-rank query heads
+        kv = max(1, tc.num_key_value_heads // tp_world)    # per-rank kv heads
+        self._inv_freq = compute_rope_freqs(head_dim, tc.rope_theta, self.device)
+        self._cache = FlashInferPagedKV(
+            tc.num_hidden_layers, THINKER_TEXT_PAGES, PAGE_SIZE, kv, head_dim,
+            self.device, torch.bfloat16,
+        )
+        self._attn = FlashInferAttention(
+            self._cache, qo, head_dim, self.device, max_new_tokens=2048,
+            cudagraph=False, causal=True, dtype=torch.bfloat16,
+        )
+        self._eos = self.tokenizer.eos_token_id
+        self._generated: dict[int, int] = {}
+        self._pending_stops: list[tuple[int, str]] = []
+
+    def execute(self, node_name, walk, inputs, kv=None):
+        torch = self._torch
+        out: dict[int, dict[str, list]] = {}
+        for rid, named in inputs.items():
+            ids = named["text_inputs"][0].to(self.device).reshape(-1)
+            view = kv[rid]
+            seq_pos, n = view["seq_pos"], view["append_len"]
+            if n > 1:
+                pos3d = self._rope_index(n, seq_pos, self.device)
+            else:
+                pos3d = torch.full((3, 1), float(seq_pos), dtype=torch.float, device=self.device)
+            cos, sin = self._cos_sin(pos3d, self._inv_freq, MROPE_SECTION, target_dtype=torch.bfloat16)
+            self._attn.plan(view["pages"], seq_pos, n)
+            handle = self._Handle(self._attn)
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                hidden, layer_0, _ = self._tmodel(
+                    input_embeds=self._embed(ids).to(torch.bfloat16),
+                    cache_handle=handle, cos_sin_3d=(cos, sin), mrope_section=MROPE_SECTION,
+                )
+                logits = self._lm_head(hidden[-1:])
+            tok = int(logits.argmax(-1).reshape(-1)[0].item())
+            o = {"new_token": [torch.tensor([tok], dtype=torch.long)]}
+            if self.audio_output:
+                # Stream the selected Thinker hidden + mask to the Talker. For a
+                # text-only prompt: multimodal mask all-False, so the selected
+                # hidden is layer_0_embed; prefill drops system/prior-assistant
+                # tokens via _get_talker_text_mask (mstar postprocess L1140-1163).
+                if walk == "prefill_text":
+                    incl = self._thinker_sub._get_talker_text_mask(ids)
+                    o["thinker_states"] = [layer_0[incl].contiguous()]
+                    o["thinker_mask"] = [torch.zeros(int(incl.sum()), dtype=torch.bool,
+                                                     device=self.device)]
+                else:  # thinker_decode: one token's layer_0_embed
+                    o["thinker_states"] = [layer_0.contiguous()]
+                    o["thinker_mask"] = [torch.zeros(1, dtype=torch.bool, device=self.device)]
+            if walk == "thinker_decode":
+                o["text_inputs"] = [torch.tensor([tok], dtype=torch.long)]  # loop-back
+                cnt = self._generated.get(rid, 0) + 1
+                self._generated[rid] = cnt
+                if tok == self._eos or cnt >= self.max_output_tokens:
+                    self._pending_stops.append((rid, "thinker_decode_loop"))
+            out[rid] = o
+        return out
+
+    def loops_to_finish(self):
+        stops = self._pending_stops
+        self._pending_stops = []
+        return stops
+
+
+# =========================================================================
+# Stage 2, slice 2: the audio path — Talker (backbone + code-predictor depth
+# loop) + Code2Wav vocoder. Both run TP=1 on a single GPU (small models; only
+# the Thinker needed sharding). The Talker backbone uses the same handle
+# contract as orpheus (apply_rope theta=1e6 + run_attention), so the
+# FlashInferCacheHandle drives it unchanged; the code predictor is a
+# self-contained dense-KV fp-loop that never touches the paged handle. This
+# reuses mstar's OWN `_forward_decode_like` / `_forward_prefill` (they take a
+# cache_handle + injected_sampler, no engine coupling) for maximal fidelity —
+# only the orchestration around them lives here. Streaming this onto rank 2
+# behind the conductor (cross-partition thinker_states / codec_tokens) is the
+# next slice; here it is drivable standalone (verify_talker_code2wav.py).
+# =========================================================================
+
+
+class Qwen3OmniAudioPolicy(ModelPolicy):
+    """Conductor-side control plane for the FULL audio pipeline: Thinker text
+    AR (prefill_text -> thinker_decode) streaming thinker_states to the Talker
+    (talker_prefill -> talker_last_prefill -> talker_decode) streaming
+    codec_tokens to Code2Wav. Weightless. `talker_trigger` is dropped — in this
+    runtime the streamed-chunk arrival already gates the Talker walks. The
+    Thinker runs TP (ranks 0,1); Talker + Code2Wav run on rank 2."""
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID,
+                 max_output_tokens: int = 2048, voice: str = "chelsie") -> None:
+        from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+        self._mstar = Qwen3OmniModel(model_path_hf=model_id)
+        self.cfg = self._mstar.config
+        self.tokenizer = self._mstar.tokenizer
+        self.max_output_tokens = max_output_tokens
+        self.voice = voice
+
+    # -- graph -------------------------------------------------------------
+
+    def _thinker_out(self):
+        return [
+            emit("new_token", modality="text", persist=True),
+            stream_edge("Talker", "thinker_states", "Talker"),
+            stream_edge("Talker", "thinker_mask", "Talker"),
+        ]
+
+    def walks(self):
+        return {
+            "prefill_text": node("Thinker", ["text_inputs"], self._thinker_out()),
+            "thinker_decode": loop(
+                "thinker_decode_loop",
+                node("Thinker", ["text_inputs"],
+                     [edge("Thinker", "text_inputs")] + self._thinker_out()),
+                max_iters=self.max_output_tokens,
+            ),
+            "talker_prefill": node("Talker", ["thinker_states", "thinker_mask"], []),
+            "talker_last_prefill": node(
+                "Talker", ["thinker_states", "thinker_mask"],
+                [edge(EMPTY_DESTINATION, "talker_input_embeds", persist=True),
+                 stream_edge("Code2Wav", "codec_tokens", "Code2Wav")],
+            ),
+            "talker_decode": loop(
+                "talker_decode_loop",
+                node("Talker", ["thinker_states", "thinker_mask", "talker_input_embeds"],
+                     [edge("Talker", "talker_input_embeds"),
+                      stream_edge("Code2Wav", "codec_tokens", "Code2Wav")]),
+                max_iters=self.max_output_tokens,
+            ),
+            "code2wav_chunk": node("Code2Wav", ["codec_tokens"],
+                                   [emit("audio_chunk", modality="audio")]),
+        }
+
+    def partitions(self):
+        return (
+            [
+                partition("Thinker", ["prefill_text", "thinker_decode"]),
+                partition("Talker", ["talker_prefill", "talker_last_prefill", "talker_decode"]),
+                partition("Code2Wav", ["code2wav_chunk"]),
+            ],
+            [
+                connection("Thinker", "Talker", "thinker_states",
+                           fixed_chunk(1, continue_after_done=True)),
+                connection("Thinker", "Talker", "thinker_mask",
+                           fixed_chunk(1, continue_after_done=True)),
+                connection("Talker", "Code2Wav", "codec_tokens",
+                           left_context(CODEC_CHUNK_FRAMES, CODEC_LEFT_CONTEXT_FRAMES)),
+            ],
+        )
+
+    def kv_config(self):
+        return (
+            [(THINKER_KV, THINKER_TEXT_PAGES, PAGE_SIZE), (TALKER_KV, TALKER_PAGES, PAGE_SIZE)],
+            {"Thinker": THINKER_KV, "Talker": TALKER_KV},
+        )
+
+    # -- ingestion + continuation -----------------------------------------
+
+    def _talker_text_mask(self, ids):
+        """Replicate ThinkerSubmodule._get_talker_text_mask (config-only, no
+        weights): drop system / prior-assistant segments; keep user + the
+        trailing assistant-generation header. Gives num_kept = the Talker's
+        prefill KV append."""
+        import torch
+
+        c = self.cfg
+        starts = (ids == c.im_start_token_id).nonzero(as_tuple=True)[0]
+        mask = torch.ones(ids.shape, dtype=torch.bool)
+        for i in range(len(starts) - 1):
+            role = ids[starts[i] + 1]
+            if role in (c.system_token_id, c.assistant_token_id):
+                mask[starts[i]: starts[i + 1]] = False
+        return mask
+
+    def _tokenize(self, prompt):
+        text = self._mstar._processor.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True)
+        return self.tokenizer(text, return_tensors="pt")["input_ids"][0]
+
+    def initial_walks(self, request):
+        ids = self._tokenize(request.get("prompt") or request.get("text", ""))
+        num_kept = int(self._talker_text_mask(ids).sum())
+        # seed all three partitions (mstar kicks off every partition at ingest);
+        # Talker/Code2Wav have no seed inputs — they wait on streamed chunks.
+        return [
+            ("prefill_text", [("Thinker", "text_inputs", [ids])], {THINKER_KV: int(ids.shape[0])}),
+            ("talker_prefill", [], {TALKER_KV: num_kept}),
+            ("code2wav_chunk", []),
+        ]
+
+    def next_forward(self, request_id, partition, walk, fwd_index, persist, stream_done):
+        if partition == "Thinker":
+            if walk == "prefill_text":
+                return ("thinker_decode", [("Thinker", "text_inputs", persist["new_token"])],
+                        {THINKER_KV: 1})
+            return None  # thinker_decode finished
+        if partition == "Talker":
+            if walk == "talker_prefill":   # text-only: one prefill -> last_prefill
+                return ("talker_last_prefill", [], {TALKER_KV: 6})
+            if walk == "talker_last_prefill":
+                return ("talker_decode",
+                        [("Talker", "talker_input_embeds", persist["talker_input_embeds"])],
+                        {TALKER_KV: 1})
+            return None  # talker_decode finished (codec_eos / max)
+        # Code2Wav: re-arm until the codec stream is drained.
+        return None if stream_done else ("code2wav_chunk", [])
+
+    def postprocess(self, name, modality, tensors):
+        if modality == "audio":
+            return tensors[0].detach().cpu()      # int16 PCM, 24 kHz
+        return int(tensors[0].reshape(-1)[0].item())  # text token id
+
+
+class Qwen3OmniAudioEngine(ModelEngine):
+    """Talker + Code2Wav on one GPU (rank 2). Handles both the "Talker" and
+    "Code2Wav" nodes via `execute`; the standalone step methods (used by
+    verify_talker_code2wav.py) mirror the same walks. Each frame is 1 semantic
+    code (Talker codec_head) + 15 residual codes (code predictor) =
+    num_code_groups. Consumes streamed thinker_states from the Thinker and
+    streams codec_tokens to Code2Wav."""
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = "cuda",
+                 voice: str = "chelsie", max_output_tokens: int = 2048,
+                 cuda_graph: bool = True) -> None:
+        import torch
+
+        from mstar.distributed.communication import TPCommGroup
+        from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+        from mstar.utils.sampling import (
+            Sampler,
+            SamplerBuffers,
+            SamplingConfig,
+            SeenTokenMask,
+        )
+
+        from ..fi import FlashInferAttention, FlashInferCacheHandle, FlashInferPagedKV
+
+        self._torch = torch
+        self._Handle = FlashInferCacheHandle
+        self.device = torch.device(device)
+        # Make this the current device so Triton/CUDA kernels (e.g. the sampler)
+        # launch on the same device as their operands — otherwise a kernel
+        # launched on the default cuda:0 over cuda:2 tensors faults. Only when
+        # an explicit index is given ("cuda" with no index -> leave current).
+        if self.device.index is not None:
+            torch.cuda.set_device(self.device)
+        self._mstar = Qwen3OmniModel(model_path_hf=model_id)
+        self.cfg = self._mstar.config
+        self.sr = 24000
+
+        self.talker = self._mstar.get_submodule(
+            "Talker", device=str(self.device), tp_group=TPCommGroup.trivial(),
+            autocast_dtype=torch.bfloat16,
+        )
+        self.code2wav = self._mstar.get_submodule("Code2Wav", device=str(self.device))
+        # The weight loader moves params but not the non-persistent `code_offset`
+        # buffer (created on CPU in __init__); move the whole vocoder to device.
+        self.code2wav.code2wav.to(self.device)
+        self.num_codes = self.talker.num_codes                       # 16
+        self._csum_dtype = self.talker.talker_code_emb.weight.dtype
+
+        tt = self.cfg.talker_text
+        head_dim = getattr(tt, "head_dim", tt.hidden_size // tt.num_attention_heads)
+        self._cache = FlashInferPagedKV(
+            tt.num_hidden_layers, THINKER_TEXT_PAGES, PAGE_SIZE,
+            tt.num_key_value_heads, head_dim, self.device, torch.bfloat16,
+        )
+        self._attn = FlashInferAttention(
+            self._cache, tt.num_attention_heads, head_dim, self.device,
+            max_new_tokens=512, cudagraph=False, causal=True, dtype=torch.bfloat16,
+        )
+        self._pages = list(range(THINKER_TEXT_PAGES))
+        self.sampler = Sampler(device=self.device)
+        self.voice = voice
+        self.max_output_tokens = max_output_tokens
+        self._registered: set[str] = set()
+        # per-request streaming state (for execute)
+        self._eos_sent: set[str] = set()      # tts_eos injected once after Thinker EOS
+        self._first_chunk: set[str] = set()    # Code2Wav left-context trim gate
+        self._codec_eos_hit: set[int] = set()
+        self._pending_stops: list[tuple[int, str]] = []
+
+        # --- CUDA-graph decode capture (RTF lever) -----------------------
+        # Capture the WHOLE per-frame decode (mstar's _forward_decode_like:
+        # backbone + codec_head + layer-0 sample + the unrolled 16-step depth
+        # loop) as one graph, reusing mstar's graph-safe code verbatim. My fi
+        # attention runs in cudagraph mode (plan() outside), and an in-graph
+        # CudaGraphableSampler replaces the eager Sampler. mstar's own runner
+        # can't be reused here (it's bound to mstar's paged cache manager, which
+        # the Rust runtime + fi handle replace) — so I own only the torch.cuda
+        # .graph harness; every op inside is mstar's.
+        self.cuda_graph = cuda_graph
+        self._SamplingConfig = SamplingConfig
+        self._SeenTokenMask = SeenTokenMask
+        self._g_ie = torch.zeros(1, tt.hidden_size, dtype=torch.bfloat16, device=self.device)
+        self._g_all_codes = torch.zeros(1, self.num_codes, dtype=torch.long, device=self.device)
+        self._g_csum = torch.zeros(1, self.cfg.talker_hidden_size,
+                                   dtype=self._csum_dtype, device=self.device)
+        self._g_pos = torch.zeros(1, 1, dtype=torch.long, device=self.device)
+        self._decode_attn = FlashInferAttention(
+            self._cache, tt.num_attention_heads, head_dim, self.device,
+            max_new_tokens=1, cudagraph=cuda_graph, causal=True, dtype=torch.bfloat16,
+        )
+        self._sbuf = SamplerBuffers.allocate(
+            1, self.device, tp_group=TPCommGroup.trivial(), vocab_size=tt.vocab_size,
+        )
+        self._decode_graph = None
+        self._decode_sampler = None
+
+    def _handle(self, pages, seq_pos: int, n: int):
+        self._attn.plan(pages, seq_pos, n)
+        return self._Handle(self._attn)
+
+    def _register(self, rid: str) -> None:
+        if rid not in self._registered:
+            self.sampler.add_request(rid)
+            self.sampler.set_config(
+                rid, vocab_size=self.cfg.talker_text.vocab_size,
+                temperature=1.0, top_p=1.0, repetition_penalty=1.1, ignore_eos=False,
+            )
+            self._registered.add(rid)
+
+    def _depth(self, rid: str, handle, input_embeds):
+        """Run the Talker backbone over `input_embeds` then the code-predictor
+        depth loop (mstar's _forward_decode_like). Returns its output dict:
+        codec_tokens (1,16), talker_input_embeds (1,1024), new_token (layer0)."""
+        torch = self._torch
+        bs = 1
+        return self.talker._forward_decode_like(
+            request_ids=[rid],
+            cache_handle=handle,
+            injected_sampler=self.sampler,
+            suppress_mask=self.talker._get_suppress_mask(),
+            all_codes=torch.zeros(bs, self.num_codes, dtype=torch.long, device=self.device),
+            codec_emb_sum=torch.zeros(bs, self.cfg.talker_hidden_size,
+                                      dtype=self._csum_dtype, device=self.device),
+            pos_buf=torch.zeros(bs, 1, dtype=torch.long, device=self.device),
+            is_batched_decode=False,
+            input_embeds=input_embeds,
+        )
+
+    def _capture_decode(self, rid: str, pages, seq_pos: int) -> None:
+        """Capture the whole per-frame decode (mstar's _forward_decode_like:
+        backbone + codec_head + layer-0 sample + 16-step depth loop) as ONE
+        CUDA graph over static buffers, with the fi wrapper in cudagraph mode
+        (planned outside) and an in-graph CudaGraphableSampler. All compute is
+        mstar's code; only this harness is mine."""
+        torch = self._torch
+        cfg = self._SamplingConfig(
+            vocab_size=self.cfg.talker_text.vocab_size,
+            temperature=1.0, top_k=0, top_p=1.0, repetition_penalty=1.1, ignore_eos=False,
+        )
+        self._sbuf.register_request(rid, cfg)
+        seen = self._SeenTokenMask.new(rid, self.cfg.talker_text.vocab_size, self.device)
+        self._sbuf.stage_seen_token_masks([rid], [seen])
+        sampler = self._sbuf.gather_for_request_ids([rid], 1, gather_seen_tokens=True)
+        self._decode_sampler = sampler
+        handle = self._Handle(self._decode_attn)
+        self._decode_attn.plan(pages, seq_pos, 1)
+
+        def dec_fn() -> None:
+            self._g_pos.zero_()
+            self._g_csum.zero_()               # _forward_decode_like accumulates via add_
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                self.talker._forward_decode_like(
+                    request_ids=[rid], cache_handle=handle, injected_sampler=sampler,
+                    suppress_mask=self.talker._get_suppress_mask(),
+                    all_codes=self._g_all_codes, codec_emb_sum=self._g_csum,
+                    pos_buf=self._g_pos, is_batched_decode=False, input_embeds=self._g_ie,
+                )
+
+        saved_off = self._sbuf.offset_buf[:1].clone()
+        saved_seen = self._sbuf.seen_tokens.buf[:1].clone()
+        torch.cuda.synchronize()
+        for _ in range(2):  # warmup / autotune (writes garbage KV at this slot)
+            dec_fn()
+        self._sbuf.offset_buf[:1].copy_(saved_off)
+        self._sbuf.seen_tokens.buf[:1].copy_(saved_seen)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            dec_fn()
+        torch.cuda.synchronize()
+        self._decode_graph = g
+
+    def _decode_graphed(self, rid: str, input_embeds, pages, seq_pos: int):
+        """Replay the captured decode graph for one frame. Re-plans the fi
+        wrapper outside the graph (growing KV), copies the input embed in, and
+        reads the static output buffers."""
+        torch = self._torch
+        if self._decode_graph is None:
+            self._capture_decode(rid, pages, seq_pos)
+        self._decode_attn.plan(pages, seq_pos, 1)   # growing KV, outside the graph
+        self._g_ie.copy_(input_embeds)
+        self._decode_graph.replay()
+        torch.cuda.synchronize()
+        return (self._g_all_codes.clone(), self._g_csum.clone(),
+                self._g_all_codes[:, 0].clone())
+
+    def talker_prefill(self, thinker_states, mm_mask, seq_pos: int) -> int:
+        """KV-fill from a chunk of streamed Thinker hiddens; returns new seq_pos."""
+        torch = self._torch
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            emb = self.talker._get_talker_embeds(thinker_states.to(self.device), mm_mask.to(self.device))
+            self.talker._forward_prefill(self._handle(self._pages, seq_pos, emb.shape[0]), emb)
+        return seq_pos + emb.shape[0]
+
+    def last_prefill(self, rid: str, last_thinker_hidden, voice: str, seq_pos: int):
+        """The 6-token assistant prefix -> first codec frame. Returns
+        (codec_tokens[16], talker_input_embeds[1024], layer0, new_seq_pos)."""
+        torch = self._torch
+        self._register(rid)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            codec6 = self.talker._get_last_prefill_codec_hidden(voice)
+            text6 = self.talker._get_last_prefill_talker_hidden(last_thinker_hidden.to(self.device))
+            out = self._depth(rid, self._handle(self._pages, seq_pos, 6), codec6 + text6)
+        return out["codec_tokens"][0], out["talker_input_embeds"][0], out["new_token"][0], seq_pos + 6
+
+    def decode_step(self, rid: str, talker_input_embeds, text_hidden, seq_pos: int):
+        """One decode frame: self-fed codec ⊕ text conditioning -> depth loop.
+        Returns (codec_tokens[1,16], talker_input_embeds[1,1024], layer0[1], new_seq_pos)."""
+        torch = self._torch
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            emb = (talker_input_embeds + text_hidden).to(torch.bfloat16)
+        if self.cuda_graph:
+            codes, csum, layer0 = self._decode_graphed(rid, emb, self._pages, seq_pos)
+            return codes, csum, layer0, seq_pos + 1
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = self._depth(rid, self._handle(self._pages, seq_pos, 1), emb)
+        return out["codec_tokens"][0], out["talker_input_embeds"][0], out["new_token"][0], seq_pos + 1
+
+    def tts_pad(self):
+        return self.talker._tts_pad_embed_cached.unsqueeze(0)
+
+    def tts_eos(self):
+        return self.talker._tts_eos_embed_cached.unsqueeze(0)
+
+    def code2wav_chunk(self, codec_frames, first_chunk: bool):
+        """codec_frames: (F, 16) codec tokens -> 24 kHz int16 PCM. Pads to the
+        constant full_seqlen (left-context + chunk) so the vocoder graph shape
+        is fixed, then trims the left-context samples off non-first chunks."""
+        torch = self._torch
+        sub = self.code2wav
+        full = sub.full_seqlen
+        up = sub.total_upsample
+        ctx = self.cfg.code2wav.codec_left_context_frames
+        F = codec_frames.shape[0]
+        codes = codec_frames[:, : self.cfg.code2wav.num_quantizers].to(self.device)
+        if F < full:  # pad up to the fixed vocoder length (repeat last frame)
+            codes = torch.cat([codes, codes[-1:].expand(full - F, -1)], dim=0)
+        codes_t = codes.t().contiguous()                       # (Q, full)
+        pos = torch.arange(full, device=self.device)
+        with torch.no_grad():
+            wav = sub.code2wav(codes_t.unsqueeze(0), pos.unsqueeze(0))  # (1,1,full*up)
+        wav = wav.reshape(-1)
+        trim = 0 if first_chunk else ctx * up
+        pcm = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return pcm[trim: F * up]
+
+    # -- conductor-driven execution ---------------------------------------
+
+    def _check_eos(self, rid: int, layer0) -> None:
+        if int(layer0.reshape(-1)[0].item()) == self.cfg.talker.codec_eos_token_id:
+            self._codec_eos_hit.add(rid)
+            self._pending_stops.append((rid, "talker_decode_loop"))
+
+    def execute(self, node_name, walk, inputs, kv=None):
+        torch = self._torch
+        out: dict[int, dict[str, list]] = {}
+        for rid, named in inputs.items():
+            srid = str(rid)
+            if node_name == "Talker":
+                view = kv[rid]
+                if walk == "talker_decode":
+                    # per-frame hot loop — the CUDA-graph path (mstar's
+                    # _forward_decode_like captured over static buffers).
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        states = named.get("thinker_states", [])
+                        if states and states[0].numel() > 0:
+                            text_h = self.talker.model.text_projection(states[0].to(self.device))
+                        elif srid not in self._eos_sent:  # Thinker EOS -> tts_eos once
+                            text_h = self.tts_eos()
+                            self._eos_sent.add(srid)
+                        else:
+                            text_h = self.tts_pad()
+                        emb = (named["talker_input_embeds"][0].to(self.device) + text_h).to(torch.bfloat16)
+                    if self.cuda_graph:
+                        codes, csum, layer0 = self._decode_graphed(
+                            srid, emb, view["pages"], view["seq_pos"])
+                    else:
+                        o = self._depth(srid, self._handle(view["pages"], view["seq_pos"], 1), emb)
+                        codes, csum, layer0 = (o["codec_tokens"][0], o["talker_input_embeds"][0],
+                                               o["new_token"][0])
+                    out[rid] = {"codec_tokens": [codes], "talker_input_embeds": [csum]}
+                    self._check_eos(rid, layer0)
+                    continue
+                # prefill walks (one-off, eager)
+                handle = self._handle(view["pages"], view["seq_pos"], view["append_len"])
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    if walk == "talker_prefill":
+                        states = named["thinker_states"][0].to(self.device)
+                        mask = named["thinker_mask"][0].to(self.device)
+                        self.talker._forward_prefill(handle, self.talker._get_talker_embeds(states, mask))
+                        out[rid] = {}  # KV-fill only, no outputs
+                        continue
+                    # talker_last_prefill
+                    self._register(srid)
+                    states = named["thinker_states"][0].to(self.device)
+                    codec6 = self.talker._get_last_prefill_codec_hidden(self.voice)
+                    text6 = self.talker._get_last_prefill_talker_hidden(states)
+                    o = self._depth(srid, handle, codec6 + text6)
+                out[rid] = {
+                    "codec_tokens": [o["codec_tokens"][0]],
+                    "talker_input_embeds": [o["talker_input_embeds"][0]],
+                }
+                self._check_eos(rid, o["new_token"][0])
+            elif node_name == "Code2Wav":
+                frames = named["codec_tokens"]           # window of (1,16) frames
+                codec = torch.cat([f.reshape(1, -1) for f in frames], dim=0)
+                first = rid not in self._first_chunk
+                self._first_chunk.add(rid)
+                out[rid] = {"audio_chunk": [self.code2wav_chunk(codec, first_chunk=first)]}
+            else:
+                raise ValueError(f"unknown node: {node_name}")
+        return out
+
+    def loops_to_finish(self):
+        stops = self._pending_stops
+        self._pending_stops = []
+        return stops

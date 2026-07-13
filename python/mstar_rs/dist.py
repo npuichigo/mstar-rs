@@ -136,6 +136,16 @@ class Worker:
     def _handle_execute(self, msg: dict) -> None:
         batch_id = msg["batch_id"]
         rids = [int(rid) for rid in msg["inputs"].keys()]
+        # TP: a partition sharded across N ranks runs the SAME execute on the
+        # SAME inputs in NCCL lockstep (the collectives inside the model forward
+        # synchronize them). Every rank reads inputs from the conductor's SHM
+        # arena (host SHM, readable by all processes) — no NCCL input-broadcast
+        # needed. The residual stream is replicated, so all ranks produce
+        # identical outputs; only rank 0 stages + replies (the replicas discard
+        # theirs). Freeing inputs on rank 0's `done` is safe: rank 0 can only
+        # finish execute after every replica passed the shared all-reduces,
+        # which come *after* the input read at execute's start.
+        tp_rank = msg.get("tp_rank", 0)
         try:
             # inputs: {rid: {name: [descriptor, ...]}}
             inputs = {
@@ -145,8 +155,15 @@ class Worker:
                 }
                 for rid, named in msg["inputs"].items()
             }
-            kv = msg.get("kv")  # reserved for KV models; None for stateless
+            # KV models: {rid: {label, pages, seq_pos, append_len, ...}}. Keys
+            # come back from msgpack as ints; normalize so kv[rid] matches the
+            # int rids the engine iterates. None for stateless models.
+            kv = msg.get("kv")
+            if kv is not None:
+                kv = {int(rid): view for rid, view in kv.items()}
             outputs = self.engine.execute(msg["node"], msg["walk"], inputs, kv=kv)
+            if tp_rank != 0:
+                return  # replica: outputs are replicated on rank 0; stay silent
             # check_stop: report loops the model wants terminated this pass
             # (the conductor replays them before complete_batch).
             stops = self.engine.loops_to_finish()
@@ -196,7 +213,13 @@ class Conductor:
         max_batch_size: int = 8,
     ) -> None:
         self.policy = policy
-        self.node_to_worker = node_to_worker
+        # A node maps to a LIST of worker ids — its TP ranks, rank 0 first. A
+        # bare string is a single-GPU node (a 1-element group), kept for
+        # back-compat with non-TP callers.
+        self.node_to_workers = {
+            n: ([w] if isinstance(w, str) else list(w))
+            for n, w in node_to_worker.items()
+        }
         self.max_batch_size = max_batch_size
         self.runtime = Runtime(_spec_json(policy))
         if (kv := policy.kv_config()) is not None:
@@ -303,7 +326,7 @@ class Conductor:
         return self.results
 
     def _dispatch(self, batch) -> None:
-        worker = self.node_to_worker[batch.node]
+        workers = self.node_to_workers[batch.node]
         # inputs: {rid: {name: [descriptor]}} resolved from uuids.
         inputs = {
             rid: {
@@ -312,13 +335,21 @@ class Conductor:
             }
             for rid, named in batch.inputs.items()
         }
-        self.mbox.send(
-            worker,
-            msgpack.packb(
-                {"t": "execute", "batch_id": batch.batch_id, "node": batch.node,
-                 "walk": batch.walk, "inputs": inputs}
-            ),
-        )
+        # Send the same execute to every TP rank (rank 0 first). All ranks read
+        # inputs from our SHM arena and run in NCCL lockstep; only rank 0 (the
+        # leader) replies with outputs, so `_inflight` counts one per batch.
+        # `batch.kv` carries the runtime's per-request KV view (label, pages,
+        # seq_pos, append_len, scratch_len) for KV models — plain ints/lists, so
+        # it rides the msgpack control wire (never tensor bytes).
+        for tp_rank, worker in enumerate(workers):
+            self.mbox.send(
+                worker,
+                msgpack.packb(
+                    {"t": "execute", "batch_id": batch.batch_id, "node": batch.node,
+                     "walk": batch.walk, "inputs": inputs, "kv": batch.kv,
+                     "tp_rank": tp_rank}
+                ),
+            )
 
     def _process_done(self, msg: dict) -> None:
         """Route a worker's `done` message: mint output uuids, record their
@@ -461,7 +492,7 @@ class Conductor:
         self._stop.set()
 
     def shutdown_workers(self) -> None:
-        for worker in set(self.node_to_worker.values()):
+        for worker in {w for ws in self.node_to_workers.values() for w in ws}:
             self.mbox.send(worker, msgpack.packb({"t": "shutdown"}))
 
 
