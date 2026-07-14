@@ -60,6 +60,36 @@ fn named_tensors_from_py(obj: &Bound<'_, PyAny>) -> PyResult<BTreeMap<String, Ve
     Ok(out)
 }
 
+/// Marshal a runtime Batch into the Python-facing PyBatch (shared by
+/// `next_batch` and the TP-follow `next_batch_for`).
+fn batch_to_py(py: Python<'_>, batch: mstar_runtime::Batch) -> PyResult<PyBatch> {
+    let inputs = PyDict::new(py);
+    for (rid, named) in &batch.inputs {
+        let per_req = PyDict::new(py);
+        for (name, tensors) in named {
+            per_req.set_item(name, tensors_to_py(py, tensors)?)?;
+        }
+        inputs.set_item(rid, per_req)?;
+    }
+    let kv = PyDict::new(py);
+    for (rid, view) in &batch.kv {
+        let v = PyDict::new(py);
+        v.set_item("label", &view.label)?;
+        v.set_item("pages", view.pages.clone())?;
+        v.set_item("seq_pos", view.seq_pos)?;
+        v.set_item("append_len", view.append_len)?;
+        v.set_item("scratch_len", view.scratch_len)?;
+        kv.set_item(rid, v)?;
+    }
+    Ok(PyBatch {
+        batch_id: batch.batch_id,
+        node: batch.node,
+        walk: batch.walk,
+        inputs: inputs.unbind().into(),
+        kv: kv.unbind().into(),
+    })
+}
+
 #[pyclass(name = "Batch")]
 struct PyBatch {
     #[pyo3(get)]
@@ -134,6 +164,13 @@ impl PyRuntime {
     /// worker); unset = own all (single-process / centralized).
     fn set_local_partitions(&mut self, names: Vec<String>) {
         self.inner.set_local_partitions(names);
+    }
+
+    /// TP follower rank: never self-initiate batches for `nodes` — schedule
+    /// them only via `next_batch_for` (replaying the leader's decision), so
+    /// all TP ranks run identical batch shapes in identical order.
+    fn set_tp_follower_nodes(&mut self, nodes: Vec<String>) {
+        self.inner.set_tp_follower_nodes(nodes);
     }
 
     /// Consumer side: inject a stream chunk shipped from another worker (which
@@ -226,31 +263,28 @@ impl PyRuntime {
         let Some(batch) = self.inner.next_batch(max_batch_size).map_err(to_py_err)? else {
             return Ok(None);
         };
-        let inputs = PyDict::new(py);
-        for (rid, named) in &batch.inputs {
-            let per_req = PyDict::new(py);
-            for (name, tensors) in named {
-                per_req.set_item(name, tensors_to_py(py, tensors)?)?;
-            }
-            inputs.set_item(rid, per_req)?;
-        }
-        let kv = PyDict::new(py);
-        for (rid, view) in &batch.kv {
-            let v = PyDict::new(py);
-            v.set_item("label", &view.label)?;
-            v.set_item("pages", view.pages.clone())?;
-            v.set_item("seq_pos", view.seq_pos)?;
-            v.set_item("append_len", view.append_len)?;
-            v.set_item("scratch_len", view.scratch_len)?;
-            kv.set_item(rid, v)?;
-        }
-        Ok(Some(PyBatch {
-            batch_id: batch.batch_id,
-            node: batch.node,
-            walk: batch.walk,
-            inputs: inputs.unbind().into(),
-            kv: kv.unbind().into(),
-        }))
+        batch_to_py(py, batch).map(Some)
+    }
+
+    /// TP follow path: schedule EXACTLY the leader's batch — `request_ids` in
+    /// the leader's order for (node, walk). Returns None until every listed
+    /// request is ready here (this rank's ingest may lag); errors if the KV
+    /// allocator states diverged.
+    fn next_batch_for(
+        &mut self,
+        py: Python<'_>,
+        node: &str,
+        walk: &str,
+        request_ids: Vec<u64>,
+    ) -> PyResult<Option<PyBatch>> {
+        let Some(batch) = self
+            .inner
+            .next_batch_for(node, walk, &request_ids)
+            .map_err(to_py_err)?
+        else {
+            return Ok(None);
+        };
+        batch_to_py(py, batch).map(Some)
     }
 
     /// outputs: {request_id: {name: [(uuid, dims, dtype), ...]}}.

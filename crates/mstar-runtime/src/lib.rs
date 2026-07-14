@@ -232,6 +232,11 @@ pub struct Runtime {
     /// partitions become `Event::StreamOut` (shipped to the owning worker),
     /// and incoming chunks arrive via `inject_stream_chunk`.
     local_partitions: Option<BTreeSet<String>>,
+    /// Nodes this runtime must NOT self-initiate batches for — it is a
+    /// tensor-parallel FOLLOWER rank for them and only schedules them via
+    /// `next_batch_for` (replaying the leader's batch decision). Mirrors
+    /// mstar's `tp_rank_zero_nodes` ("only rank 0 can initiate scheduling!").
+    tp_follower_nodes: BTreeSet<String>,
     requests: BTreeMap<u64, RequestState>,
     scheduler: MicroScheduler,
     inflight: BTreeMap<u64, InflightBatch>,
@@ -323,6 +328,7 @@ impl Runtime {
             partition_names,
             connections,
             local_partitions: None,
+            tp_follower_nodes: BTreeSet::new(),
             requests: BTreeMap::new(),
             scheduler: MicroScheduler::new(),
             inflight: BTreeMap::new(),
@@ -363,6 +369,15 @@ impl Runtime {
         self.local_partitions
             .as_ref()
             .is_none_or(|s| s.contains(partition))
+    }
+
+    /// Mark `nodes` as tensor-parallel FOLLOWED here: this runtime never
+    /// initiates batches for them (`next_batch` skips them); they are
+    /// scheduled only through `next_batch_for`, replaying the leader rank's
+    /// batch decision so all TP ranks run identical batch shapes in identical
+    /// order (mstar's `tp_rank_zero_nodes` / `ScheduleTPNode` follow path).
+    pub fn set_tp_follower_nodes(&mut self, nodes: Vec<String>) {
+        self.tp_follower_nodes = nodes.into_iter().collect();
     }
 
     /// Consumer side of a cross-worker connection: inject a stream chunk shipped
@@ -573,6 +588,9 @@ impl Runtime {
                 }
                 let Some(walk) = &pstate.walk else { continue };
                 for node in walk.ready_nodes() {
+                    if self.tp_follower_nodes.contains(&node) {
+                        continue; // TP follower: only the leader initiates this node
+                    }
                     if let Some(kv) = &self.kv {
                         if let Some(label) = kv.label_for_node(&node) {
                             let append = pstate.kv_appends.get(label).copied().unwrap_or(0);
@@ -704,6 +722,116 @@ impl Runtime {
             batch_id,
             node: plan.node,
             walk: plan.walk,
+            inputs,
+            kv: kv_views,
+        }))
+    }
+
+    /// Schedule EXACTLY the leader rank's batch — the TP follow path (mstar's
+    /// `_try_schedule_tp_follow`). All-or-nothing: returns `Ok(None)` until
+    /// every listed request has `(node, walk)` ready here (this rank's ingest
+    /// may lag the leader's), then builds the batch over `request_ids` in the
+    /// GIVEN order, so the follower's tensor layout and collective shapes
+    /// match the leader's exactly. A KV reservation failure after the
+    /// all-ready check is a hard error: the ranks' allocator states have
+    /// diverged and the collectives would deadlock — fail loudly instead.
+    pub fn next_batch_for(
+        &mut self,
+        node: &str,
+        walk: &str,
+        request_ids: &[u64],
+    ) -> Result<Option<Batch>> {
+        self.pump_streams();
+        if request_ids.is_empty() {
+            return Ok(None);
+        }
+        let partition = self
+            .walk_partition
+            .get(walk)
+            .ok_or_else(|| {
+                RuntimeError::InvalidSpec(format!("TP follow: unknown walk '{walk}'"))
+            })?
+            .clone();
+
+        // All-or-nothing readiness scan (no mutation).
+        for &rid in request_ids {
+            let Some(req) = self.requests.get(&rid) else {
+                return Ok(None); // seed not ingested here yet
+            };
+            if req.finished {
+                return Ok(None);
+            }
+            let Some(pstate) = req.partitions.get(&partition) else {
+                return Ok(None);
+            };
+            let Some(w) = &pstate.walk else {
+                return Ok(None);
+            };
+            if w.walk_name() != walk || !w.ready_nodes().contains(&node.to_string()) {
+                return Ok(None);
+            }
+            if let Some(kv) = &self.kv {
+                if let Some(label) = kv.label_for_node(node) {
+                    let append = pstate.kv_appends.get(label).copied().unwrap_or(0);
+                    let scratch = pstate.kv_scratch.get(label).copied().unwrap_or(0);
+                    if !kv.can_reserve(rid, label, append, scratch) {
+                        return Ok(None); // pages not free yet; retry later
+                    }
+                }
+            }
+        }
+
+        // Build the batch in the leader's request order.
+        let kv_label = self
+            .kv
+            .as_ref()
+            .and_then(|kv| kv.label_for_node(node))
+            .map(str::to_string);
+        let mut inputs = BTreeMap::new();
+        let mut kv_views = BTreeMap::new();
+        let mut kv_advances = Vec::new();
+        for &rid in request_ids {
+            let req = self.requests.get_mut(&rid).expect("checked above");
+            let pstate = req.partitions.get_mut(&partition).expect("checked above");
+            if let Some(label) = &kv_label {
+                let append = pstate.kv_appends.get(label).copied().unwrap_or(0);
+                let scratch = pstate.kv_scratch.get(label).copied().unwrap_or(0);
+                let view = self
+                    .kv
+                    .as_mut()
+                    .expect("kv_label implies kv")
+                    .reserve(rid, label, append, scratch)
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidSpec(format!(
+                            "TP follow: KV reservation failed for request {rid} on \
+                             node '{node}' after the all-ready check — follower \
+                             allocator state diverged from the leader's"
+                        ))
+                    })?;
+                kv_views.insert(rid, view);
+                kv_advances.push((rid, label.clone(), append));
+            }
+            let req = self.requests.get_mut(&rid).expect("checked above");
+            let pstate = req.partitions.get_mut(&partition).expect("checked above");
+            let w = pstate.walk.as_mut().expect("checked above");
+            inputs.insert(rid, w.take_node_inputs(node)?);
+        }
+
+        self.next_batch_id += 1;
+        let batch_id = self.next_batch_id;
+        self.inflight.insert(
+            batch_id,
+            InflightBatch {
+                node: node.to_string(),
+                partition,
+                request_ids: request_ids.to_vec(),
+                kv_advances,
+            },
+        );
+        Ok(Some(Batch {
+            batch_id,
+            node: node.to_string(),
+            walk: walk.to_string(),
             inputs,
             kv: kv_views,
         }))
@@ -1564,5 +1692,116 @@ mod tests {
             rt.complete_batch(42, BTreeMap::new()),
             Err(RuntimeError::UnknownBatch(42))
         ));
+    }
+
+    /// Seed one request into `rt` and return its rid (VJEPA2_WALKS shape).
+    fn seed_one(rt: &mut Runtime) -> u64 {
+        let rid = rt.add_request();
+        let frames = tref(rt);
+        rt.start_walk(
+            rid,
+            "prefill_video",
+            vec![IncomingInput {
+                node: "video_encoder".into(),
+                name: "video_frames".into(),
+                tensors: vec![frames],
+            }],
+        )
+        .unwrap();
+        rid
+    }
+
+    #[test]
+    fn tp_follower_replays_leader_batches_exactly() {
+        // Leader + follower runtimes with identical requests. The leader's
+        // scheduler is free-running; the follower must (a) never self-initiate
+        // the TP node and (b) replay the leader's batch decisions exactly —
+        // even when its own scheduler would have grouped differently. This is
+        // the divergence that deadlocks NCCL under concurrency: leader batches
+        // {A} alone (B not ingested yet), follower has {A, B} both ready.
+        let mut leader = Runtime::from_walks_json(VJEPA2_WALKS).unwrap();
+        let mut follower = Runtime::from_walks_json(VJEPA2_WALKS).unwrap();
+        follower
+            .set_tp_follower_nodes(vec!["video_encoder".into(), "predictor".into()]);
+
+        // Leader sees only A at its first tick; follower already has A and B.
+        let la = seed_one(&mut leader);
+        let fa = seed_one(&mut follower);
+        let fb = seed_one(&mut follower);
+
+        // (a) follower never initiates, no matter how much is ready.
+        assert!(follower.next_batch(8).unwrap().is_none());
+
+        // Leader initiates: batch {A} alone.
+        let lb1 = leader.next_batch(8).unwrap().unwrap();
+        assert_eq!(lb1.inputs.keys().copied().collect::<Vec<_>>(), vec![la]);
+
+        // (b) follower replays exactly {A} — NOT its locally-ready {A, B}.
+        let fb1 = follower
+            .next_batch_for(&lb1.node, &lb1.walk, &[fa])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb1.node, lb1.node);
+        assert_eq!(fb1.inputs.keys().copied().collect::<Vec<_>>(), vec![fa]);
+
+        // Leader ingests B late and batches it alone next tick.
+        let lb = seed_one(&mut leader);
+        let lb2 = leader.next_batch(8).unwrap().unwrap();
+        assert_eq!(lb2.inputs.keys().copied().collect::<Vec<_>>(), vec![lb]);
+        let fb2 = follower
+            .next_batch_for(&lb2.node, &lb2.walk, &[fb])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fb2.inputs.keys().copied().collect::<Vec<_>>(), vec![fb]);
+
+        // A follow for a request whose seed hasn't arrived yet: not ready.
+        assert!(follower
+            .next_batch_for("video_encoder", "prefill_video", &[999])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn tp_follow_not_ready_until_inputs_arrive() {
+        // The tp_sched message can overtake the seed (different senders): the
+        // follow must return None until this rank's ingest catches up, then
+        // succeed — mstar's `_try_schedule_tp_follow` wait semantics.
+        let mut follower = Runtime::from_walks_json(VJEPA2_WALKS).unwrap();
+        follower.set_tp_follower_nodes(vec!["video_encoder".into()]);
+        let rid = follower.add_request();
+        // Request exists but its walk hasn't been seeded: not ready.
+        assert!(follower
+            .next_batch_for("video_encoder", "prefill_video", &[rid])
+            .unwrap()
+            .is_none());
+        let frames = tref(&mut follower);
+        follower
+            .start_walk(
+                rid,
+                "prefill_video",
+                vec![IncomingInput {
+                    node: "video_encoder".into(),
+                    name: "video_frames".into(),
+                    tensors: vec![frames],
+                }],
+            )
+            .unwrap();
+        let b = follower
+            .next_batch_for("video_encoder", "prefill_video", &[rid])
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.inputs.keys().copied().collect::<Vec<_>>(), vec![rid]);
+        // Completing the follow batch routes outputs exactly like next_batch's.
+        let hidden = tref(&mut follower);
+        let events = follower
+            .complete_batch(
+                b.batch_id,
+                BTreeMap::from([(
+                    rid,
+                    BTreeMap::from([("encoder_hidden".to_string(), vec![hidden])]),
+                )]),
+            )
+            .unwrap();
+        assert!(!events.is_empty() || !follower.idle());
     }
 }
