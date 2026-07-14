@@ -736,7 +736,8 @@ class DisaggWorker:
                  coordinator_id: str = "coordinator",
                  tp_nodes: list | None = None,
                  tp_followers: list | None = None,
-                 tp_follow_nodes: list | None = None) -> None:
+                 tp_follow_nodes: list | None = None,
+                 async_pipeline: bool = False) -> None:
         self.worker_id = worker_id
         # Tensor-parallel batch coordination (mstar's ScheduleTPNode):
         #   leader rank:   tp_nodes = the TP nodes it initiates; tp_followers =
@@ -754,6 +755,22 @@ class DisaggWorker:
         # follower: leader decisions whose gids aren't all mapped locally yet
         # (the tp_sched can overtake the seed — different senders).
         self._tp_pending: list[tuple] = []
+        # async pipeline (mstar's worker run loop): execute on a dedicated
+        # thread; host work (messages, streams, outbox, routing) overlaps the
+        # in-flight batch, and an eventfd wakes the loop the moment the
+        # execute future completes (no poll-timeout latency).
+        if async_pipeline and tp_follow_nodes:
+            raise ValueError(
+                "async_pipeline on a TP follower is not supported yet: the "
+                "follow-replay path drives the engine from the message loop")
+        self.async_pipeline = async_pipeline
+        self.spec_hits = 0   # claimed speculations (pipeline instrumentation)
+        # Fairness (mstar's max-consecutive-spec): break the claim chain
+        # every N claims with a full scheduler scan, so newly-arrived
+        # requests co-batch into the loop instead of starving behind an
+        # unbroken speculation chain.
+        self.spec_cap = 8
+        self._spec_streak = 0
         self.mbox = ZmqCommunicator(worker_id, socket_dir)
         self.shm = ShmPool(worker_id)
         self.partition_to_worker = partition_to_worker
@@ -798,6 +815,8 @@ class DisaggWorker:
             raise
 
     def _run(self) -> None:
+        if self.async_pipeline:
+            return self._run_async()
         while not self._stop:
             raw = self.mbox.recv_timeout(50)   # block when idle (no busy spin)
             # Drain a BOUNDED number of queued messages, then always poll — an
@@ -816,6 +835,106 @@ class DisaggWorker:
             if did:
                 _dbg(self.worker_id, "poll ran a batch")
             self._ship_outbox()
+
+    def _run_async(self) -> None:
+        """mstar's async worker pipeline, on this runtime: one batch in flight
+        on a dedicated execute thread; the host thread overlaps it with
+        message handling, stream shipping, and the PREVIOUS batch's routing.
+        While batch N runs, its follow-up is SPECULATED (same loop body); the
+        moment N completes, the speculation is claimed and N+1 submitted
+        before any post-processing — mstar's submit-asap ordering. An eventfd
+        registered with the mailbox (the Step-1 wakeup path) wakes the loop
+        the instant the future finishes, instead of on the poll timeout.
+
+        Thread discipline: the runtime, the tensor store, and all routing stay
+        on THIS thread; the execute thread runs only `model.execute` (torch
+        releases the GIL during CUDA waits, which is where the overlap comes
+        from on GPU)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"mstar-exec-{self.worker_id}")
+        efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self.mbox.register_wakeup_fd(efd)
+        pending = None   # (batch, future)
+        ticket = None    # speculation for the pending batch
+
+        def submit(prepared) -> None:
+            nonlocal pending, ticket
+            batch, inputs = prepared
+            future = executor.submit(
+                self.engine_execute, batch.node, batch.walk, inputs, batch.kv)
+            future.add_done_callback(lambda _f: os.eventfd_write(efd, 1))
+            pending = (batch, future)
+            ticket = self.driver.speculate(batch)
+
+        try:
+            while not self._stop:
+                # Host preamble — overlaps the in-flight batch: drain a
+                # bounded number of messages (or block briefly when idle).
+                kind, raw = self.mbox.recv_or_wake(50 if pending is None else 0)
+                if kind == "wake":
+                    try:
+                        os.eventfd_read(efd)
+                    except BlockingIOError:
+                        pass
+                n = 0
+                while raw is not None and n < 16:
+                    self._handle(raw)
+                    if self._stop:
+                        return
+                    n += 1
+                    raw = self.mbox.try_recv()
+                self._drain_tp_pending()
+
+                if pending is None:
+                    prepared = self.driver.begin_batch()
+                    if prepared is not None:
+                        submit(prepared)
+                    continue
+
+                batch, future = pending
+                if not future.done():
+                    # Block until the future's eventfd or a message wakes us.
+                    kind, raw = self.mbox.recv_or_wake(50)
+                    if kind == "wake":
+                        try:
+                            os.eventfd_read(efd)
+                        except BlockingIOError:
+                            pass
+                    elif kind == "msg" and raw is not None:
+                        self._handle(raw)
+                        if self._stop:
+                            return
+                        self._drain_tp_pending()
+                    continue
+
+                outputs = future.result()  # raises -> the crash handler above
+                pending = None
+                self.driver.finish_batch(batch, outputs)
+                # Submit the follow-up ASAP (claimed speculation skips the
+                # scheduler scan; fall back to a normal schedule), THEN do
+                # post-processing — outbox shipping overlaps GPU(N+1).
+                prepared = None
+                if ticket is not None and self._spec_streak < self.spec_cap:
+                    prepared = self.driver.claim_speculative(ticket)
+                ticket = None
+                if prepared is not None:
+                    self.spec_hits += 1
+                    self._spec_streak += 1
+                else:
+                    prepared = self.driver.begin_batch()
+                    self._spec_streak = 0
+                if prepared is not None:
+                    submit(prepared)
+                self._ship_outbox()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            os.close(efd)
+
+    def engine_execute(self, node, walk, inputs, kv):
+        """Runs on the execute thread — model compute only, no runtime access."""
+        return self.driver.model.execute(node, walk, inputs, kv=kv)
 
     def _broadcast_batch(self, node: str, walk: str, rids: list) -> None:
         """TP leader: ship this batch decision to follower ranks BEFORE

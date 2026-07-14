@@ -266,6 +266,15 @@ impl PyRuntime {
         batch_to_py(py, batch).map(Some)
     }
 
+    /// Predict the follow-up batch for an in-flight batch (mstar's
+    /// speculation): (node, walk, request_ids) when the same loop body will
+    /// run again for these requests, else None. Pure prediction — claim it
+    /// with `next_batch_for` after `complete_batch`; a failed claim IS the
+    /// cancellation path.
+    fn speculate_next(&self, batch_id: u64) -> Option<(String, String, Vec<u64>)> {
+        self.inner.speculate_next(batch_id)
+    }
+
     /// TP follow path: schedule EXACTLY the leader's batch — `request_ids` in
     /// the leader's order for (node, walk). Returns None until every listed
     /// request is ready here (this rank's ingest may lag); errors if the KV

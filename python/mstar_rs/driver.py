@@ -160,25 +160,42 @@ class Driver:
             # locally-owned non-TP work keeps flowing.
         return self.runtime.next_batch(self.max_batch_size)
 
-    def poll(self, timeout_ms: int = 0) -> bool:
-        """Run the next ready batch IN-PROCESS (no IPC) and route its outputs.
-        Returns True if a batch ran. One batch per call so a serving loop can
-        ingest new requests between steps (continuous batching emerges from the
-        runtime grouping every ready request's same-(node,walk) work into one
-        batch). `timeout_ms` is accepted for Conductor-API parity and ignored —
-        in-process there is nothing to block on."""
-        batch = self._next_batch()
-        if batch is None:
-            return False
+    def _prepare(self, batch):
+        """Fire the TP-leader hook and resolve input tensors for a scheduled
+        batch (mstar ships ScheduleTPNode before GPU submission)."""
         if self.on_batch is not None:
-            # TP leader: ship the batch decision to follower ranks BEFORE
-            # executing (mstar sends ScheduleTPNode before GPU submission).
             self.on_batch(batch.node, batch.walk, list(batch.inputs.keys()))
         inputs = {
             rid: {name: self.store.get_all(refs) for name, refs in named.items()}
             for rid, named in batch.inputs.items()
         }
-        outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+        return batch, inputs
+
+    def begin_batch(self):
+        """Schedule the next batch and hand back `(batch, inputs)` for the
+        caller to execute — the async half of `poll` (the caller may run
+        `model.execute` on a dedicated thread and overlap host work with it).
+        Must be paired with `finish_batch`. None when nothing is ready."""
+        batch = self._next_batch()
+        return None if batch is None else self._prepare(batch)
+
+    def speculate(self, batch):
+        """While `batch` executes: predict its follow-up (same loop body,
+        same requests) — or None. Claim with `claim_speculative` AFTER
+        `finish_batch`; a failed claim is the cancellation (stop signal,
+        terminated loop)."""
+        return self.runtime.speculate_next(batch.batch_id)
+
+    def claim_speculative(self, ticket):
+        """Materialize a speculation ticket into a ready `(batch, inputs)`,
+        skipping the scheduler scan — or None (speculation cancelled)."""
+        node, walk, rids = ticket
+        batch = self.runtime.next_batch_for(node, walk, rids)
+        return None if batch is None else self._prepare(batch)
+
+    def finish_batch(self, batch, outputs) -> None:
+        """Route a finished batch's outputs (the completion half of `poll`).
+        Runs on the runtime's thread — never on the execute thread."""
         # check_stop -> STOP_LOOPS: must land before complete_batch so the
         # loop terminates on this iteration rather than advancing.
         for rid, loop_name in self.model.loops_to_finish():
@@ -190,6 +207,20 @@ class Driver:
         }
         for event in self.runtime.complete_batch(batch.batch_id, out_refs):
             self._handle_event(event)
+
+    def poll(self, timeout_ms: int = 0) -> bool:
+        """Run the next ready batch IN-PROCESS (no IPC) and route its outputs.
+        Returns True if a batch ran. One batch per call so a serving loop can
+        ingest new requests between steps (continuous batching emerges from the
+        runtime grouping every ready request's same-(node,walk) work into one
+        batch). `timeout_ms` is accepted for Conductor-API parity and ignored —
+        in-process there is nothing to block on."""
+        prepared = self.begin_batch()
+        if prepared is None:
+            return False
+        batch, inputs = prepared
+        outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+        self.finish_batch(batch, outputs)
         return True
 
     def run_until_idle(self) -> dict[int, list[Any]]:

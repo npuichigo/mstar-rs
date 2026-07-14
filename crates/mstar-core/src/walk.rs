@@ -201,6 +201,28 @@ impl WalkState {
         self.ingest(&node, input_name, tensors);
     }
 
+    /// Whether `node` is a loop body that will run again after the current
+    /// iteration — the speculation predicate (mstar's `_can_speculate`):
+    /// the node's innermost loop is live, has iterations left, and no finish
+    /// signal is pending. Conservative: any ancestor loop being on its final
+    /// iteration doesn't matter (the INNER loop advancing is what re-runs the
+    /// node), but a pending finish signal anywhere in the chain vetoes.
+    pub fn node_continues_in_loop(&self, node: &str) -> bool {
+        let Some(&idx) = self.graph.node_loop.get(node) else {
+            return false; // not in a loop: runs once
+        };
+        let mut i = Some(idx);
+        while let Some(li) = i {
+            let lst = &self.loops[li];
+            if lst.terminated || lst.finish_signal {
+                return false;
+            }
+            i = self.graph.loops[li].parent;
+        }
+        let lst = &self.loops[idx];
+        lst.curr_iter + 1 < self.graph.loops[idx].max_iters
+    }
+
     /// Record a finish signal for a loop (mstar's `check_stop -> STOP_LOOPS`).
     /// Takes effect when the current iteration completes.
     pub fn signal_loop_finish(&mut self, loop_name: &str) -> Result<()> {

@@ -837,6 +837,50 @@ impl Runtime {
         }))
     }
 
+    /// Predict the follow-up batch for an IN-FLIGHT batch — mstar's
+    /// `_try_speculate_next`: while the data plane executes batch N, the
+    /// driver asks whether the same `(node, walk)` will run again for the
+    /// same requests (an AR loop-body continuing), so N+1 can be claimed and
+    /// launched the moment N completes, with no scheduler scan in between.
+    ///
+    /// Pure prediction — no state is mutated and nothing is reserved. The
+    /// claim is `next_batch_for(node, walk, rids)` after `complete_batch(N)`:
+    /// its all-or-nothing readiness check IS the cancellation path (a stop
+    /// signal fired during N, a terminated loop, or missing loop-back inputs
+    /// simply make the claim return None and the driver falls back to the
+    /// scheduler).
+    ///
+    /// Returns `(node, walk, request_ids)` — rids in batch order — or None
+    /// when the batch's node is not a loop body or every request's loop is on
+    /// its final iteration.
+    pub fn speculate_next(&self, batch_id: u64) -> Option<(String, String, Vec<u64>)> {
+        let inflight = self.inflight.get(&batch_id)?;
+        let walk_name = {
+            // All rids in a batch share (node, walk); read the walk name from
+            // the first live request's partition state.
+            let rid = *inflight.request_ids.first()?;
+            let req = self.requests.get(&rid)?;
+            let pstate = req.partitions.get(&inflight.partition)?;
+            pstate.walk.as_ref()?.walk_name().to_string()
+        };
+        let mut rids = Vec::with_capacity(inflight.request_ids.len());
+        for &rid in &inflight.request_ids {
+            let req = self.requests.get(&rid)?;
+            if req.finished {
+                return None;
+            }
+            let pstate = req.partitions.get(&inflight.partition)?;
+            let w = pstate.walk.as_ref()?;
+            if w.walk_name() != walk_name
+                || !w.node_continues_in_loop(&inflight.node)
+            {
+                return None; // not a loop body, or on its final iteration
+            }
+            rids.push(rid);
+        }
+        Some((inflight.node.clone(), walk_name, rids))
+    }
+
     /// The data plane finished a batch: route each request's named outputs,
     /// collect emissions, and report walk completions.
     pub fn complete_batch(
@@ -1759,6 +1803,58 @@ mod tests {
             .next_batch_for("video_encoder", "prefill_video", &[999])
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn speculate_predicts_loop_continuation_and_claim_builds_it() {
+        // AR-loop shape: node "step" self-feeds "state" for 3 iterations.
+        const LOOP_WALK: &str = r#"{
+            "gen": {"kind": "loop", "name": "gen_loop", "max_iters": 3,
+                "body": {"kind": "node", "name": "step", "input_names": ["state"],
+                         "outputs": [{"next_node": "step", "name": "state"}]},
+                "outputs": []}
+        }"#;
+        let mut rt = Runtime::from_walks_json(LOOP_WALK).unwrap();
+        let rid = rt.add_request();
+        let state = tref(&mut rt);
+        rt.start_walk(
+            rid,
+            "gen",
+            vec![IncomingInput {
+                node: "step".into(),
+                name: "state".into(),
+                tensors: vec![state],
+            }],
+        )
+        .unwrap();
+
+        // Iter 1 in flight: speculation predicts the same (node, walk, rids).
+        let b1 = rt.next_batch(8).unwrap().unwrap();
+        let ticket = rt.speculate_next(b1.batch_id).expect("loop continues");
+        assert_eq!(ticket, ("step".to_string(), "gen".to_string(), vec![rid]));
+
+        // Claim BEFORE completion: loop-back inputs absent -> not ready.
+        assert!(rt
+            .next_batch_for(&ticket.0, &ticket.1, &ticket.2)
+            .unwrap()
+            .is_none());
+
+        // Complete N; the claim now builds N+1 with the loop-back input.
+        let out = tref(&mut rt);
+        rt.complete_batch(
+            b1.batch_id,
+            BTreeMap::from([(rid, BTreeMap::from([("state".to_string(), vec![out])]))]),
+        )
+        .unwrap();
+        let b2 = rt
+            .next_batch_for(&ticket.0, &ticket.1, &ticket.2)
+            .unwrap()
+            .expect("claim succeeds after completion");
+        assert_eq!(b2.node, "step");
+
+        // Iter 2 in flight; a stop signal vetoes further speculation.
+        rt.signal_loop_finish(rid, "gen_loop").unwrap();
+        assert!(rt.speculate_next(b2.batch_id).is_none());
     }
 
     #[test]
