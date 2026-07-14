@@ -67,6 +67,11 @@ struct LoopState {
     /// External inputs into loop members, re-injected on every advance
     /// (mstar's `_ingested_external_inputs`).
     external_inputs: Vec<(String, String, Vec<TensorRef>)>,
+    /// Child loops that terminated within THIS iteration of this loop. An
+    /// inner loop is an entity of its parent's iteration (mstar's nested
+    /// loops): the parent's iteration completes only when its member nodes
+    /// completed AND every child loop terminated.
+    children_done: BTreeSet<usize>,
 }
 
 /// Per-request state machine over one compiled walk graph. Ports the runtime
@@ -228,8 +233,11 @@ impl WalkState {
         let mut result = CompletionResult::default();
         let loop_idx = self.graph.node_loop.get(node).copied();
 
-        // Capture loop output values produced by this node.
-        if let Some(idx) = loop_idx {
+        // Capture loop output values produced by this node — along the whole
+        // ancestor chain, since an inner node's output may be an OUTER loop's
+        // declared output (mstar's nested loops).
+        let mut ancestor = loop_idx;
+        while let Some(idx) = ancestor {
             let loop_spec = &self.graph.loops[idx];
             let capture: Vec<(String, bool)> = loop_spec
                 .outputs
@@ -254,6 +262,7 @@ impl WalkState {
                     lst.last_values.insert(name, tensors.clone());
                 }
             }
+            ancestor = self.graph.loops[idx].parent;
         }
 
         // Route the node's own edges.
@@ -264,13 +273,7 @@ impl WalkState {
 
         // Loop iteration bookkeeping.
         if let Some(idx) = loop_idx {
-            let all_members_done = self.graph.loops[idx]
-                .members
-                .iter()
-                .all(|m| self.nodes[m].completed);
-            if all_members_done {
-                self.complete_loop_iter(idx, &mut result.events);
-            }
+            self.try_complete_loop(idx, &mut result.events);
         } else {
             // A completed non-loop node will never re-read its inputs (a
             // re-arrival routes into `next_iter`, not `current`). Drop them so
@@ -308,6 +311,37 @@ impl WalkState {
         }
     }
 
+    /// This loop and every loop nested under it (depth-first).
+    fn subtree_loops(&self, idx: usize) -> Vec<usize> {
+        let mut out = vec![idx];
+        let mut stack = self.graph.loops[idx].children.clone();
+        while let Some(i) = stack.pop() {
+            out.push(i);
+            stack.extend(self.graph.loops[i].children.iter().copied());
+        }
+        out
+    }
+
+    /// Complete this loop's iteration if all its entities are done: every
+    /// direct member node completed AND every child loop terminated this
+    /// iteration (an inner loop is an entity of its parent's iteration).
+    fn try_complete_loop(&mut self, idx: usize, events: &mut Vec<RouteEvent>) {
+        if self.loops[idx].terminated {
+            return;
+        }
+        let members_done = self.graph.loops[idx]
+            .members
+            .iter()
+            .all(|m| self.nodes[m].completed);
+        let children_done = self.graph.loops[idx]
+            .children
+            .iter()
+            .all(|c| self.loops[idx].children_done.contains(c));
+        if members_done && children_done {
+            self.complete_loop_iter(idx, events);
+        }
+    }
+
     /// mstar `Loop.complete_iter`: terminate on max_iters/finish signal,
     /// otherwise advance one iteration.
     fn complete_loop_iter(&mut self, idx: usize, events: &mut Vec<RouteEvent>) {
@@ -333,20 +367,61 @@ impl WalkState {
                 let tensors = accumulated.get(&edge.name).cloned().unwrap_or_default();
                 Self::route_edge(&mut self.nodes, events, edge, tensors);
             }
-        } else {
-            // Advance: reset members, promote next-iter inputs, re-inject
-            // external inputs (which never overwrite fresher loop-back values).
-            let members: Vec<String> = self.graph.loops[idx].members.iter().cloned().collect();
-            self.loops[idx].curr_iter += 1;
-            for member in &members {
-                let st = self.nodes.get_mut(member).expect("member validated");
-                st.completed = false;
-                st.current = std::mem::take(&mut st.next_iter);
+            // The loop has finished: its buffered loop-back signals must NOT
+            // propagate (mstar's `filtered_signals`) — without this, a parent
+            // loop's advance would promote the final loop-back value over the
+            // re-injected external input.
+            for li in self.subtree_loops(idx) {
+                let members: Vec<String> =
+                    self.graph.loops[li].members.iter().cloned().collect();
+                for member in members {
+                    self.nodes
+                        .get_mut(&member)
+                        .expect("member validated")
+                        .next_iter
+                        .clear();
+                }
             }
-            let externals = self.loops[idx].external_inputs.clone();
-            for (node, name, tensors) in externals {
-                let st = self.nodes.get_mut(&node).expect("member validated");
-                st.current.entry(name).or_insert(tensors);
+            // Nested: this loop is an entity of its parent's iteration — the
+            // parent may now be complete too.
+            if let Some(parent) = loop_spec.parent {
+                self.loops[parent].children_done.insert(idx);
+                self.try_complete_loop(parent, events);
+            }
+        } else {
+            // Advance: reset the whole SUBTREE. Every transitive member node
+            // promotes its buffered next-iter inputs; descendant loops reset
+            // fully (curr_iter, termination, finish signal, output caches) so
+            // they run afresh inside the new iteration; then external inputs
+            // of this loop AND descendants re-inject (never overwriting a
+            // fresher promoted loop-back value).
+            let subtree = self.subtree_loops(idx);
+            self.loops[idx].curr_iter += 1;
+            self.loops[idx].children_done.clear();
+            for &li in &subtree {
+                let members: Vec<String> =
+                    self.graph.loops[li].members.iter().cloned().collect();
+                for member in &members {
+                    let st = self.nodes.get_mut(member).expect("member validated");
+                    st.completed = false;
+                    st.current = std::mem::take(&mut st.next_iter);
+                }
+                if li != idx {
+                    let lst = &mut self.loops[li];
+                    lst.curr_iter = 0;
+                    lst.terminated = false;
+                    lst.finish_signal = false; // a stop applies to one run
+                    lst.children_done.clear();
+                    lst.last_values.clear();
+                    lst.accumulated.clear();
+                }
+            }
+            for &li in &subtree {
+                let externals = self.loops[li].external_inputs.clone();
+                for (node, name, tensors) in externals {
+                    let st = self.nodes.get_mut(&node).expect("member validated");
+                    st.current.entry(name).or_insert(tensors);
+                }
             }
         }
     }
@@ -773,10 +848,150 @@ mod tests {
         let bad = node("a", &["x"], vec![edge("ghost", "y")]);
         assert!(CompiledWalk::compile("w", &bad).is_err());
 
-        // Nested loops unsupported (documented v0 limitation).
+        // A loop with an empty body is meaningless.
+        let empty = Section::Loop(LoopSpec {
+            name: "empty".into(),
+            body: Box::new(Section::Sequential { sections: vec![] }),
+            max_iters: 2,
+            outputs: vec![],
+            accumulated_outputs: vec![],
+        });
+        assert!(CompiledWalk::compile("w", &empty).is_err());
+    }
+
+    // ---- nested loops (mstar's loop-inside-loop) ---------------------------
+
+    /// outer(max=O) { inner(max=I) { step } } — `step` self-feeds `x`; the
+    /// inner loop emits its last x on each termination; the outer re-runs the
+    /// inner each iteration and emits the final value at the end.
+    fn nested_walk(outer_iters: u32, inner_iters: u32) -> WalkState {
+        let step = node("step", &["x"], vec![edge("step", "x")]);
         let inner = Section::Loop(LoopSpec {
             name: "inner".into(),
-            body: Box::new(node("a", &["x"], vec![edge("a", "x")])),
+            body: Box::new(step),
+            max_iters: inner_iters,
+            outputs: vec![emit("x", "text", true)],
+            accumulated_outputs: vec![],
+        });
+        let outer = Section::Loop(LoopSpec {
+            name: "outer".into(),
+            body: Box::new(inner),
+            max_iters: outer_iters,
+            outputs: vec![],
+            accumulated_outputs: vec![],
+        });
+        WalkState::new(Arc::new(CompiledWalk::compile("nested", &outer).unwrap()))
+    }
+
+    fn run_step(walk: &mut WalkState, out_uuid: u64) -> CompletionResult {
+        walk.take_node_inputs("step").unwrap();
+        walk.complete_node(
+            "step",
+            BTreeMap::from([("x".to_string(), vec![tref(out_uuid)])]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn nested_loop_runs_outer_times_inner_iterations() {
+        // 2 outer x 3 inner = 6 step executions; the walk is done only after
+        // the LAST inner termination completes the LAST outer iteration.
+        let mut walk = nested_walk(2, 3);
+        walk.seed(vec![IncomingInput {
+            node: "step".into(),
+            name: "x".into(),
+            tensors: vec![tref(1)],
+        }])
+        .unwrap();
+
+        let mut executions = 0u64;
+        let mut emissions = Vec::new();
+        while !walk.is_done() {
+            assert_eq!(walk.ready_nodes(), vec!["step".to_string()],
+                       "step must be ready each iteration");
+            executions += 1;
+            let result = run_step(&mut walk, 100 + executions);
+            for ev in result.events {
+                if let RouteEvent::Emission { tensors, .. } = ev {
+                    emissions.push(tensors[0].uuid);
+                }
+            }
+            assert!(executions <= 6, "ran more than outer*inner iterations");
+        }
+        assert_eq!(executions, 6);
+        // The inner loop terminated twice (once per outer iteration), emitting
+        // its last value each time: after executions 3 and 6.
+        assert_eq!(emissions, vec![103, 106]);
+    }
+
+    #[test]
+    fn nested_inner_reruns_from_external_input_each_outer_iteration() {
+        // The seed (an external input into the inner loop) must re-inject at
+        // the start of EVERY outer iteration — the inner loop's second run
+        // starts from the seed again, not from the first run's final value.
+        let mut walk = nested_walk(2, 2);
+        walk.seed(vec![IncomingInput {
+            node: "step".into(),
+            name: "x".into(),
+            tensors: vec![tref(7)],
+        }])
+        .unwrap();
+
+        // Outer iteration 1: inner runs twice (input 7, then loop-back 101).
+        let inp = walk.take_node_inputs("step").unwrap();
+        assert_eq!(inp["x"][0].uuid, 7);
+        walk.complete_node("step", BTreeMap::from([("x".to_string(), vec![tref(101)])]))
+            .unwrap();
+        let inp = walk.take_node_inputs("step").unwrap();
+        assert_eq!(inp["x"][0].uuid, 101);
+        walk.complete_node("step", BTreeMap::from([("x".to_string(), vec![tref(102)])]))
+            .unwrap();
+
+        // Outer iteration 2 begins: the inner loop reset; the SEED re-injected.
+        assert!(!walk.is_done());
+        let inp = walk.take_node_inputs("step").unwrap();
+        assert_eq!(inp["x"][0].uuid, 7, "seed must re-inject on outer advance");
+        walk.complete_node("step", BTreeMap::from([("x".to_string(), vec![tref(201)])]))
+            .unwrap();
+        let inp = walk.take_node_inputs("step").unwrap();
+        assert_eq!(inp["x"][0].uuid, 201);
+        walk.complete_node("step", BTreeMap::from([("x".to_string(), vec![tref(202)])]))
+            .unwrap();
+        assert!(walk.is_done());
+    }
+
+    #[test]
+    fn nested_inner_finish_signal_applies_to_one_run() {
+        // Stopping the inner loop ends its CURRENT run; the outer's next
+        // iteration runs the inner afresh (the signal does not persist).
+        let mut walk = nested_walk(2, 5);
+        walk.seed(vec![IncomingInput {
+            node: "step".into(),
+            name: "x".into(),
+            tensors: vec![tref(1)],
+        }])
+        .unwrap();
+
+        walk.signal_loop_finish("inner").unwrap();
+        run_step(&mut walk, 100); // inner terminates after 1 iter (signal)
+        assert!(!walk.is_done(), "outer has another iteration to run");
+
+        // Second outer iteration: the inner runs its full 5 iterations.
+        for i in 0..5 {
+            assert!(!walk.is_done());
+            run_step(&mut walk, 200 + i);
+        }
+        assert!(walk.is_done());
+    }
+
+    #[test]
+    fn outer_loop_output_captured_from_inner_node() {
+        // An inner node's output declared as the OUTER loop's output must be
+        // captured across the nesting boundary and emitted at outer end.
+        let step = node("step", &["x"], vec![edge("step", "x")]);
+        let inner = Section::Loop(LoopSpec {
+            name: "inner".into(),
+            body: Box::new(step),
             max_iters: 2,
             outputs: vec![],
             accumulated_outputs: vec![],
@@ -785,12 +1000,30 @@ mod tests {
             name: "outer".into(),
             body: Box::new(inner),
             max_iters: 2,
-            outputs: vec![],
+            outputs: vec![emit("x", "text", true)],
             accumulated_outputs: vec![],
         });
-        assert!(matches!(
-            CompiledWalk::compile("w", &outer),
-            Err(CoreError::NestedLoop(_, _))
-        ));
+        let mut walk =
+            WalkState::new(Arc::new(CompiledWalk::compile("nested_out", &outer).unwrap()));
+        walk.seed(vec![IncomingInput {
+            node: "step".into(),
+            name: "x".into(),
+            tensors: vec![tref(1)],
+        }])
+        .unwrap();
+
+        let mut last_emission = None;
+        let mut n = 0;
+        while !walk.is_done() {
+            n += 1;
+            let result = run_step(&mut walk, 100 + n);
+            for ev in result.events {
+                if let RouteEvent::Emission { tensors, .. } = ev {
+                    last_emission = Some(tensors[0].uuid);
+                }
+            }
+        }
+        assert_eq!(n, 4);
+        assert_eq!(last_emission, Some(104), "outer emits the final inner value");
     }
 }

@@ -71,9 +71,16 @@ pub enum Section {
 pub struct CompiledLoop {
     pub name: String,
     pub max_iters: u32,
+    /// Direct member nodes — nodes whose INNERMOST enclosing loop is this one.
     pub members: BTreeSet<String>,
     pub outputs: Vec<EdgeSpec>,
     pub accumulated_outputs: Vec<EdgeSpec>,
+    /// Enclosing loop, for nesting (mstar's loop-inside-loop): an inner loop
+    /// is an *entity* of its parent's iteration — the parent's iteration
+    /// completes only once the inner loop has fully terminated.
+    pub parent: Option<usize>,
+    /// Direct child loops (indices into `CompiledWalk::loops`).
+    pub children: Vec<usize>,
 }
 
 /// A walk's graph, flattened for execution: nodes by name, loops, and the
@@ -122,12 +129,6 @@ impl CompiledWalk {
                 Ok(())
             }
             Section::Loop(spec) => {
-                if let Some(outer) = enclosing_loop {
-                    return Err(CoreError::NestedLoop(
-                        self.loops[outer].name.clone(),
-                        spec.name.clone(),
-                    ));
-                }
                 if spec.max_iters == 0 {
                     return Err(CoreError::InvalidSpec(format!(
                         "loop '{}' has max_iters == 0",
@@ -141,9 +142,16 @@ impl CompiledWalk {
                     members: BTreeSet::new(),
                     outputs: spec.outputs.clone(),
                     accumulated_outputs: spec.accumulated_outputs.clone(),
+                    parent: enclosing_loop,
+                    children: Vec::new(),
                 });
+                if let Some(outer) = enclosing_loop {
+                    self.loops[outer].children.push(loop_idx);
+                }
                 self.collect(&spec.body, Some(loop_idx))?;
-                if self.loops[loop_idx].members.is_empty() {
+                if self.loops[loop_idx].members.is_empty()
+                    && self.loops[loop_idx].children.is_empty()
+                {
                     return Err(CoreError::InvalidSpec(format!(
                         "loop '{}' has an empty body",
                         spec.name

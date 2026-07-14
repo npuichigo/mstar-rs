@@ -14,8 +14,6 @@ pub enum CoreError {
     NodeNotScheduled(String),
     #[error("duplicate node name '{0}' in walk '{1}'")]
     DuplicateNode(String, String),
-    #[error("nested loops are not supported yet (loop '{0}' contains loop '{1}')")]
-    NestedLoop(String, String),
     #[error("invalid walk spec: {0}")]
     InvalidSpec(String),
 }
