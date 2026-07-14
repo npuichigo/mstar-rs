@@ -57,6 +57,64 @@ THINKER_PAGES = 512   # 64k text-context tokens
 THINKER_TEXT_PAGES = 64   # 8k context for the text-only Thinker AR slice
 MROPE_SECTION = [24, 20, 20]  # for head_dim 128
 TALKER_PAGES = 256
+
+# Multimodal placeholder/marker token ids for THIS checkpoint (verified against
+# the processor output; the config.py values 151646/7/8 are stale). The
+# processor expands each media placeholder to N tokens; the encoder embeds are
+# masked-scattered onto the AUDIO_PAD / IMAGE_PAD positions.
+AUDIO_PAD, AUDIO_BOS, AUDIO_EOS = 151675, 151669, 151670
+IMAGE_PAD, IMAGE_BOS, IMAGE_EOS = 151655, 151652, 151653
+
+
+def _thinker_prefill_seeds(mstar, request):
+    """Build the Thinker prefill walk name + seed inputs from a request (text +
+    media file paths). Feature extraction (HF processor, CPU — no weights) runs
+    here in the weightless conductor; the encoder forward + masked-scatter run
+    in the Thinker engine. The processor expands each media placeholder to N
+    tokens, so `input_ids` already carries the AUDIO_PAD/IMAGE_PAD spans the
+    engine scatters onto. Shared by the text-out and audio-out policies.
+    Returns (walk_name, seeds, ids). Single media item per modality (v1)."""
+    import torch
+
+    fp = request.get("file_paths") or {}
+    prompt = request.get("prompt") or request.get("text", "") or ""
+    proc = mstar._processor
+    if fp.get("audio"):
+        import numpy as np
+        import soundfile as sf
+        wav, sr = sf.read(fp["audio"][0])
+        if sr != 16000:  # the feature extractor is 16 kHz
+            n = int(len(wav) * 16000 / sr)
+            wav = np.interp(np.linspace(0, len(wav), n, endpoint=False),
+                            np.arange(len(wav)), wav)
+        msgs = [{"role": "user", "content": [{"type": "audio", "audio": wav},
+                                             {"type": "text", "text": prompt}]}]
+        out = proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
+                                       return_dict=True, return_tensors="pt")
+        ids = out["input_ids"][0]
+        m = out["feature_attention_mask"].bool()
+        feats = out["input_features"].permute(0, 2, 1)[m].permute(1, 0).contiguous().float()
+        seqlens = out["feature_attention_mask"].sum(-1).to(torch.long)
+        return ("prefill_audio",
+                [("Thinker", "text_inputs", [ids]),
+                 ("Thinker", "audio_features", [feats]),
+                 ("Thinker", "audio_seqlens", [seqlens])], ids)
+    if fp.get("image"):
+        from PIL import Image
+        img = Image.open(fp["image"][0]).convert("RGB")
+        msgs = [{"role": "user", "content": [{"type": "image", "image": img},
+                                             {"type": "text", "text": prompt}]}]
+        out = proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True,
+                                       return_dict=True, return_tensors="pt")
+        ids = out["input_ids"][0]
+        return ("prefill_vision",
+                [("Thinker", "text_inputs", [ids]),
+                 ("Thinker", "pixel_values", [out["pixel_values"].contiguous().float()]),
+                 ("Thinker", "image_grid_thw", [out["image_grid_thw"].to(torch.long)])], ids)
+    text = proc.apply_chat_template([{"role": "user", "content": prompt}],
+                                    tokenize=False, add_generation_prompt=True)
+    ids = mstar.tokenizer(text, return_tensors="pt")["input_ids"][0]
+    return ("prefill_text", [("Thinker", "text_inputs", [ids])], ids)
 MAX_OUTPUT_TOKENS = 2048  # mstar: get_max_output_tokens() (both AR loops)
 # Talker→Code2Wav windowing (mstar: codec_chunk_frames / codec_left_context).
 CODEC_CHUNK_FRAMES = 25
@@ -199,11 +257,15 @@ class Qwen3OmniThinkerPolicy(ModelPolicy):
         self.greedy = greedy
 
     def walks(self) -> dict[str, Any]:
+        prefill_emit = [emit("new_token", modality="text", persist=True)]
         return {
-            "prefill_text": node(
-                "Thinker", ["text_inputs"],
-                [emit("new_token", modality="text", persist=True)],
-            ),
+            "prefill_text": node("Thinker", ["text_inputs"], prefill_emit),
+            # Media prefills: the encoder embeds are scattered onto the placeholder
+            # positions in the Thinker engine, so each declares its extra seeds.
+            "prefill_audio": node(
+                "Thinker", ["text_inputs", "audio_features", "audio_seqlens"], prefill_emit),
+            "prefill_vision": node(
+                "Thinker", ["text_inputs", "pixel_values", "image_grid_thw"], prefill_emit),
             "thinker_decode": loop(
                 "thinker_decode_loop",
                 node("Thinker", ["text_inputs"],
@@ -224,14 +286,14 @@ class Qwen3OmniThinkerPolicy(ModelPolicy):
         return self.tokenizer(text, return_tensors="pt")["input_ids"][0]
 
     def initial_walks(self, request: dict[str, Any]):
-        ids = self._tokenize(request.get("prompt") or request.get("text", ""))
-        return [("prefill_text", [("Thinker", "text_inputs", [ids])],
-                 {THINKER_KV: int(ids.shape[0])})]
+        walk, seeds, ids = _thinker_prefill_seeds(self._mstar, request)
+        return [(walk, seeds, {THINKER_KV: int(ids.shape[0])})]
 
     def next_forward(self, request_id, partition, walk, fwd_index, persist, stream_done):
         # prefill sampled the first token (persisted); seed the decode loop with
-        # it (KV append = 1). decode returning None finishes the request.
-        if walk == "prefill_text":
+        # it (KV append = 1). decode returning None finishes the request. Every
+        # prefill variant (text/audio/vision) transitions to the same decode.
+        if walk.startswith("prefill"):
             return ("thinker_decode", [("Thinker", "text_inputs", persist["new_token"])],
                     {THINKER_KV: 1})
         return None
@@ -258,7 +320,9 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         from mstar.model.qwen3_omni.components.rope import (
             compute_3d_cos_sin,
             compute_rope_freqs,
+            get_rope_index_audio,
             get_rope_index_text,
+            get_rope_index_vision,
         )
 
         from ..fi import (
@@ -272,6 +336,18 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         self._Handle = FlashInferCacheHandle
         self._cos_sin = compute_3d_cos_sin
         self._rope_index = get_rope_index_text
+        self._rope_text = get_rope_index_text
+        self._rope_audio = get_rope_index_audio
+        self._rope_vision = get_rope_index_vision
+        # Encoders load lazily on the first media request (replicated per rank,
+        # not sharded). Text-only serving never pays for them.
+        self._audio_encoder = None
+        self._vision_encoder = None
+        # Per-request RoPE-vs-KV position offset: for a vision prefill the grid
+        # span exceeds the token count, so decode tokens advance RoPE from the
+        # grid span while the KV cache advances by token count (verify_vision's
+        # dual counters). 0 for text/audio.
+        self._rope_offset: dict[int, int] = {}
 
         # comm group + NCCL init (mstar's WorkerTPGroups); init_dist sets cuda:rank.
         members = list(range(tp_world))
@@ -357,11 +433,13 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         torch.cuda.synchronize()
         self._decode_graph = g
 
-    def _decode_graphed(self, tok_id: int, pages, seq_pos: int):
+    def _decode_graphed(self, tok_id: int, pages, seq_pos: int, rope_pos: int | None = None):
         """Replay the captured Thinker decode for one token. Returns
-        (sampled_token:int, layer_0_hidden or None)."""
+        (sampled_token:int, layer_0_hidden or None). `rope_pos` is the MRoPE
+        position (defaults to seq_pos); it differs from the KV `seq_pos` after a
+        vision prefill, where RoPE advances by the image grid span."""
         torch = self._torch
-        cos, sin = self._mrope(seq_pos)
+        cos, sin = self._mrope(seq_pos if rope_pos is None else rope_pos)
         if self._decode_graph is None:
             self._g_cos.copy_(cos); self._g_sin.copy_(sin)
             self._capture_decode(pages, seq_pos)
@@ -372,6 +450,101 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         tok = int(self._g_out_tok.item())   # .item() syncs; no explicit sync needed
         layer0 = self._g_layer0.clone() if self.audio_output else None
         return tok, layer0
+
+    def _move_stray_cpu_tensors(self, mod) -> None:
+        # The encoders' sinusoidal PE (and similar) are plain tensor attributes,
+        # not registered buffers, so .to(device) skips them — move them here.
+        torch = self._torch
+        for m in mod.modules():
+            for name, val in list(vars(m).items()):
+                if isinstance(val, torch.Tensor) and val.device.type == "cpu":
+                    setattr(m, name, val.to(self.device))
+
+    def _ensure_audio_encoder(self):
+        if self._audio_encoder is None:
+            enc = self._mstar.get_submodule("audio_encoder", device=str(self.device)).audio_encoder
+            enc = enc.to(self.device)
+            self._move_stray_cpu_tensors(enc)
+            self._audio_encoder = enc
+            self._audio_enc_dtype = next(enc.parameters()).dtype
+        return self._audio_encoder
+
+    def _ensure_vision_encoder(self):
+        if self._vision_encoder is None:
+            enc = self._mstar.get_submodule("vision_encoder", device=str(self.device)).vision_encoder
+            enc = enc.to(self.device)
+            self._move_stray_cpu_tensors(enc)
+            self._vision_encoder = enc
+            self._vision_enc_dtype = next(enc.parameters()).dtype
+        return self._vision_encoder
+
+    def _embed_with_audio(self, ids, named):
+        """Embed the prompt with the audio encoder's embeds scattered onto the
+        AUDIO_PAD positions, plus audio-aware 3D-MRoPE (temporal-only across the
+        audio span). Mirrors verify_audio_input.py, inside the engine."""
+        torch = self._torch
+        enc = self._ensure_audio_encoder()
+        feats = named["audio_features"][0].to(self.device, self._audio_enc_dtype)
+        seqlens = named["audio_seqlens"][0].to(self.device).to(torch.long)
+        with torch.no_grad():
+            embeds = enc(feats, feature_lens=seqlens, return_dict=True).last_hidden_state
+        if embeds.dim() == 3:
+            embeds = embeds.squeeze(0)
+        inp = self._embed(ids).to(torch.bfloat16)
+        mask = ids == AUDIO_PAD
+        inp = inp.masked_scatter(mask.unsqueeze(-1), embeds.to(inp.dtype))
+        a0 = int(mask.nonzero()[0])
+        seq, n_aud = int(ids.shape[0]), int(mask.sum())
+        pips = self.cfg.thinker.position_id_per_seconds
+        pos = torch.empty(3, seq, dtype=torch.float, device=self.device)
+        pos[:, :a0] = self._rope_text(a0, 0.0, self.device)
+        pos[:, a0:a0 + n_aud] = self._rope_audio(n_aud, float(a0), self.device, pips)
+        if a0 + n_aud < seq:
+            pos[:, a0 + n_aud:] = self._rope_text(seq - a0 - n_aud, float(a0 + n_aud), self.device)
+        return inp, pos, None, 0  # audio span occupies n_aud units -> no offset
+
+    def _embed_with_vision(self, ids, named):
+        """Embed the prompt with the vision encoder's (spatial-merged) embeds
+        scattered onto the IMAGE_PAD positions, deepstack features placed at the
+        same positions (added into the Thinker's first layers), and grid-based
+        3D-MRoPE. Returns the RoPE-vs-KV offset since the grid span exceeds the
+        token count. Mirrors verify_vision_input.py, inside the engine."""
+        torch = self._torch
+        enc = self._ensure_vision_encoder()
+        pixel_values = named["pixel_values"][0].to(self.device, self._vision_enc_dtype)
+        grid_thw = named["image_grid_thw"][0].to(self.device).to(torch.long)
+        with torch.no_grad():
+            enc_out = enc(pixel_values, grid_thw=grid_thw)
+        if isinstance(enc_out, tuple):
+            vision_embeds, deepstack = enc_out
+        else:
+            vision_embeds = enc_out.pooler_output      # spatial-merged, not raw patches
+            deepstack = enc_out.deepstack_features
+        if isinstance(deepstack, torch.Tensor):
+            deepstack = [deepstack]
+        inp = self._embed(ids).to(torch.bfloat16)
+        mask = ids == IMAGE_PAD
+        inp = inp.masked_scatter(mask.unsqueeze(-1), vision_embeds.to(inp.dtype))
+        hidden_size = inp.shape[-1]
+        ds_full = []
+        for ds in deepstack:
+            f = torch.zeros(ids.shape[0], hidden_size, dtype=inp.dtype, device=self.device)
+            f[mask] = ds.to(inp.dtype)
+            ds_full.append(f)
+        v0 = int(mask.nonzero()[0])
+        seq, n_vis = int(ids.shape[0]), int(mask.sum())
+        pips = self.cfg.thinker.position_id_per_seconds
+        sms = self.cfg.vision.spatial_merge_size
+        pos = torch.empty(3, seq, dtype=torch.float, device=self.device)
+        pos[:, :v0] = self._rope_text(v0, 0.0, self.device)
+        pos[:, v0:v0 + n_vis] = self._rope_vision(
+            grid_thw, float(v0), position_id_per_seconds=pips, device=self.device,
+            spatial_merge_size=sms, seconds_per_grid=None)
+        nxt = float(pos[:, v0:v0 + n_vis].max().item()) + 1   # grid span > token count
+        if v0 + n_vis < seq:
+            pos[:, v0 + n_vis:] = self._rope_text(seq - v0 - n_vis, nxt, self.device)
+        rope_pos = int(pos.max().item()) + 1
+        return inp, pos, ds_full, rope_pos - seq   # decode continues from grid span
 
     def execute(self, node_name, walk, inputs, kv=None):
         torch = self._torch
@@ -384,7 +557,8 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
             # incl. NCCL all-reduces + lm_head + argmax, captured over static
             # buffers; MRoPE cos/sin copied in per token).
             if walk == "thinker_decode" and self.cuda_graph:
-                tok, layer0 = self._decode_graphed(int(ids[0].item()), view["pages"], seq_pos)
+                rp = seq_pos + self._rope_offset.get(rid, 0)
+                tok, layer0 = self._decode_graphed(int(ids[0].item()), view["pages"], seq_pos, rp)
                 o = {"new_token": [torch.tensor([tok], dtype=torch.long)],
                      "text_inputs": [torch.tensor([tok], dtype=torch.long)]}
                 if self.audio_output:
@@ -396,17 +570,29 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
                     self._pending_stops.append((rid, "thinker_decode_loop"))
                 out[rid] = o
                 continue
-            if n > 1:
+            deepstack = None
+            if walk == "prefill_audio":
+                input_embeds, pos3d, deepstack, off = self._embed_with_audio(ids, named)
+                self._rope_offset[rid] = off
+            elif walk == "prefill_vision":
+                input_embeds, pos3d, deepstack, off = self._embed_with_vision(ids, named)
+                self._rope_offset[rid] = off
+            elif n > 1:  # text prefill
                 pos3d = self._rope_index(n, seq_pos, self.device)
-            else:
-                pos3d = torch.full((3, 1), float(seq_pos), dtype=torch.float, device=self.device)
+                input_embeds = self._embed(ids).to(torch.bfloat16)
+                self._rope_offset[rid] = 0
+            else:  # eager decode fallback (cuda_graph off); RoPE may be offset from KV
+                rp = seq_pos + self._rope_offset.get(rid, 0)
+                pos3d = torch.full((3, 1), float(rp), dtype=torch.float, device=self.device)
+                input_embeds = self._embed(ids).to(torch.bfloat16)
             cos, sin = self._cos_sin(pos3d, self._inv_freq, MROPE_SECTION, target_dtype=torch.bfloat16)
             self._attn.plan(view["pages"], seq_pos, n)
             handle = self._Handle(self._attn)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 hidden, layer_0, _ = self._tmodel(
-                    input_embeds=self._embed(ids).to(torch.bfloat16),
+                    input_embeds=input_embeds,
                     cache_handle=handle, cos_sin_3d=(cos, sin), mrope_section=MROPE_SECTION,
+                    deepstack_visual_embeds=deepstack,
                 )
                 logits = self._lm_head(hidden[-1:])
             tok = int(logits.argmax(-1).reshape(-1)[0].item())
@@ -416,7 +602,7 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
                 # text-only prompt: multimodal mask all-False, so the selected
                 # hidden is layer_0_embed; prefill drops system/prior-assistant
                 # tokens via _get_talker_text_mask (mstar postprocess L1140-1163).
-                if walk == "prefill_text":
+                if walk.startswith("prefill"):
                     incl = self._thinker_sub._get_talker_text_mask(ids)
                     o["thinker_states"] = [layer_0[incl].contiguous()]
                     o["thinker_mask"] = [torch.zeros(int(incl.sum()), dtype=torch.bool,
@@ -484,6 +670,14 @@ class Qwen3OmniAudioPolicy(ModelPolicy):
     def walks(self):
         return {
             "prefill_text": node("Thinker", ["text_inputs"], self._thinker_out()),
+            # Media prefills: encoder embeds scattered onto the placeholders in
+            # the Thinker engine; same thinker_states/mask stream to the Talker.
+            "prefill_audio": node(
+                "Thinker", ["text_inputs", "audio_features", "audio_seqlens"],
+                self._thinker_out()),
+            "prefill_vision": node(
+                "Thinker", ["text_inputs", "pixel_values", "image_grid_thw"],
+                self._thinker_out()),
             "thinker_decode": loop(
                 "thinker_decode_loop",
                 node("Thinker", ["text_inputs"],
@@ -510,7 +704,8 @@ class Qwen3OmniAudioPolicy(ModelPolicy):
     def partitions(self):
         return (
             [
-                partition("Thinker", ["prefill_text", "thinker_decode"]),
+                partition("Thinker", ["prefill_text", "prefill_audio", "prefill_vision",
+                                      "thinker_decode"]),
                 partition("Talker", ["talker_prefill", "talker_last_prefill", "talker_decode"]),
                 partition("Code2Wav", ["code2wav_chunk"]),
             ],
@@ -554,19 +749,21 @@ class Qwen3OmniAudioPolicy(ModelPolicy):
         return self.tokenizer(text, return_tensors="pt")["input_ids"][0]
 
     def initial_walks(self, request):
-        ids = self._tokenize(request.get("prompt") or request.get("text", ""))
+        # Text or media prefill (feature extraction in the conductor); the
+        # placeholder-expanded ids drive the Talker's text-conditioning mask too.
+        walk, seeds, ids = _thinker_prefill_seeds(self._mstar, request)
         num_kept = int(self._talker_text_mask(ids).sum())
         # seed all three partitions (mstar kicks off every partition at ingest);
         # Talker/Code2Wav have no seed inputs — they wait on streamed chunks.
         return [
-            ("prefill_text", [("Thinker", "text_inputs", [ids])], {THINKER_KV: int(ids.shape[0])}),
+            (walk, seeds, {THINKER_KV: int(ids.shape[0])}),
             ("talker_prefill", [], {TALKER_KV: num_kept}),
             ("code2wav_chunk", []),
         ]
 
     def next_forward(self, request_id, partition, walk, fwd_index, persist, stream_done):
         if partition == "Thinker":
-            if walk == "prefill_text":
+            if walk.startswith("prefill"):
                 return ("thinker_decode", [("Thinker", "text_inputs", persist["new_token"])],
                         {THINKER_KV: 1})
             return None  # thinker_decode finished
