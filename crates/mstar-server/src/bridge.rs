@@ -35,10 +35,14 @@ pub struct ResultChunk {
     pub metadata: Value,
 }
 
-/// A result chunk, or end-of-stream, delivered to a request's serving task.
+/// A result chunk, a backend error, or end-of-stream, delivered to a
+/// request's serving task.
 #[derive(Debug)]
 pub enum StreamItem {
     Chunk(ResultChunk),
+    /// The backend failed this request (worker exception, bad input);
+    /// terminal — the route is removed.
+    Error(String),
     Done,
 }
 
@@ -56,7 +60,7 @@ struct SubmitMsg<'a> {
     streaming: bool,
 }
 
-/// Inbound message; `t` selects chunk vs done. `data` is msgpack binary.
+/// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
 #[derive(Deserialize)]
 struct Inbound {
     t: String,
@@ -67,6 +71,8 @@ struct Inbound {
     data: serde_bytes::ByteBuf,
     #[serde(default)]
     metadata: Value,
+    #[serde(default)]
+    msg: String, // error message for t == "err"
 }
 
 pub struct Bridge {
@@ -112,6 +118,7 @@ impl Bridge {
                     })),
                     false,
                 ),
+                "err" => (Some(StreamItem::Error(msg.msg)), true),
                 "done" => (Some(StreamItem::Done), true),
                 _ => (None, false),
             };
@@ -155,5 +162,16 @@ impl Bridge {
         let payload = rmp_serde::to_vec_named(&msg).expect("encode submit");
         let _ = self.mbox.send("conductor", &payload);
         rx
+    }
+
+    /// Abort a request (client disconnected or timed out): tell the conductor
+    /// to release its state (idempotent — a finished rid is a no-op there)
+    /// and drop the local route.
+    pub fn abort(&self, request_id: &str) {
+        self.routes.lock().expect("routes lock").remove(request_id);
+        let msg = serde_json::json!({"t": "abort", "rid": request_id});
+        if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
+            let _ = self.mbox.send("conductor", &payload);
+        }
     }
 }

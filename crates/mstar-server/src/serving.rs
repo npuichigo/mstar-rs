@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::stream::Stream;
 use uuid::Uuid;
@@ -30,32 +30,111 @@ pub struct AppState {
     /// Output audio sample rate (mstar reads it from the model; the frontend
     /// has no model, so it's configured, default 24 kHz).
     pub sample_rate: u32,
+    /// Total per-request budget (mstar's `timeout_seconds`, default 600 s):
+    /// exceeded => a terminal error + an abort to the conductor.
+    pub request_timeout: Duration,
     /// Present when a conductor socket dir is given (real streaming); absent =
     /// the self-contained mock generator.
     pub bridge: Option<Arc<Bridge>>,
 }
 
-pub type ChunkStream = Pin<Box<dyn Stream<Item = ResultChunk> + Send>>;
+/// One item of a request's result stream.
+pub enum Out {
+    Chunk(ResultChunk),
+    /// Terminal backend failure (worker exception, bad input, timeout).
+    Error(String),
+}
 
-/// The unified chunk source: bridge to the conductor, or the mock generator.
+pub type OutStream = Pin<Box<dyn Stream<Item = Out> + Send>>;
+
+/// Aborts the request on drop unless it completed — covers both the client
+/// disconnecting mid-stream (axum drops the body stream, dropping this) and
+/// the timeout path (mstar's `abort_request` releases engine state).
+struct AbortGuard {
+    bridge: Arc<Bridge>,
+    rid: String,
+    done: bool,
+}
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.bridge.abort(&self.rid);
+        }
+    }
+}
+
+/// The unified result source: bridge to the conductor, or the mock generator.
 pub fn result_stream(
     state: &AppState,
     args: &SubmitArgs,
     request_id: &str,
     streaming: bool,
-) -> ChunkStream {
+) -> OutStream {
     match &state.bridge {
         Some(b) => {
             let rx = b.submit(args, request_id, streaming);
-            Box::pin(futures::stream::unfold(rx, |mut rx| async move {
-                match rx.recv().await {
-                    Some(StreamItem::Chunk(c)) => Some((c, rx)),
-                    _ => None, // Done, or the sender was dropped
-                }
-            }))
+            let guard = AbortGuard {
+                bridge: b.clone(),
+                rid: request_id.to_string(),
+                done: false,
+            };
+            let deadline = Instant::now() + state.request_timeout;
+            // finished: a terminal item was yielded — end on the next poll.
+            let st = (rx, guard, deadline, false);
+            Box::pin(futures::stream::unfold(
+                st,
+                |(mut rx, mut guard, deadline, finished)| async move {
+                    if finished {
+                        return None;
+                    }
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(left, rx.recv()).await {
+                        Ok(Some(StreamItem::Chunk(c))) => {
+                            Some((Out::Chunk(c), (rx, guard, deadline, false)))
+                        }
+                        Ok(Some(StreamItem::Error(e))) => {
+                            guard.done = true; // conductor already cleaned up
+                            Some((Out::Error(e), (rx, guard, deadline, true)))
+                        }
+                        Ok(Some(StreamItem::Done)) => {
+                            guard.done = true;
+                            drop(guard); // completed: Drop sees done and skips the abort
+                            None
+                        }
+                        Ok(None) => None, // sender dropped; guard aborts
+                        Err(_elapsed) => {
+                            // Total budget exceeded — mstar raises 500
+                            // "Request timed out" and aborts. The guard (still
+                            // not done) sends the abort when the state drops.
+                            Some((
+                                Out::Error("Request timed out".to_string()),
+                                (rx, guard, deadline, true),
+                            ))
+                        }
+                    }
+                },
+            ))
         }
-        None => Box::pin(futures::stream::iter(mock_chunks(args, state.sample_rate))),
+        None => Box::pin(futures::stream::iter(
+            mock_chunks(args, state.sample_rate).into_iter().map(Out::Chunk),
+        )),
     }
+}
+
+/// Gather a non-streaming request's chunks; the first error wins (mstar's
+/// `collect_results` raising into the handler).
+pub async fn collect(stream: OutStream) -> Result<Vec<ResultChunk>, String> {
+    use futures::StreamExt;
+    let mut chunks = Vec::new();
+    let mut s = stream;
+    while let Some(item) = s.next().await {
+        match item {
+            Out::Chunk(c) => chunks.push(c),
+            Out::Error(e) => return Err(e),
+        }
+    }
+    Ok(chunks)
 }
 
 /// Mock output: one chunk per requested output modality.

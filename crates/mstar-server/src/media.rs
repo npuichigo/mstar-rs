@@ -133,6 +133,45 @@ pub fn save_base64(
     Ok((modality_hint.to_string(), path.to_string_lossy().into_owned()))
 }
 
+/// Download an `http(s)` URL into `upload_dir` (mstar's `save_remote_url`;
+/// 30 s timeout). Modality from the Content-Type, falling back to the URL
+/// path's extension. Gated by `allow_remote` — SSRF surface.
+fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), String> {
+    let resp = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .get(url)
+        .call()
+        .map_err(|e| format!("remote media fetch failed: {e}"))?;
+    let mut mime = resp
+        .header("content-type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut raw = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("remote media read failed: {e}"))?;
+    if mime.is_empty() || mime == "application/octet-stream" {
+        // Infer from the URL path extension (mstar's fallback).
+        let path = url.split('?').next().unwrap_or(url);
+        let suffix = PathBuf::from(path)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        mime = match modality_from_ext(&suffix) {
+            "image" => format!("image/{}", suffix.trim_start_matches('.')),
+            "audio" => format!("audio/{}", suffix.trim_start_matches('.')),
+            "video" => format!("video/{}", suffix.trim_start_matches('.')),
+            _ => "application/octet-stream".to_string(),
+        };
+    }
+    save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
+}
+
 /// Resolve a media reference (data URL, `http(s)` URL, or local path).
 /// Returns `(modality, path)`. Local paths pass through unchanged (modality
 /// from extension). `http(s)` is refused unless `allow_remote` is set — remote
@@ -150,7 +189,7 @@ pub fn resolve_media_ref(
         if !allow_remote {
             return Err("Remote media fetch is disabled on this server".to_string());
         }
-        return Err("Remote media fetch is not implemented in the Rust frontend".to_string());
+        return save_remote_url(reference, upload_dir);
     }
     // Treat as a local filesystem path.
     let suffix = PathBuf::from(reference)

@@ -50,7 +50,7 @@ use uuid::Uuid;
 use adapters::{Adapter, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
 use protocol::{ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest};
-use serving::{now, result_stream, rid, AppState};
+use serving::{collect, now, result_stream, rid, AppState, Out};
 
 #[tokio::main]
 async fn main() {
@@ -72,6 +72,13 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(24000);
     let allow_remote = std::env::var("MSTAR_ALLOW_REMOTE").as_deref() == Ok("1");
+    // Total per-request budget (mstar's APIServer timeout_seconds default).
+    let request_timeout = std::time::Duration::from_secs(
+        std::env::var("MSTAR_REQUEST_TIMEOUT_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600),
+    );
 
     let bridge = socket_dir.map(|dir| {
         eprintln!("bridging to conductor at {dir}");
@@ -86,8 +93,15 @@ async fn main() {
         upload_dir,
         allow_remote,
         sample_rate,
+        request_timeout,
         bridge,
     };
+
+    // Allow-all CORS, matching mstar's CORSMiddleware configuration.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
 
     let app = Router::new()
         .route("/health", get(health))
@@ -97,6 +111,7 @@ async fn main() {
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/generate", post(generate))
+        .layer(cors)
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -150,6 +165,35 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
     Ok(adapter)
 }
 
+/// Delete a request's persisted media 60 s after translation, matching
+/// mstar's deferred upload cleanup. Only files under `upload_dir` are ours to
+/// delete — local paths passed through by reference are left alone.
+fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
+    let files: Vec<PathBuf> = args
+        .file_paths
+        .values()
+        .flatten()
+        .map(PathBuf::from)
+        .filter(|p| p.starts_with(upload_dir))
+        .collect();
+    if files.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        for f in files {
+            let _ = std::fs::remove_file(f);
+        }
+    });
+}
+
+/// An SSE data event carrying an OpenAI error envelope (terminal mid-stream).
+fn sse_error_event(msg: &str) -> Event {
+    Event::default().data(
+        json!({"error": {"message": msg, "type": "server_error", "code": 500}}).to_string(),
+    )
+}
+
 // ---- GET /health, /v1/models ---------------------------------------------
 
 async fn health() -> Json<Value> {
@@ -174,15 +218,19 @@ async fn chat_completions(
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
     if req.stream {
         return chat_sse(st, args, request_id).into_response();
     }
-    let chunks = result_stream(&st, &args, &request_id, false)
-        .collect::<Vec<_>>()
-        .await;
-    Json(build_chat_response(&st.model_name, &request_id, chunks, st.sample_rate)).into_response()
+    match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => Json(build_chat_response(
+            &st.model_name, &request_id, chunks, st.sample_rate,
+        ))
+        .into_response(),
+        Err(e) => error(500, &e, "server_error"),
+    }
 }
 
 /// SSE `chat.completion.chunk`s: role delta, per-chunk deltas, finish, `[DONE]`.
@@ -202,8 +250,18 @@ fn chat_sse(
     let body = {
         let model = model.clone();
         let id = request_id.clone();
-        base.map(move |c| {
-            Ok(Event::default().data(chunk_json(&id, created, &model, chat_delta(&c), None)))
+        base.map(move |item| match item {
+            Out::Chunk(c) => Ok(Event::default().data(chunk_json(
+                &id,
+                created,
+                &model,
+                chat_delta(&c),
+                None,
+            ))),
+            // Terminal mid-stream failure: an OpenAI error event (the stream
+            // ends right after — mstar's generator exception drops the
+            // connection; this is strictly more informative).
+            Out::Error(e) => Ok(sse_error_event(&e)),
         })
     };
     let tail = {
@@ -306,13 +364,16 @@ async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>
 
     if req.stream {
         // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
+        // A backend error ends the byte stream (the connection closes
+        // mid-WAV, matching mstar's generator exception).
         let header = media::wav_stream_header(st.sample_rate, 1);
         let base = result_stream(&st, &args, &request_id, true);
-        let audio_only = base.filter_map(|c| async move {
-            if c.modality == "audio" && !c.data.is_empty() {
-                Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
-            } else {
-                None
+        let audio_only = base.filter_map(|item| async move {
+            match item {
+                Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
+                    Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+                }
+                _ => None,
             }
         });
         let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
@@ -324,9 +385,10 @@ async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>
             .unwrap();
     }
 
-    let chunks = result_stream(&st, &args, &request_id, false)
-        .collect::<Vec<_>>()
-        .await;
+    let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => chunks,
+        Err(e) => return error(500, &e, "server_error"),
+    };
     let mut pcm: Vec<u8> = Vec::new();
     for c in &chunks {
         if c.modality == "audio" {
@@ -355,10 +417,10 @@ async fn images_generations(
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
     let request_id = rid("img");
-    let chunks = result_stream(&st, &args, &request_id, false)
-        .collect::<Vec<_>>()
-        .await;
-    Json(images_response(chunks)).into_response()
+    match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => Json(images_response(chunks)).into_response(),
+        Err(e) => error(500, &e, "server_error"),
+    }
 }
 
 async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
@@ -412,11 +474,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("img");
-    let chunks = result_stream(&st, &args, &request_id, false)
-        .collect::<Vec<_>>()
-        .await;
-    Json(images_response(chunks)).into_response()
+    match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => Json(images_response(chunks)).into_response(),
+        Err(e) => error(500, &e, "server_error"),
+    }
 }
 
 fn images_response(chunks: Vec<ResultChunk>) -> Value {
@@ -515,9 +578,19 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
         model_kwargs,
     };
 
+    schedule_upload_cleanup(&st.upload_dir, &args);
     if streaming {
         let base = result_stream(&st, &args, &request_id, true);
-        let body = base.map(|c| Ok::<Bytes, Infallible>(Bytes::from(ndjson_line(&c))));
+        let body = base.map(|item| {
+            Ok::<Bytes, Infallible>(Bytes::from(match item {
+                Out::Chunk(c) => ndjson_line(&c),
+                Out::Error(e) => {
+                    let mut s = json!({"error": e}).to_string();
+                    s.push('\n');
+                    s.into_bytes()
+                }
+            }))
+        });
         return Response::builder()
             .header("content-type", "application/x-ndjson")
             .header("cache-control", "no-cache")
@@ -525,9 +598,10 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
             .unwrap();
     }
 
-    let chunks = result_stream(&st, &args, &request_id, false)
-        .collect::<Vec<_>>()
-        .await;
+    let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
+        Ok(chunks) => chunks,
+        Err(e) => return error(500, &e, "server_error"),
+    };
     let mut outputs: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for c in &chunks {
         outputs

@@ -104,6 +104,13 @@ class _FrontendStream:
         self._detoks.pop(front_rid, None)
         self._mbox.send("frontend", msgpack.packb({"t": "done", "rid": front_rid}))
 
+    def error(self, front_rid, msg: str) -> None:
+        """Terminal backend failure — the frontend surfaces it as an HTTP 500
+        (non-streaming) or an SSE/NDJSON error event (streaming)."""
+        self._detoks.pop(front_rid, None)
+        self._mbox.send("frontend", msgpack.packb(
+            {"t": "err", "rid": front_rid, "msg": str(msg)}))
+
 from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
 from .driver import Driver
@@ -323,6 +330,7 @@ class Conductor:
         self.on_token = None      # callable(front_rid, value)
         self.on_emit = None       # callable(front_rid, modality, value) — multimodal frontend
         self.on_done = None       # callable(front_rid)
+        self.on_error = None      # callable(front_rid, msg) — terminal failure
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
         self._stop = threading.Event()  # graceful shutdown for serve_frontend
 
@@ -398,21 +406,47 @@ class Conductor:
             self._inflight -= 1
         elif t == "submit":
             self._ingest_submit(msg)
+        elif t == "abort":
+            self._abort_front(msg["rid"])
+
+    def _abort_front(self, front_rid) -> None:
+        """The frontend gave up on a request (client disconnect / timeout):
+        release its engine + runtime state. Idempotent — an already-finished
+        request is a no-op (mstar's abort_request)."""
+        rid = next((r for r, f in self._front_rid.items() if f == front_rid), None)
+        if rid is None:
+            return
+        self._front_rid.pop(rid, None)  # no done/err back; the frontend is gone
+        try:
+            self.runtime.finish_request(rid)
+        except Exception:
+            pass  # in-flight batches for it complete as no-ops
+        self._finish_request(rid)
+        self.results.pop(rid, None)
 
     def _ingest_submit(self, msg: dict) -> None:
         """A frontend submitted a flattened request (text + media file paths +
         in/out modalities + model_kwargs, mirroring mstar's PreprocessInput):
         start it, and remember the frontend's request id so emissions stream
         back. The policy tokenizes the text (and loads any media) when it builds
-        the initial walks."""
-        rid = self.submit({
+        the initial walks. Ingest failures (bad media, empty prompt) go back as
+        a terminal error instead of killing the serve loop."""
+        try:
+            rid = self._do_submit(msg)
+        except Exception as e:  # noqa: BLE001 — any ingest failure fails ONE request
+            if self.on_error is not None:
+                self.on_error(msg["rid"], repr(e))
+            return
+        self._front_rid[rid] = msg["rid"]
+
+    def _do_submit(self, msg: dict) -> int:
+        return self.submit({
             "text": msg.get("text"),
             "file_paths": msg.get("file_paths") or {},
             "input_modalities": list(msg.get("input_modalities") or []),
             "output_modalities": list(msg.get("output_modalities") or ["text"]),
             "model_kwargs": dict(msg.get("model_kwargs") or {}),
         })
-        self._front_rid[rid] = msg["rid"]
 
     def run_until_idle(self) -> dict[int, list[Any]]:
         """Drive until no request has work left (used by the batch demo)."""
@@ -484,6 +518,11 @@ class Conductor:
         for rid in msg.get("rids", []):
             rid = int(rid)
             self.errors[rid] = detail
+            # Frontend-streamed request: surface the failure as a terminal
+            # error (HTTP 500 / SSE error event), not a clean `done`.
+            front = self._front_rid.pop(rid, None)
+            if front is not None and self.on_error is not None:
+                self.on_error(front, detail)
             try:
                 self.runtime.finish_request(rid)
             except Exception:
@@ -584,6 +623,7 @@ class Conductor:
         stream = _FrontendStream(self.mbox, self.policy.tokenizer)
         self.on_emit = stream.emit
         self.on_done = stream.done
+        self.on_error = stream.error
         # Short poll timeout bounds shutdown latency: after stop() the loop
         # returns from the blocking recv within this window and exits, so the
         # thread is joinable before interpreter teardown (a daemon thread stuck
@@ -915,10 +955,14 @@ class DisaggCoordinator:
                     # Stream to the frontend (worker already postprocessed);
                     # don't accumulate server-side.
                     self._stream.emit(self._front_rid[gid], msg.get("modality", ""), value)
-                else:
+                elif gid in self.results:
                     self.results[gid].append(value)
+                # else: late emission for an aborted request — drop it
             elif t == "partition_done":
                 gid = int(msg["gid"])
+                if gid not in self._pending:
+                    raw = self.mbox.try_recv()
+                    continue  # late report for an aborted request
                 self._pending[gid].discard(msg["partition"])
                 if not self._pending[gid]:
                     self.finished.add(gid)
@@ -934,15 +978,34 @@ class DisaggCoordinator:
                         self.results.pop(gid, None)  # streamed already
             elif t == "submit":
                 # A frontend submitted a flattened request (same wire shape the
-                # centralized Conductor ingests).
-                gid = self.submit({
-                    "text": msg.get("text"),
-                    "file_paths": msg.get("file_paths") or {},
-                    "input_modalities": list(msg.get("input_modalities") or []),
-                    "output_modalities": list(msg.get("output_modalities") or ["text"]),
-                    "model_kwargs": dict(msg.get("model_kwargs") or {}),
-                })
-                self._front_rid[gid] = msg["rid"]
+                # centralized Conductor ingests). Ingest failures fail ONE
+                # request instead of killing the serve loop.
+                try:
+                    gid = self.submit({
+                        "text": msg.get("text"),
+                        "file_paths": msg.get("file_paths") or {},
+                        "input_modalities": list(msg.get("input_modalities") or []),
+                        "output_modalities": list(msg.get("output_modalities") or ["text"]),
+                        "model_kwargs": dict(msg.get("model_kwargs") or {}),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    if self._stream is not None:
+                        self._stream.error(msg["rid"], repr(e))
+                else:
+                    self._front_rid[gid] = msg["rid"]
+            elif t == "abort":
+                # Frontend gave up (disconnect/timeout): finish the request on
+                # every leader (they forward to TP followers) — idempotent.
+                front = msg["rid"]
+                gid = next((g for g, f in self._front_rid.items() if f == front), None)
+                if gid is not None:
+                    self._front_rid.pop(gid, None)
+                    self._pending.pop(gid, None)
+                    self.results.pop(gid, None)
+                    self.finished.add(gid)
+                    fin = msgpack.packb({"t": "finish", "gid": gid})
+                    for worker in {ws[0] for ws in self.partition_to_workers.values()}:
+                        self.mbox.send(worker, fin)
             raw = self.mbox.try_recv()
 
     def run_until_idle(self) -> dict[int, list[Any]]:
