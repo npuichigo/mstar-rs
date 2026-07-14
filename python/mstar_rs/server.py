@@ -1,33 +1,20 @@
-"""HTTP serving surface for the multi-process runtime — the **dev path** (T5).
+"""The serving drive-loop: `ServingEngine`.
 
-A FastAPI app co-located with the conductor. HTTP requests are enqueued;
-a single **background drive thread** owns the `Conductor` (and thus the Rust
-`Runtime` — all runtime access stays on one thread, as PyO3 requires) and
-loops `conductor.poll()`, which continuously-batches across every in-flight
-request and dispatches to the worker processes. When a request completes,
-its future is resolved and the HTTP handler returns.
+`ServingEngine` owns a **background drive thread** that holds the `Conductor`
+(and thus the Rust `Runtime` — all runtime access stays on one thread, as PyO3
+requires) and loops `conductor.poll()`, continuously-batching across every
+in-flight request. Callers submit and block for the result. It's the reusable
+request-driver, independent of any HTTP layer: `verify_serve_local.py` drives an
+in-process `Driver` through it with no server at all.
 
-This is one of two front-ends; they are complementary, not redundant:
-
-  * **T5 (this file)** — FastAPI co-located with the conductor. Simplest to
-    run (one process, no extra hop); right for dev / low concurrency. HTTP,
-    tokenization, detokenization and JSON/SSE all run in Python under the GIL.
-  * **T6 (`crates/mstar-server`, axum)** — the *scale* path, for **high
-    concurrency**. Under many concurrent requests a Python FastAPI/uvicorn
-    front-end saturates on the GIL — per-request tokenize + per-token
-    detokenize + JSON/SSE serialize all contend for one interpreter lock —
-    which is exactly why **both vLLM and SGLang moved their front-ends to
-    Rust**. T6 does the same: HTTP + tokenize + detokenize + SSE in Rust
-    (off the GIL), talking to the same Python conductor over the ZmqCommunicator. It
-    does NOT replace the conductor (which must stay Python — it runs the model
-    policy); the conductor is per-forward-pass and GPU-bound, not the
-    concurrency bottleneck. The extra process/hop buys GIL-free request
-    handling that scales with concurrent connections.
-
-Relation to mstar: mstar's front-end is 100% Python (FastAPI/uvicorn) and,
-notably, runs the api_server as a *separate process* from the conductor
-(ZMQ IPC) — so T5's co-location is a deliberate simplification, and T6's Rust
-front-end for GIL offload is a departure mstar has no precedent for.
+The production **HTTP surface is the Rust axum frontend** (`crates/mstar-server`),
+started together with the workers by `mstar_rs.launch`. The frontend runs HTTP +
+adapters + media + SSE off the GIL in its own process and talks to the Python
+conductor over the `mstar-comm` ZmqCommunicator (submit text/media, stream
+`ResultChunk`s back) — the same split vLLM (`rust/vllm-server`) and SGLang
+(`sgl-router`) use. This module carries no HTTP server of its own; the earlier
+in-process FastAPI dev-path was removed once the axum frontend + launcher
+covered the whole surface.
 """
 
 from __future__ import annotations
@@ -104,38 +91,3 @@ class ServingEngine:
                 self._results[rid] = self.cond.results.pop(rid, [])
                 if (ev := self._futures.pop(rid, None)) is not None:
                     ev.set()
-
-
-def build_app(engine: ServingEngine):
-    """A minimal FastAPI app over the serving engine (call `engine.start()`
-    before serving). The default handler passes the JSON body straight to
-    the model and returns the postprocessed result; swap the marshalling for
-    a model's real request/response schema."""
-    from fastapi import FastAPI
-
-    app = FastAPI(title="mstar-rs")
-
-    @app.get("/health")
-    def health() -> dict:
-        return {"status": "ok", "inflight": engine.cond._inflight}
-
-    @app.post("/generate")
-    async def generate(body: dict) -> dict:
-        # Run the blocking submit in a threadpool so the event loop stays free.
-        import anyio
-
-        result = await anyio.to_thread.run_sync(engine.submit, body)
-        return {"result": [_jsonable(x) for x in result]}
-
-    return app
-
-
-def _jsonable(x: Any) -> Any:
-    try:
-        import torch
-
-        if isinstance(x, torch.Tensor):
-            return x.tolist()
-    except ImportError:
-        pass
-    return x
