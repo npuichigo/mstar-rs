@@ -40,6 +40,28 @@ def _dbg(who: str, msg: str) -> None:
     if _DISAGG_DEBUG:
         print(f"[{who}] {msg}", flush=True)
 
+
+class _IncrementalDetok:
+    """Decode a stream of text token ids into cleanly-splittable pieces.
+
+    mstar detokenizes in the data-worker; the Rust frontend carries no
+    tokenizer, so the conductor detokenizes at the frontend seam. Decoding the
+    whole prefix each step (then emitting the new suffix) keeps multi-token
+    characters and BPE merges intact — a partial code point never ships as a
+    broken UTF-8 fragment."""
+
+    def __init__(self, tokenizer) -> None:
+        self._tok = tokenizer
+        self._ids: list[int] = []
+        self._text = ""
+
+    def step(self, token_id: int) -> str:
+        self._ids.append(token_id)
+        full = self._tok.decode(self._ids, skip_special_tokens=True)
+        piece = full[len(self._text):]
+        self._text = full
+        return piece
+
 from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
 from .driver import Driver
@@ -251,6 +273,7 @@ class Conductor:
         # Serving hooks (set by a frontend bridge): stream each emission and
         # signal completion, keyed by the *frontend's* request id.
         self.on_token = None      # callable(front_rid, value)
+        self.on_emit = None       # callable(front_rid, modality, value) — multimodal frontend
         self.on_done = None       # callable(front_rid)
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
         self._stop = threading.Event()  # graceful shutdown for serve_frontend
@@ -322,9 +345,18 @@ class Conductor:
             self._ingest_submit(msg)
 
     def _ingest_submit(self, msg: dict) -> None:
-        """A frontend submitted token-ids: start a request, and remember the
-        frontend's request id so emissions can be streamed back to it."""
-        rid = self.submit({"tokens": list(msg["tokens"]), "max_tokens": msg["max_tokens"]})
+        """A frontend submitted a flattened request (text + media file paths +
+        in/out modalities + model_kwargs, mirroring mstar's PreprocessInput):
+        start it, and remember the frontend's request id so emissions stream
+        back. The policy tokenizes the text (and loads any media) when it builds
+        the initial walks."""
+        rid = self.submit({
+            "text": msg.get("text"),
+            "file_paths": msg.get("file_paths") or {},
+            "input_modalities": list(msg.get("input_modalities") or []),
+            "output_modalities": list(msg.get("output_modalities") or ["text"]),
+            "model_kwargs": dict(msg.get("model_kwargs") or {}),
+        })
         self._front_rid[rid] = msg["rid"]
 
     def run_until_idle(self) -> dict[int, list[Any]]:
@@ -409,9 +441,15 @@ class Conductor:
             tensors = [self.shm.read(self.desc[uuid]) for (uuid, _d, _t) in event["tensors"]]
             value = self.policy.postprocess(event["name"], event["modality"], tensors)
             self.results[rid].append(value)
-            # Stream this emission to the frontend, if one is attached.
-            if self.on_token is not None and rid in self._front_rid:
-                self.on_token(self._front_rid[rid], value)
+            # Stream this emission to the frontend, if one is attached. A
+            # multimodal frontend (on_emit) gets the modality so it can build a
+            # ResultChunk; the legacy token-only hook (on_token) still works.
+            if rid in self._front_rid:
+                front = self._front_rid[rid]
+                if self.on_emit is not None:
+                    self.on_emit(front, event["modality"], value)
+                elif self.on_token is not None:
+                    self.on_token(front, value)
         elif event["type"] == "free":
             # Per-tensor reclaim: free SHM for tensors the runtime reports
             # unreachable. Emitted after this batch's emission/walk_done events,
@@ -436,8 +474,8 @@ class Conductor:
     def _finish_request(self, rid: int) -> None:
         """A request completed (or failed): reclaim its SHM + descriptors, then
         do path-appropriate bookkeeping. A frontend bridge already streamed the
-        output, so drop the server-side buffers and fire on_done; the FastAPI
-        path retains `results`/`finished` for the drive thread to consume."""
+        output, so drop the server-side buffers and fire on_done; otherwise
+        retain `results`/`finished` for a drive loop (ServingEngine) to consume."""
         self._reclaim(rid)
         front = self._front_rid.pop(rid, None)
         if self.on_done is not None:
@@ -445,7 +483,7 @@ class Conductor:
                 self.on_done(front)
             self.results.pop(rid, None)  # streamed already; don't accumulate
         else:
-            self.finished.add(rid)  # FastAPI drive thread consumes + pops
+            self.finished.add(rid)  # drive loop (ServingEngine) consumes + pops
 
     def _free_uuids(self, uuids) -> None:
         """Free SHM for a set of uuids: conductor-owned offsets locally,
@@ -478,18 +516,47 @@ class Conductor:
     def serve_frontend(self) -> None:
         """Run forever as a streaming backend for the Rust axum frontend.
 
-        The frontend sends `submit` messages (token-ids) on our inbox; we wire
-        each per-token emission and the request-complete signal back to it over
-        the same `ZmqCommunicator` mesh as msgpack. `submit`/`done`/`token` are the
+        The frontend sends `submit` messages (text + media file paths + in/out
+        modalities + model_kwargs) on our inbox; we wire each emission back as a
+        `ResultChunk` ({modality, data, metadata}) and signal completion, over
+        the same `ZmqCommunicator` mesh as msgpack. `submit`/`chunk`/`done` are the
         only messages that cross this seam — tensor bytes never do (those move
-        worker<->conductor through SHM)."""
-        self.on_token = lambda front_rid, value: self.mbox.send(
-            "frontend",
-            msgpack.packb({"t": "token", "rid": front_rid, "id": int(value)}),
-        )
-        self.on_done = lambda front_rid: self.mbox.send(
-            "frontend", msgpack.packb({"t": "done", "rid": front_rid})
-        )
+        worker<->conductor through SHM).
+
+        Text emissions (token ids) are detokenized here — mstar detokenizes in
+        the data-worker; the frontend carries no tokenizer — using an
+        incremental decoder per request so partial pieces stream cleanly. Audio
+        emissions are int16 PCM at the model rate; the frontend wraps them in a
+        WAV container."""
+        detoks: dict[int, _IncrementalDetok] = {}
+
+        def send_chunk(front_rid: int, modality: str, data: bytes) -> None:
+            self.mbox.send("frontend", msgpack.packb(
+                {"t": "chunk", "rid": front_rid, "modality": modality,
+                 "data": data, "metadata": {}}))
+
+        def on_emit(front_rid: int, modality: str, value) -> None:
+            if modality == "text":
+                detok = detoks.get(front_rid)
+                if detok is None:
+                    detok = detoks[front_rid] = _IncrementalDetok(self.policy.tokenizer)
+                piece = detok.step(int(value))
+                if piece:
+                    send_chunk(front_rid, "text", piece.encode("utf-8"))
+            elif modality == "audio":
+                import numpy as np
+                pcm = np.ascontiguousarray(value.numpy()).astype("<i2").tobytes()
+                send_chunk(front_rid, "audio", pcm)
+            else:
+                data = value if isinstance(value, (bytes, bytearray)) else bytes(value)
+                send_chunk(front_rid, modality, bytes(data))
+
+        def on_done(front_rid: int) -> None:
+            detoks.pop(front_rid, None)
+            self.mbox.send("frontend", msgpack.packb({"t": "done", "rid": front_rid}))
+
+        self.on_emit = on_emit
+        self.on_done = on_done
         # Short poll timeout bounds shutdown latency: after stop() the loop
         # returns from the blocking recv within this window and exits, so the
         # thread is joinable before interpreter teardown (a daemon thread stuck

@@ -1,252 +1,550 @@
 //! mstar-server: the Rust (axum) HTTP frontend — the "scale path".
 //!
-//! Moves the work that saturates a Python API server off the GIL: HTTP,
-//! **tokenization** (HF `tokenizers` crate — same `tokenizer.json`, no
-//! Python), and **per-token detokenization + SSE streaming**. This is
-//! exactly the layer vLLM and SGLang moved to Rust. The conductor stays
-//! Python (model policy, per-forward-pass, off the hot path); this frontend
-//! talks to it over the `mstar-comm` `ZmqCommunicator` (submit token-ids, receive a
-//! token-id stream) — see `bridge`.
+//! A faithful port of mstar's `api_server` HTTP surface to axum, moving the
+//! GIL-heavy edge work off Python: HTTP, JSON, base64, media file IO, and the
+//! SSE / WAV / NDJSON serialization of results. The endpoints are
+//! model-agnostic — each looks up the loaded model's adapter, checks the
+//! surface is supported, and translates to/from mstar's request path. Media
+//! preprocessing and the model itself stay in the Python data plane (the
+//! conductor + data-worker), reached over the `mstar-comm` bridge.
 //!
-//! Two token sources, selected at startup by whether a conductor socket dir
-//! is passed:
-//!   - **real** (socket dir given): submit token-ids to the Python conductor
-//!     over the ZmqCommunicator, stream the generated token-ids back (`sse_from_stream`).
-//!   - **mock** (no socket dir): a self-contained generator that echoes the
-//!     prompt tokens (`mockgen`) — proves the HTTP/tokenize/detok/SSE layer
-//!     standalone, no conductor needed.
-//! Either way, tokenization, incremental detokenization, and SSE
-//! serialization all happen in Rust, off the GIL.
+//! Endpoints (mirroring `api_server/openai/router.py` + `entrypoint.py`):
+//!   GET  /v1/models
+//!   POST /v1/chat/completions      (SSE stream or JSON; text/audio/image out)
+//!   POST /v1/audio/speech          (streaming WAV or full container)
+//!   POST /v1/images/generations
+//!   POST /v1/images/edits          (multipart)
+//!   POST /generate                 (native multipart -> NDJSON)
+//!   GET  /health
+//!
+//! Two result sources, selected at startup by whether a conductor socket dir is
+//! passed: **real** (bridge to the Python conductor) or **mock** (self-contained
+//! generator that proves the HTTP/adapter/media/streaming layer standalone).
 
+mod adapters;
 mod bridge;
-mod tokenizer;
+mod media;
+mod protocol;
+mod serving;
 
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
-    response::sse::{Event, KeepAlive, Sse},
+    body::{Body, Bytes},
+    extract::{Multipart, State},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use futures::StreamExt;
+use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
-use bridge::{Bridge, StreamItem};
-use tokenizer::{IncrementalDecoder, Tok};
-
-#[derive(Clone)]
-struct AppState {
-    tok: Arc<Tok>,
-    /// Present when a conductor socket dir is given: real streaming via the
-    /// ZmqCommunicator bridge. Absent: the self-contained mock generator.
-    bridge: Option<Arc<Bridge>>,
-}
+use adapters::{Adapter, SubmitArgs};
+use bridge::{Bridge, ResultChunk};
+use protocol::{ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest};
+use serving::{now, result_stream, rid, AppState};
 
 #[tokio::main]
 async fn main() {
-    let tokenizer_path = std::env::args()
+    let model_name = std::env::args()
         .nth(1)
-        .expect("usage: mstar-server <tokenizer.json> [port] [conductor_socket_dir]");
+        .expect("usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]");
     let port: u16 = std::env::args()
         .nth(2)
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
     let socket_dir = std::env::args().nth(3);
+    let upload_dir = PathBuf::from(
+        std::env::args()
+            .nth(4)
+            .unwrap_or_else(|| "/tmp/mstar_uploads".to_string()),
+    );
+    let sample_rate: u32 = std::env::var("MSTAR_SAMPLE_RATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24000);
+    let allow_remote = std::env::var("MSTAR_ALLOW_REMOTE").as_deref() == Ok("1");
 
-    eprintln!("loading tokenizer: {tokenizer_path}");
-    let tok = Arc::new(Tok::from_file(&tokenizer_path).expect("load tokenizer"));
-    eprintln!("tokenizer loaded ({} vocab)", tok.vocab_size());
     let bridge = socket_dir.map(|dir| {
         eprintln!("bridging to conductor at {dir}");
         Arc::new(Bridge::new(&dir).expect("bind bridge"))
     });
-    let state = AppState { tok, bridge };
+    if bridge.is_none() {
+        eprintln!("no conductor socket dir given — mock generator (HTTP/adapter/media layer only)");
+    }
+
+    let state = AppState {
+        model_name: model_name.clone(),
+        upload_dir,
+        allow_remote,
+        sample_rate,
+        bridge,
+    };
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/tokenize", post(tokenize))
-        .route("/detokenize", post(detokenize))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/audio/speech", post(audio_speech))
+        .route("/v1/images/generations", post(images_generations))
+        .route("/v1/images/edits", post(images_edits))
+        .route("/generate", post(generate))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    eprintln!("mstar-server (Rust frontend) on http://{addr}");
+    eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
+// ---- shared helpers -------------------------------------------------------
+
+enum Surface {
+    Chat,
+    Speech,
+    Images,
 }
 
-// ---- tokenize / detokenize (prove Rust tokenization off the GIL) ----
-
-#[derive(Deserialize)]
-struct TokenizeReq {
-    text: String,
+fn error(status: u16, message: &str, type_: &str) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        code,
+        Json(json!({"error": {"message": message, "type": type_, "code": status}})),
+    )
+        .into_response()
 }
 
-#[derive(Serialize)]
-struct TokenizeResp {
-    tokens: Vec<u32>,
-    count: usize,
+/// Resolve the loaded model's adapter and check it serves `surface`; otherwise
+/// an OpenAI-shaped error response (404), matching router.py `_resolve`.
+fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
+    let adapter = Adapter::from_model_name(&st.model_name).ok_or_else(|| {
+        error(
+            404,
+            &format!(
+                "Model {:?} has no OpenAI-compatible adapter; use POST /generate",
+                st.model_name
+            ),
+            "model_not_found",
+        )
+    })?;
+    let ok = match surface {
+        Surface::Chat => adapter.supports_chat(),
+        Surface::Speech => adapter.supports_speech(),
+        Surface::Images => adapter.supports_images(),
+    };
+    if !ok {
+        return Err(error(
+            404,
+            &format!("Model {:?} does not support this endpoint", st.model_name),
+            "invalid_request_error",
+        ));
+    }
+    Ok(adapter)
 }
 
-async fn tokenize(
-    State(st): State<AppState>,
-    Json(req): Json<TokenizeReq>,
-) -> Json<TokenizeResp> {
-    let tokens = st.tok.encode(&req.text);
-    Json(TokenizeResp {
-        count: tokens.len(),
-        tokens,
-    })
+// ---- GET /health, /v1/models ---------------------------------------------
+
+async fn health() -> Json<Value> {
+    Json(json!({"status": "healthy"}))
 }
 
-#[derive(Deserialize)]
-struct DetokenizeReq {
-    tokens: Vec<u32>,
+async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
+    Json(ModelList::new(vec![ModelCard::new(st.model_name, now())]))
 }
 
-async fn detokenize(
-    State(st): State<AppState>,
-    Json(req): Json<DetokenizeReq>,
-) -> Json<serde_json::Value> {
-    Json(json!({"text": st.tok.decode(&req.tokens)}))
-}
+// ---- POST /v1/chat/completions -------------------------------------------
 
-// ---- streaming chat completions (per-token SSE, incremental detok) ----
-
-#[derive(Deserialize)]
-struct ChatReq {
-    #[serde(default)]
-    messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: usize,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; we always stream
-    #[serde(default)]
-    stream: bool,
-}
-
-fn default_max_tokens() -> usize {
-    64
-}
-
-#[derive(Deserialize)]
-struct ChatMessage {
-    #[allow(dead_code)]
-    role: String,
-    content: String,
-}
-
-/// Stream generated tokens as OpenAI-style SSE `chat.completion.chunk`s. The
-/// token source here is a mock generator (echoes the prompt's tokens); the
-/// real path replaces it with a stream of token-ids arriving from the
-/// conductor over the ZmqCommunicator. Either way, tokenization, incremental
-/// detokenization, and SSE serialization all happen in Rust.
 async fn chat_completions(
     State(st): State<AppState>,
-    Json(req): Json<ChatReq>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let prompt: String = req
-        .messages
-        .last()
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    let prompt_ids = st.tok.encode(&prompt);
-
-    let stream: futures::future::Either<_, _> = match &st.bridge {
-        // Real path: submit token-ids to the conductor, stream the generated
-        // token-ids back, detokenize incrementally in Rust.
-        Some(b) => {
-            let (_rid, rx) = b.submit(prompt_ids, req.max_tokens as u32);
-            futures::future::Either::Left(sse_from_stream(st.tok.clone(), rx))
-        }
-        // Mock path: echo the prompt tokens (self-contained, no conductor).
-        None => {
-            let mut ids = prompt_ids;
-            ids.truncate(req.max_tokens);
-            futures::future::Either::Right(mockgen::sse_per_token(st.tok.clone(), ids))
-        }
+    Json(req): Json<ChatCompletionRequest>,
+) -> Response {
+    let adapter = match resolve(&st, Surface::Chat) {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    let args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
+        Ok(a) => a,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    let request_id = rid("chatcmpl");
+
+    if req.stream {
+        return chat_sse(st, args, request_id).into_response();
+    }
+    let chunks = result_stream(&st, &args, &request_id, false)
+        .collect::<Vec<_>>()
+        .await;
+    Json(build_chat_response(&st.model_name, &request_id, chunks, st.sample_rate)).into_response()
 }
 
-/// SSE from a live token-id stream (the bridge path): each token is
-/// detokenized incrementally (same `IncrementalDecoder` as the mock path) and
-/// emitted as a delta chunk; `Done` closes with a finish chunk + `[DONE]`.
-fn sse_from_stream(
-    tok: Arc<Tok>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<StreamItem>,
-) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-    enum Phase {
-        Stream,
-        Finish,
-        End,
+/// SSE `chat.completion.chunk`s: role delta, per-chunk deltas, finish, `[DONE]`.
+fn chat_sse(
+    st: AppState,
+    args: SubmitArgs,
+    request_id: String,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let created = now();
+    let model = st.model_name.clone();
+    let base = result_stream(&st, &args, &request_id, true);
+
+    let head = {
+        let s = chunk_json(&request_id, created, &model, json!({"role": "assistant"}), None);
+        futures::stream::once(async move { Ok(Event::default().data(s)) })
+    };
+    let body = {
+        let model = model.clone();
+        let id = request_id.clone();
+        base.map(move |c| {
+            Ok(Event::default().data(chunk_json(&id, created, &model, chat_delta(&c), None)))
+        })
+    };
+    let tail = {
+        let finish = chunk_json(&request_id, created, &model, json!({}), Some("stop"));
+        futures::stream::iter(vec![
+            Ok(Event::default().data(finish)),
+            Ok(Event::default().data("[DONE]")),
+        ])
+    };
+    Sse::new(head.chain(body).chain(tail)).keep_alive(KeepAlive::default())
+}
+
+/// One streaming chunk -> its OpenAI delta object.
+fn chat_delta(c: &ResultChunk) -> Value {
+    match c.modality.as_str() {
+        "text" => json!({"content": String::from_utf8_lossy(&c.data)}),
+        // Streaming audio deltas are base64 16-bit PCM at the model rate.
+        "audio" => json!({"audio": {"id": rid("audio"), "data": media::b64(&c.data)}}),
+        "image" => json!({"content": media::png_to_data_url(&c.data)}),
+        _ => json!({}),
     }
-    let init = (rx, IncrementalDecoder::new(tok), Phase::Stream);
-    futures::stream::unfold(init, |(mut rx, mut detok, phase)| async move {
-        match phase {
-            Phase::Stream => match rx.recv().await {
-                Some(StreamItem::Token(id)) => {
-                    let piece = detok.step(id).unwrap_or_default();
-                    let chunk = json!({
-                        "object": "chat.completion.chunk",
-                        "choices": [{"delta": {"content": piece}, "index": 0, "finish_reason": null}],
-                    });
-                    let ev = Ok(Event::default().data(chunk.to_string()));
-                    Some((ev, (rx, detok, Phase::Stream)))
-                }
-                _ => {
-                    let done = json!({
-                        "object": "chat.completion.chunk",
-                        "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-                    });
-                    let ev = Ok(Event::default().data(done.to_string()));
-                    Some((ev, (rx, detok, Phase::Finish)))
-                }
-            },
-            Phase::Finish => {
-                let ev = Ok(Event::default().data("[DONE]"));
-                Some((ev, (rx, detok, Phase::End)))
-            }
-            Phase::End => None,
+}
+
+fn chunk_json(id: &str, created: i64, model: &str, delta: Value, finish: Option<&str>) -> String {
+    json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    })
+    .to_string()
+}
+
+/// Non-streaming chat: text into `content`, audio into `message.audio` (b64
+/// WAV), images into `image_url` data-URL content parts (matching serving_chat).
+fn build_chat_response(
+    model: &str,
+    request_id: &str,
+    chunks: Vec<ResultChunk>,
+    sample_rate: u32,
+) -> Value {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut audio_pcm: Vec<u8> = Vec::new();
+    let mut images: Vec<Vec<u8>> = Vec::new();
+    for c in &chunks {
+        match c.modality.as_str() {
+            "text" => text_parts.push(String::from_utf8_lossy(&c.data).into_owned()),
+            "audio" => audio_pcm.extend_from_slice(&c.data),
+            "image" => images.push(c.data.clone()),
+            _ => {}
         }
+    }
+    let text = text_parts.concat();
+    let mut message = json!({"role": "assistant", "content": text.clone()});
+
+    if !audio_pcm.is_empty() {
+        let wav = media::pcm16_to_wav_bytes(&audio_pcm, sample_rate, 1);
+        message["audio"] = json!({
+            "id": rid("audio"),
+            "data": media::b64(&wav),
+            "expires_at": now() + 86400,
+            "transcript": text.clone(),
+        });
+    }
+    if !images.is_empty() {
+        let mut parts: Vec<Value> = Vec::new();
+        if !text.is_empty() {
+            parts.push(json!({"type": "text", "text": text}));
+        }
+        for img in &images {
+            parts.push(json!({"type": "image_url", "image_url": {"url": media::png_to_data_url(img)}}));
+        }
+        message["content"] = Value::Array(parts);
+    }
+
+    json!({
+        "id": request_id,
+        "object": "chat.completion",
+        "created": now(),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     })
 }
 
-/// Mock token source: build the per-token SSE events eagerly and replay them
-/// as a stream. Used when no conductor is attached — the real path
-/// (`sse_from_stream`) produces the same SSE from token-ids arriving over the
-/// ZmqCommunicator; only the token *source* differs (tokenization, incremental
-/// detokenization, and SSE serialization stay identical, all Rust off the GIL).
-mod mockgen {
-    use super::*;
-    use futures::stream;
+// ---- POST /v1/audio/speech -----------------------------------------------
 
-    pub fn sse_per_token(
-        tok: Arc<Tok>,
-        ids: Vec<u32>,
-    ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
-        let mut detok = IncrementalDecoder::new(tok);
-        let mut events: Vec<Result<Event, std::convert::Infallible>> = Vec::new();
-        for id in ids {
-            if let Some(piece) = detok.step(id) {
-                let chunk = json!({
-                    "object": "chat.completion.chunk",
-                    "choices": [{"delta": {"content": piece}, "index": 0, "finish_reason": null}],
-                });
-                events.push(Ok(Event::default().data(chunk.to_string())));
+async fn audio_speech(State(st): State<AppState>, Json(req): Json<SpeechRequest>) -> Response {
+    let adapter = match resolve(&st, Surface::Speech) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let args = match adapter.speech_to_request(&req) {
+        Ok(a) => a,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    let request_id = rid("speech");
+    let fmt = req.response_format.to_ascii_lowercase();
+
+    if req.stream {
+        // Open-ended WAV: streaming header, then PCM16 frames as they arrive.
+        let header = media::wav_stream_header(st.sample_rate, 1);
+        let base = result_stream(&st, &args, &request_id, true);
+        let audio_only = base.filter_map(|c| async move {
+            if c.modality == "audio" && !c.data.is_empty() {
+                Some(Ok::<Bytes, Infallible>(Bytes::from(c.data)))
+            } else {
+                None
+            }
+        });
+        let body = futures::stream::once(async move { Ok::<Bytes, Infallible>(Bytes::from(header)) })
+            .chain(audio_only);
+        return Response::builder()
+            .header("content-type", "audio/wav")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(body))
+            .unwrap();
+    }
+
+    let chunks = result_stream(&st, &args, &request_id, false)
+        .collect::<Vec<_>>()
+        .await;
+    let mut pcm: Vec<u8> = Vec::new();
+    for c in &chunks {
+        if c.modality == "audio" {
+            pcm.extend_from_slice(&c.data);
+        }
+    }
+    let (bytes, mime) = media::pcm16_to_container(&pcm, st.sample_rate, &fmt);
+    Response::builder()
+        .header("content-type", mime)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+
+// ---- POST /v1/images/generations, /v1/images/edits -----------------------
+
+async fn images_generations(
+    State(st): State<AppState>,
+    Json(req): Json<ImageGenerationRequest>,
+) -> Response {
+    let adapter = match resolve(&st, Surface::Images) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let args = match adapter.image_to_request(&req) {
+        Ok(a) => a,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    let request_id = rid("img");
+    let chunks = result_stream(&st, &args, &request_id, false)
+        .collect::<Vec<_>>()
+        .await;
+    Json(images_response(chunks)).into_response()
+}
+
+async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
+    let adapter = match resolve(&st, Surface::Images) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    // Multipart (image file + prompt + passthrough fields), parsed manually so
+    // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
+    let known = ["image", "prompt", "model", "n", "size", "response_format"];
+    let mut image_bytes: Option<Vec<u8>> = None;
+    let mut image_filename: Option<String> = None;
+    let mut prompt = String::new();
+    let mut extra: Map<String, Value> = Map::new();
+
+    while let Ok(Some(field)) = mp.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        let has_file = field.file_name().is_some();
+        if name == "image" {
+            image_filename = field.file_name().map(str::to_string);
+            image_bytes = field.bytes().await.ok().map(|b| b.to_vec());
+        } else if name == "prompt" {
+            prompt = field.text().await.unwrap_or_default();
+        } else if known.contains(&name.as_str()) || has_file {
+            let _ = field.bytes().await; // consume + discard
+        } else {
+            let v = field.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
+            extra.insert(name, parsed);
+        }
+    }
+
+    let image_bytes = match image_bytes {
+        Some(b) if !b.is_empty() => b,
+        _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
+    };
+    // Persist the uploaded image so the data-worker's loader can read it by path.
+    if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+        return error(500, &e.to_string(), "server_error");
+    }
+    let ext = image_filename
+        .as_deref()
+        .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
+        .unwrap_or_else(|| ".png".to_string());
+    let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
+    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
+        return error(500, &e.to_string(), "server_error");
+    }
+
+    let args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
+        Ok(a) => a,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
+    let request_id = rid("img");
+    let chunks = result_stream(&st, &args, &request_id, false)
+        .collect::<Vec<_>>()
+        .await;
+    Json(images_response(chunks)).into_response()
+}
+
+fn images_response(chunks: Vec<ResultChunk>) -> Value {
+    let data: Vec<Value> = chunks
+        .iter()
+        .filter(|c| c.modality == "image")
+        .map(|c| json!({"b64_json": media::b64(&c.data), "url": Value::Null}))
+        .collect();
+    json!({"created": now(), "data": data})
+}
+
+// ---- POST /generate (native multipart -> NDJSON) -------------------------
+
+async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
+    let mut text: Option<String> = None;
+    let mut in_mods_raw: Option<String> = None;
+    let mut out_mods_raw = "text".to_string();
+    let mut streaming = true;
+    let mut mk_raw: Option<String> = None;
+    let mut request_id: Option<String> = None;
+    let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    while let Ok(Some(field)) = mp.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "files" {
+            let filename = field.file_name().unwrap_or("").to_string();
+            let modality = media::modality_from_filename(&filename);
+            if modality == "unknown" {
+                return error(400, &format!("Cannot determine modality for file: {filename}"), "invalid_request_error");
+            }
+            let bytes = match field.bytes().await {
+                Ok(b) => b,
+                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+            };
+            if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
+                return error(500, &e.to_string(), "server_error");
+            }
+            let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), filename));
+            if let Err(e) = std::fs::write(&save_path, &bytes) {
+                return error(500, &e.to_string(), "server_error");
+            }
+            file_paths
+                .entry(modality.to_string())
+                .or_default()
+                .push(save_path.to_string_lossy().into_owned());
+        } else {
+            let val = field.text().await.unwrap_or_default();
+            match name.as_str() {
+                "text" => text = Some(val),
+                "input_modalities" => in_mods_raw = Some(val),
+                "output_modalities" => out_mods_raw = val,
+                "streaming" => streaming = matches!(val.as_str(), "true" | "True" | "1"),
+                "model_kwargs" => mk_raw = Some(val),
+                "request_id" => request_id = Some(val),
+                _ => {}
             }
         }
-        let done = json!({
-            "object": "chat.completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-        });
-        events.push(Ok(Event::default().data(done.to_string())));
-        events.push(Ok(Event::default().data("[DONE]")));
-        stream::iter(events)
     }
+
+    let output_modalities: Vec<String> = out_mods_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let input_modalities: Vec<String> = match in_mods_raw {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => {
+            let mut m: Vec<String> = file_paths.keys().cloned().collect();
+            if text.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+                m.push("text".to_string());
+            }
+            m
+        }
+    };
+    let model_kwargs: Map<String, Value> = match mk_raw {
+        Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Object(m)) => m,
+            Ok(_) => return error(400, "model_kwargs must be a JSON object", "invalid_request_error"),
+            Err(e) => return error(400, &format!("model_kwargs JSON: {e}"), "invalid_request_error"),
+        },
+        _ => Map::new(),
+    };
+    let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let args = SubmitArgs {
+        text,
+        file_paths,
+        input_modalities,
+        output_modalities,
+        model_kwargs,
+    };
+
+    if streaming {
+        let base = result_stream(&st, &args, &request_id, true);
+        let body = base.map(|c| Ok::<Bytes, Infallible>(Bytes::from(ndjson_line(&c))));
+        return Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(body))
+            .unwrap();
+    }
+
+    let chunks = result_stream(&st, &args, &request_id, false)
+        .collect::<Vec<_>>()
+        .await;
+    let mut outputs: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for c in &chunks {
+        outputs
+            .entry(c.modality.clone())
+            .or_default()
+            .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
+    }
+    Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+}
+
+fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
+    let mut s = json!({
+        "modality": c.modality,
+        "data": media::b64(&c.data),
+        "metadata": c.metadata,
+    })
+    .to_string();
+    s.push('\n');
+    s.into_bytes()
 }

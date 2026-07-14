@@ -31,6 +31,13 @@ class EchoPolicy(ModelPolicy):
     """Control plane: graph, walk seeding, continuation, postprocess. No
     weights — this is what the conductor holds."""
 
+    def __init__(self, tokenizer=None) -> None:
+        # Optional so the conductor can turn a `text` submit into token-ids to
+        # echo (the multimodal bridge sends text, not tokens), and so the same
+        # tokenizer detokenizes the echoed ids back at the frontend seam. When
+        # absent, the legacy `tokens` request field is used directly.
+        self.tokenizer = tokenizer
+
     def walks(self) -> dict[str, Any]:
         return {
             # One decode step: emit the head token to the client, persist the
@@ -48,7 +55,12 @@ class EchoPolicy(ModelPolicy):
         }
 
     def initial_inputs(self, request: dict[str, Any]) -> tuple[str, WalkInputs]:
-        tokens = list(request["tokens"])[: request.get("max_tokens", len(request["tokens"]))]
+        tok = getattr(self, "tokenizer", None)
+        if request.get("text") is not None and tok is not None:
+            tokens = list(tok(request["text"], return_tensors="pt")["input_ids"][0].tolist())
+        else:
+            tokens = list(request.get("tokens", []))
+        tokens = tokens[: request.get("max_tokens", len(tokens))]
         if not tokens:
             # An empty prompt (or max_tokens=0) has nothing to echo; the gen
             # walk always emits one token, so guard here instead of emitting an
