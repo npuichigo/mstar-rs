@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Any
 
 import msgpack
@@ -61,6 +62,47 @@ class _IncrementalDetok:
         piece = full[len(self._text):]
         self._text = full
         return piece
+
+
+class _FrontendStream:
+    """Encode postprocessed emissions as frontend `ResultChunk`s and ship them.
+
+    The seam both serving backends share (centralized `Conductor` and
+    decentralized `DisaggCoordinator`): text emissions (token ids) are
+    detokenized here with an incremental decoder per request — mstar
+    detokenizes in the data-worker; the Rust frontend carries no tokenizer —
+    audio emissions ship as int16 PCM at the model rate (the frontend wraps
+    them in a WAV container), anything else as raw bytes."""
+
+    def __init__(self, mbox, tokenizer) -> None:
+        self._mbox = mbox
+        self._tokenizer = tokenizer
+        self._detoks: dict[Any, _IncrementalDetok] = {}
+
+    def _send(self, front_rid, modality: str, data: bytes) -> None:
+        self._mbox.send("frontend", msgpack.packb(
+            {"t": "chunk", "rid": front_rid, "modality": modality,
+             "data": data, "metadata": {}}))
+
+    def emit(self, front_rid, modality: str, value) -> None:
+        if modality == "text":
+            detok = self._detoks.get(front_rid)
+            if detok is None:
+                detok = self._detoks[front_rid] = _IncrementalDetok(self._tokenizer)
+            piece = detok.step(int(value))
+            if piece:
+                self._send(front_rid, "text", piece.encode("utf-8"))
+        elif modality == "audio":
+            import numpy as np
+            pcm = np.ascontiguousarray(value.numpy()).astype("<i2").tobytes()
+            self._send(front_rid, "audio", pcm)
+        else:
+            data = value if isinstance(value, (bytes, bytearray)) else bytes(value)
+            self._send(front_rid, modality, bytes(data))
+
+    def done(self, front_rid) -> None:
+        self._detoks.pop(front_rid, None)
+        self._mbox.send("frontend", msgpack.packb({"t": "done", "rid": front_rid}))
 
 from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
 
@@ -159,6 +201,12 @@ class Worker:
                 return
             if t == "execute":
                 self._handle_execute(msg)
+            elif t == "register":
+                # Per-request engine config (arrives before the rid's first
+                # execute — the conductor sends it at ingest, ordered per peer).
+                self.engine.register_request(int(msg["rid"]), dict(msg["kwargs"]))
+            elif t == "release":
+                self.engine.release_request(int(msg["rid"]))
             elif t == "free":
                 # Conductor reclaims a finished request's tensors: release our
                 # arena offsets (all were read/cloned by the conductor already).
@@ -285,6 +333,13 @@ class Conductor:
         request = dict(request, request_id=rid)
         self.results[rid] = []
         self._req_uuids[rid] = []
+        # Per-request engine config (sampling knobs, voice, seed) to every
+        # worker BEFORE any execute can be dispatched for this rid (the mbox is
+        # ordered per peer) — mstar's model_kwargs-at-ingest, worker side.
+        if mk := request.get("model_kwargs"):
+            reg = msgpack.packb({"t": "register", "rid": rid, "kwargs": dict(mk)})
+            for worker in {w for ws in self.node_to_workers.values() for w in ws}:
+                self.mbox.send(worker, reg)
         for nxt in self.policy.initial_walks(request):
             self._start_walk(rid, nxt)
         return rid
@@ -477,6 +532,10 @@ class Conductor:
         output, so drop the server-side buffers and fire on_done; otherwise
         retain `results`/`finished` for a drive loop (ServingEngine) to consume."""
         self._reclaim(rid)
+        # Free per-request engine state (sampler slots, voice) on every worker.
+        rel = msgpack.packb({"t": "release", "rid": rid})
+        for worker in {w for ws in self.node_to_workers.values() for w in ws}:
+            self.mbox.send(worker, rel)
         front = self._front_rid.pop(rid, None)
         if self.on_done is not None:
             if front is not None:
@@ -521,42 +580,10 @@ class Conductor:
         `ResultChunk` ({modality, data, metadata}) and signal completion, over
         the same `ZmqCommunicator` mesh as msgpack. `submit`/`chunk`/`done` are the
         only messages that cross this seam — tensor bytes never do (those move
-        worker<->conductor through SHM).
-
-        Text emissions (token ids) are detokenized here — mstar detokenizes in
-        the data-worker; the frontend carries no tokenizer — using an
-        incremental decoder per request so partial pieces stream cleanly. Audio
-        emissions are int16 PCM at the model rate; the frontend wraps them in a
-        WAV container."""
-        detoks: dict[int, _IncrementalDetok] = {}
-
-        def send_chunk(front_rid: int, modality: str, data: bytes) -> None:
-            self.mbox.send("frontend", msgpack.packb(
-                {"t": "chunk", "rid": front_rid, "modality": modality,
-                 "data": data, "metadata": {}}))
-
-        def on_emit(front_rid: int, modality: str, value) -> None:
-            if modality == "text":
-                detok = detoks.get(front_rid)
-                if detok is None:
-                    detok = detoks[front_rid] = _IncrementalDetok(self.policy.tokenizer)
-                piece = detok.step(int(value))
-                if piece:
-                    send_chunk(front_rid, "text", piece.encode("utf-8"))
-            elif modality == "audio":
-                import numpy as np
-                pcm = np.ascontiguousarray(value.numpy()).astype("<i2").tobytes()
-                send_chunk(front_rid, "audio", pcm)
-            else:
-                data = value if isinstance(value, (bytes, bytearray)) else bytes(value)
-                send_chunk(front_rid, modality, bytes(data))
-
-        def on_done(front_rid: int) -> None:
-            detoks.pop(front_rid, None)
-            self.mbox.send("frontend", msgpack.packb({"t": "done", "rid": front_rid}))
-
-        self.on_emit = on_emit
-        self.on_done = on_done
+        worker<->conductor through SHM)."""
+        stream = _FrontendStream(self.mbox, self.policy.tokenizer)
+        self.on_emit = stream.emit
+        self.on_done = stream.done
         # Short poll timeout bounds shutdown latency: after stop() the loop
         # returns from the blocking recv within this window and exits, so the
         # thread is joinable before interpreter teardown (a daemon thread stuck
@@ -602,12 +629,35 @@ class DisaggWorker:
     loop; ships stream outputs to peer workers; injects peer chunks locally."""
 
     def __init__(self, worker_id, engine, local_partitions, partition_to_worker,
-                 socket_dir, device: str = "cpu", io_leader: bool = True) -> None:
+                 socket_dir, device: str = "cpu", io_leader: bool = True,
+                 coordinator_id: str = "coordinator",
+                 tp_nodes: list | None = None,
+                 tp_followers: list | None = None,
+                 tp_follow_nodes: list | None = None) -> None:
         self.worker_id = worker_id
-        self.driver = Driver(engine, local_partitions=local_partitions)
+        # Tensor-parallel batch coordination (mstar's ScheduleTPNode):
+        #   leader rank:   tp_nodes = the TP nodes it initiates; tp_followers =
+        #                  the follower worker ids to ship each batch decision to
+        #                  (BEFORE executing), so every rank runs identical
+        #                  batches in identical order under concurrency.
+        #   follower rank: tp_follow_nodes = nodes it never self-initiates; it
+        #                  replays the leader's shipped decisions instead.
+        self.tp_nodes = set(tp_nodes or [])
+        self.tp_followers = list(tp_followers or [])
+        self.driver = Driver(engine, local_partitions=local_partitions,
+                             tp_follow_nodes=tp_follow_nodes)
+        if self.tp_nodes and self.tp_followers:
+            self.driver.on_batch = self._broadcast_batch
+        # follower: leader decisions whose gids aren't all mapped locally yet
+        # (the tp_sched can overtake the seed — different senders).
+        self._tp_pending: list[tuple] = []
         self.mbox = ZmqCommunicator(worker_id, socket_dir)
         self.shm = ShmPool(worker_id)
         self.partition_to_worker = partition_to_worker
+        # Where emissions/partition-done go. "coordinator" for the standalone
+        # DisaggCoordinator; the serving launcher binds the coordinator as
+        # "conductor" so the Rust frontend's submits land in the same inbox.
+        self.coordinator_id = coordinator_id
         self.device = device
         # io_leader=False: a tensor-parallel FOLLOWER rank. It runs the SAME
         # deterministic schedule + compute as the leader (so the per-layer NCCL
@@ -622,8 +672,9 @@ class DisaggWorker:
         # producer-done notifications to ship AFTER this tick's stream chunks
         # (order: chunks first, then done) — (gid, from, edge, to).
         self._pending_done: list[tuple] = []
-        # emissions + partition-done fire from inside driver.poll(); relay them.
-        self.driver.on_token = self._emit
+        # emissions + partition-done fire from inside driver.poll(); relay them
+        # (on_emit carries the modality, which the frontend seam needs).
+        self.driver.on_emit = self._emit
         self.driver.on_partition_done = self._partition_done
 
     def run(self) -> None:
@@ -640,15 +691,61 @@ class DisaggWorker:
                     return
                 n += 1
                 raw = self.mbox.try_recv()
+            self._drain_tp_pending()
             did = self.driver.poll()           # one in-process step, no round-trip
             if did:
                 _dbg(self.worker_id, "poll ran a batch")
             self._ship_outbox()
 
+    def _broadcast_batch(self, node: str, walk: str, rids: list) -> None:
+        """TP leader: ship this batch decision to follower ranks BEFORE
+        executing (mstar sends ScheduleTPNode before GPU submission), so the
+        followers replay identical batches in identical order."""
+        if node not in self.tp_nodes:
+            return
+        gids = [self._l2g[r] for r in rids]
+        msg = msgpack.packb({"t": "tp_sched", "node": node, "walk": walk, "gids": gids})
+        for follower in self.tp_followers:
+            self.mbox.send(follower, msg)
+
+    def _drain_tp_pending(self) -> None:
+        """Follower: register leader decisions whose gids are all mapped
+        locally (the tp_sched can overtake the seed; FIFO order preserved)."""
+        while self._tp_pending:
+            node, walk, gids = self._tp_pending[0]
+            if any(g not in self._g2l for g in gids):
+                return  # head's seed(s) not ingested yet; keep order, retry
+            self.driver.register_tp_follow(
+                node, walk, [self._g2l[g] for g in gids])
+            self._tp_pending.pop(0)
+
+    def _flush_follows_for(self, local: int, gid: int, timeout_s: float = 5.0) -> None:
+        """Run the driver until no queued leader decision references this
+        request (bounded). The referenced batches are executable by
+        construction — the leader only ships batches it scheduled from the
+        same deterministic state."""
+        def pending() -> bool:
+            return (any(gid in gs for _n, _w, gs in self._tp_pending)
+                    or any(local in rs for _n, _w, rs in self.driver._tp_follow))
+
+        deadline = time.time() + timeout_s
+        while pending():
+            self._drain_tp_pending()
+            if not self.driver.poll():
+                if time.time() > deadline:
+                    _dbg(self.worker_id, f"flush_follows timeout gid={gid}")
+                    return
+                time.sleep(0.001)
+
     def _handle(self, raw: bytes) -> None:
         msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
         t = msg["t"]
         if t == "shutdown":
+            # TP leader: forward on the ordered tp_sched connection so a
+            # follower never sees shutdown overtake a queued batch decision
+            # (the coordinator shuts down only leaders).
+            for follower in self.tp_followers:
+                self.mbox.send(follower, raw)
             self._stop = True
         elif t == "seed":
             gid = int(msg["gid"])
@@ -663,7 +760,9 @@ class DisaggWorker:
                 local = self.driver.new_request()
                 self._g2l[gid] = local
                 self._l2g[local] = gid
-                self.driver._front_rid[local] = gid  # so on_token fires with gid
+                self.driver._front_rid[local] = gid  # so on_emit fires with gid
+                # per-request engine config (sampling, voice) — once per gid
+                self.driver.model.register_request(local, dict(msg.get("mk") or {}))
             inputs = [
                 (node, name, [self.shm.read(d).to(self.device) for d in descs])
                 for node, name, descs in msg["inputs"]
@@ -678,13 +777,30 @@ class DisaggWorker:
             _dbg(self.worker_id, f"stream_done gid={msg['gid']} {msg['from']}->{msg['to']}")
             local = self._g2l[int(msg["gid"])]
             self.driver.signal_stream_done(local, msg["from"], msg["edge"], msg["to"])
+        elif t == "tp_sched":
+            # leader's batch decision (TP follow) — replay after gid mapping
+            _dbg(self.worker_id, f"tp_sched {msg['node']} gids={msg['gids']}")
+            self._tp_pending.append((msg["node"], msg["walk"], [int(g) for g in msg["gids"]]))
         elif t == "finish":
-            local = self._g2l.pop(int(msg["gid"]), None)
+            gid = int(msg["gid"])
+            # TP leader: forward the finish to follower ranks over the SAME
+            # ordered connection that carries tp_sched, so a follower can never
+            # see finish overtake a batch decision (the coordinator finishes
+            # only leaders — ordering by construction, not by luck).
+            for follower in self.tp_followers:
+                self.mbox.send(follower, raw)
+            local = self._g2l.get(gid)
             if local is not None:
+                # Replay any queued leader decisions that still reference this
+                # request before teardown (the gid must stay mapped while the
+                # flush translates + runs them).
+                self._flush_follows_for(local, gid)
+                self._g2l.pop(gid, None)
                 self._l2g.pop(local, None)
                 self.driver._front_rid.pop(local, None)
                 self.driver.runtime.finish_request(local)
                 self.driver.store.free_request(local)
+                self.driver.model.release_request(local)
 
     def _ship_outbox(self) -> None:
         if not self.io_leader:
@@ -709,15 +825,16 @@ class DisaggWorker:
             )
         self._pending_done.clear()
 
-    def _emit(self, gid: int, value) -> None:
+    def _emit(self, gid: int, modality: str, value) -> None:
         if not self.io_leader:
             return   # follower: replica emission, leader already sent it
         if isinstance(value, torch.Tensor):
-            self.mbox.send("coordinator", msgpack.packb(
-                {"t": "emission", "gid": gid, "desc": self.shm.stage(value)}))
+            self.mbox.send(self.coordinator_id, msgpack.packb(
+                {"t": "emission", "gid": gid, "modality": modality,
+                 "desc": self.shm.stage(value)}))
         else:
-            self.mbox.send("coordinator", msgpack.packb(
-                {"t": "emission", "gid": gid, "value": value}))
+            self.mbox.send(self.coordinator_id, msgpack.packb(
+                {"t": "emission", "gid": gid, "modality": modality, "value": value}))
 
     def _partition_done(self, local: int, partition: str) -> None:
         if not self.io_leader:
@@ -730,7 +847,7 @@ class DisaggWorker:
         # AR loop alive). Queued to ship AFTER this tick's stream chunks.
         for edge, to in self.driver.outgoing_cross_worker(partition):
             self._pending_done.append((gid, partition, edge, to))
-        self.mbox.send("coordinator", msgpack.packb(
+        self.mbox.send(self.coordinator_id, msgpack.packb(
             {"t": "partition_done", "gid": gid, "partition": partition}))
 
 
@@ -739,7 +856,8 @@ class DisaggCoordinator:
     it seeds each partition's worker once, relays emissions to the caller, and
     completes a request when all partitions report done."""
 
-    def __init__(self, policy, partition_to_worker, socket_dir) -> None:
+    def __init__(self, policy, partition_to_worker, socket_dir,
+                 my_id: str = "coordinator") -> None:
         self.policy = policy
         # A partition maps to a LIST of workers (its TP ranks; a bare string is
         # a 1-rank group). Seeds go to ALL ranks (they run in lockstep); the
@@ -752,12 +870,19 @@ class DisaggCoordinator:
             w: p["name"] for p in policy.partitions()[0] for w in p["walks"]
         }
         self._all_partitions = [p["name"] for p in policy.partitions()[0]]
-        self.mbox = ZmqCommunicator("coordinator", socket_dir)
-        self.shm = ShmPool("coordinator")
+        # `my_id` is this coordinator's inbox name. The serving launcher binds
+        # it as "conductor" (the peer the Rust frontend submits to) and points
+        # the workers' coordinator_id here.
+        self.mbox = ZmqCommunicator(my_id, socket_dir)
+        self.shm = ShmPool(my_id)
         self._gid = 0
         self.results: dict[int, list[Any]] = {}
         self._pending: dict[int, set] = {}   # gid -> partitions not yet done
         self.finished: set[int] = set()
+        # Frontend serving (mirrors Conductor.serve_frontend).
+        self._front_rid: dict[int, Any] = {}   # gid -> frontend request id
+        self._stream: _FrontendStream | None = None
+        self._stop = threading.Event()
 
     def submit(self, request: dict[str, Any]) -> int:
         gid = self._gid
@@ -765,12 +890,14 @@ class DisaggCoordinator:
         self.results[gid] = []
         self._pending[gid] = set(self._all_partitions)
         req = dict(request, request_id=gid)
+        mk = dict(request.get("model_kwargs") or {})
         for nxt in self.policy.initial_walks(req):
             walk, inputs, *kv = nxt
             seeded = [[node, name, [self.shm.stage(t) for t in tensors]]
                       for node, name, tensors in inputs]
             msg = msgpack.packb(
-                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded, "kv": list(kv)})
+                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded,
+                 "kv": list(kv), "mk": mk})
             # seed every rank of the partition (TP group runs in lockstep)
             for worker in self.partition_to_workers[self.walk_partition[walk]]:
                 self.mbox.send(worker, msg)
@@ -784,14 +911,38 @@ class DisaggCoordinator:
             if t == "emission":
                 gid = int(msg["gid"])
                 value = self.shm.read(msg["desc"]) if "desc" in msg else msg["value"]
-                self.results[gid].append(value)   # worker already postprocessed
+                if gid in self._front_rid:
+                    # Stream to the frontend (worker already postprocessed);
+                    # don't accumulate server-side.
+                    self._stream.emit(self._front_rid[gid], msg.get("modality", ""), value)
+                else:
+                    self.results[gid].append(value)
             elif t == "partition_done":
                 gid = int(msg["gid"])
                 self._pending[gid].discard(msg["partition"])
                 if not self._pending[gid]:
                     self.finished.add(gid)
-                    for worker in self._all_workers():
-                        self.mbox.send(worker, msgpack.packb({"t": "finish", "gid": gid}))
+                    # Finish only each partition's LEADER rank (workers[0]);
+                    # leaders forward it to their TP followers on the same
+                    # ordered connection as tp_sched, so a follower never sees
+                    # finish overtake a batch decision.
+                    fin = msgpack.packb({"t": "finish", "gid": gid})
+                    for worker in {ws[0] for ws in self.partition_to_workers.values()}:
+                        self.mbox.send(worker, fin)
+                    if (front := self._front_rid.pop(gid, None)) is not None:
+                        self._stream.done(front)
+                        self.results.pop(gid, None)  # streamed already
+            elif t == "submit":
+                # A frontend submitted a flattened request (same wire shape the
+                # centralized Conductor ingests).
+                gid = self.submit({
+                    "text": msg.get("text"),
+                    "file_paths": msg.get("file_paths") or {},
+                    "input_modalities": list(msg.get("input_modalities") or []),
+                    "output_modalities": list(msg.get("output_modalities") or ["text"]),
+                    "model_kwargs": dict(msg.get("model_kwargs") or {}),
+                })
+                self._front_rid[gid] = msg["rid"]
             raw = self.mbox.try_recv()
 
     def run_until_idle(self) -> dict[int, list[Any]]:
@@ -799,9 +950,26 @@ class DisaggCoordinator:
             self.poll()
         return self.results
 
+    def serve_frontend(self) -> None:
+        """Run forever as a streaming backend for the Rust axum frontend — the
+        decentralized counterpart of `Conductor.serve_frontend`. Same seam
+        (`submit` in; `chunk`/`done` out via `_FrontendStream`), but per-request
+        only: workers self-schedule their decode loops, so nothing crosses this
+        loop per step — it just ingests requests and relays emissions."""
+        self._stream = _FrontendStream(self.mbox, self.policy.tokenizer)
+        while not self._stop.is_set():
+            self.poll(timeout_ms=20)
+
+    def stop(self) -> None:
+        """Signal serve_frontend to exit; join the serving thread after this."""
+        self._stop.set()
+
     def _all_workers(self) -> set:
         return {w for ws in self.partition_to_workers.values() for w in ws}
 
     def shutdown_workers(self) -> None:
-        for worker in self._all_workers():
+        # Shut down only each partition's LEADER; leaders forward to their TP
+        # followers on the ordered tp_sched connection (same reasoning as
+        # `finish`: shutdown must not overtake a queued batch decision).
+        for worker in {ws[0] for ws in self.partition_to_workers.values()}:
             self.mbox.send(worker, msgpack.packb({"t": "shutdown"}))

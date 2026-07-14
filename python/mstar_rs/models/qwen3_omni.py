@@ -384,11 +384,29 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         self._generated: dict[int, int] = {}
         self._pending_stops: list[tuple[int, str]] = []
 
+        # --- per-request sampling (mstar's model_kwargs-at-ingest) ---------
+        # Default is greedy (temperature=0 -> the sampler's one-hot argmax
+        # path), so behavior without kwargs is unchanged. `thinker_temperature`
+        # / `thinker_top_k` / `thinker_top_p` / `seed` arrive via
+        # register_request. The eager Sampler covers prefill + the eager decode
+        # fallback; the CUDA-graph path uses SamplerBuffers (below), whose
+        # tp_group broadcast keeps the sampled token identical across the TP
+        # ranks (without it, ranks drift on the first tied-logit draw).
+        from mstar.utils.sampling import Sampler, SamplerBuffers, SamplingConfig
+
+        self._SamplingConfig = SamplingConfig
+        self.sampler = Sampler(device=self.device, tp_group=cg)
+        self._req_cfg: dict[int, Any] = {}   # rid -> SamplingConfig
+
         # --- CUDA-graph capture of the per-token decode (TP-safe) ---------
         # Capture embed -> Thinker forward (incl. the 2 NCCL all-reduces/layer,
-        # graph-capturable) -> lm_head -> greedy argmax, over static buffers. My
-        # fi decode wrapper is in cudagraph mode (plan() outside); MRoPE cos/sin
-        # are recomputed per token and copied in (position advances each step).
+        # graph-capturable) -> lm_head -> in-graph CudaGraphableSampler (greedy
+        # rows one-hot argmax), over static buffers. My fi decode wrapper is in
+        # cudagraph mode (plan() outside); MRoPE cos/sin are recomputed per
+        # token and copied in (position advances each step). Per-request
+        # sampling params re-stage into the SamplerBuffers OUTSIDE the graph
+        # (the graph reads the per-step buffer views), so no recapture per
+        # request.
         self.cuda_graph = cuda_graph
         self._head_dim = head_dim
         self._g_tok = torch.zeros(1, dtype=torch.long, device=self.device)
@@ -400,17 +418,79 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
             self._cache, qo, head_dim, self.device, max_new_tokens=1,
             cudagraph=cuda_graph, causal=True, dtype=torch.bfloat16,
         )
+        self._sbuf = SamplerBuffers.allocate(1, self.device, tp_group=cg)
+        self._decode_sampler = None
+        self._sampler_rid = None   # whose config is staged in the per-step bufs
         self._decode_graph = None
+
+    # -- per-request sampling config (mstar's model_kwargs-at-ingest) -------
+
+    def _cfg_for(self, mk: dict):
+        """thinker_* kwargs -> SamplingConfig; absent => greedy (temp=0)."""
+        cfg = self._SamplingConfig(
+            temperature=float(mk.get("thinker_temperature", 0.0)),
+            top_k=int(mk.get("thinker_top_k", 0)),
+            top_p=float(mk.get("thinker_top_p", 1.0)),
+        )
+        if (seed := mk.get("seed")) is not None:
+            cfg.set_seed(int(seed))
+        return cfg
+
+    def register_request(self, request_id, model_kwargs: dict) -> None:
+        cfg = self._cfg_for(model_kwargs or {})
+        self._req_cfg[request_id] = cfg
+        self.sampler.add_request(request_id)
+        self.sampler.set_config(
+            request_id, temperature=cfg.temperature, top_k=cfg.top_k,
+            top_p=cfg.top_p, ignore_eos=False)
+        if cfg.seed:
+            self.sampler._sampling_config[request_id].set_seed(cfg.seed)
+
+    def release_request(self, request_id) -> None:
+        self._req_cfg.pop(request_id, None)
+        self.sampler.remove_request(request_id)
+        self._sbuf.unregister_request(request_id)
+        if self._sampler_rid == request_id:
+            self._sampler_rid = None
+        self._generated.pop(request_id, None)
+        self._rope_offset.pop(request_id, None)
+
+    def _ensure_registered(self, rid) -> None:
+        """Requests that arrived without a register (no model_kwargs on the
+        wire) get the greedy default lazily."""
+        if rid not in self._req_cfg:
+            self.register_request(rid, {})
+
+    def _sample_eager(self, rid, logits):
+        """Per-request sampling for prefill + the eager decode fallback
+        (mstar's eager Sampler; greedy rows take its argmax path)."""
+        self._ensure_registered(rid)
+        return int(self.sampler.sample([rid], logits.float())[0].item())
+
+    def _stage_sampler(self, rid) -> None:
+        """(Re)stage `rid`'s sampling params into the per-step SamplerBuffers
+        the captured graph reads — runs OUTSIDE the graph, no recapture. The
+        RNG offset resets per request so a fixed seed reproduces."""
+        self._ensure_registered(rid)
+        if self._sampler_rid == rid:
+            return
+        self._sbuf.register_request(rid, self._req_cfg[rid])
+        self._sbuf.offset_buf.zero_()
+        self._decode_sampler = self._sbuf.gather_for_request_ids(
+            [rid], 1, gather_seen_tokens=False)
+        self._sampler_rid = rid
 
     def _mrope(self, seq_pos: int):
         torch = self._torch
         pos3d = torch.full((3, 1), float(seq_pos), dtype=torch.float, device=self.device)
         return self._cos_sin(pos3d, self._inv_freq, MROPE_SECTION, target_dtype=torch.bfloat16)
 
-    def _capture_decode(self, pages, seq_pos: int) -> None:
+    def _capture_decode(self, rid, pages, seq_pos: int) -> None:
         torch = self._torch
         handle = self._Handle(self._decode_attn)
         self._decode_attn.plan(pages, seq_pos, 1)
+        self._stage_sampler(rid)
+        sampler = self._decode_sampler
 
         def dec_fn() -> None:
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -419,7 +499,8 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
                     cache_handle=handle, cos_sin_3d=(self._g_cos, self._g_sin),
                     mrope_section=MROPE_SECTION,
                 )
-                self._g_out_tok.copy_(self._lm_head(hidden[-1:]).argmax(-1).reshape(1))
+                logits = self._lm_head(hidden[-1:])
+                self._g_out_tok.copy_(sampler.sample([rid], logits).reshape(1))
                 if self.audio_output:
                     self._g_layer0.copy_(layer_0)
 
@@ -433,16 +514,22 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
         torch.cuda.synchronize()
         self._decode_graph = g
 
-    def _decode_graphed(self, tok_id: int, pages, seq_pos: int, rope_pos: int | None = None):
+    def _decode_graphed(self, rid, tok_id: int, pages, seq_pos: int,
+                        rope_pos: int | None = None):
         """Replay the captured Thinker decode for one token. Returns
         (sampled_token:int, layer_0_hidden or None). `rope_pos` is the MRoPE
         position (defaults to seq_pos); it differs from the KV `seq_pos` after a
-        vision prefill, where RoPE advances by the image grid span."""
+        vision prefill, where RoPE advances by the image grid span. `rid`'s
+        sampling params are re-staged into the graph's buffers on request
+        switch (no recapture)."""
         torch = self._torch
         cos, sin = self._mrope(seq_pos if rope_pos is None else rope_pos)
         if self._decode_graph is None:
             self._g_cos.copy_(cos); self._g_sin.copy_(sin)
-            self._capture_decode(pages, seq_pos)
+            self._capture_decode(rid, pages, seq_pos)
+            # capture warmups advanced the RNG offset; start the request at 0
+            self._sbuf.offset_buf.zero_()
+        self._stage_sampler(rid)
         self._decode_attn.plan(pages, seq_pos, 1)   # growing KV, outside the graph
         self._g_tok.copy_(torch.as_tensor([tok_id], device=self.device))
         self._g_cos.copy_(cos); self._g_sin.copy_(sin)
@@ -558,7 +645,8 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
             # buffers; MRoPE cos/sin copied in per token).
             if walk == "thinker_decode" and self.cuda_graph:
                 rp = seq_pos + self._rope_offset.get(rid, 0)
-                tok, layer0 = self._decode_graphed(int(ids[0].item()), view["pages"], seq_pos, rp)
+                tok, layer0 = self._decode_graphed(rid, int(ids[0].item()),
+                                                   view["pages"], seq_pos, rp)
                 o = {"new_token": [torch.tensor([tok], dtype=torch.long)],
                      "text_inputs": [torch.tensor([tok], dtype=torch.long)]}
                 if self.audio_output:
@@ -595,7 +683,8 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
                     deepstack_visual_embeds=deepstack,
                 )
                 logits = self._lm_head(hidden[-1:])
-            tok = int(logits.argmax(-1).reshape(-1)[0].item())
+            # per-request sampling (greedy default = argmax path in the sampler)
+            tok = self._sample_eager(rid, logits)
             o = {"new_token": [torch.tensor([tok], dtype=torch.long)]}
             if self.audio_output:
                 # Stream the selected Thinker hidden + mask to the Talker. For a
@@ -847,6 +936,12 @@ class Qwen3OmniAudioEngine(ModelEngine):
         self.voice = voice
         self.max_output_tokens = max_output_tokens
         self._registered: set[str] = set()
+        # per-request sampling + voice (mstar's model_kwargs-at-ingest):
+        # talker_temperature / talker_top_k / talker_top_p /
+        # talker_repetition_penalty / voice / seed. Defaults match the previous
+        # hard-coded values (temp=1.0, top_p=1.0, rep=1.1, ctor voice).
+        self._req_cfg: dict[Any, Any] = {}
+        self._req_voice: dict[Any, str] = {}
         # per-request streaming state (for execute)
         self._eos_sent: set[str] = set()      # tts_eos injected once after Thinker EOS
         self._first_chunk: set[str] = set()    # Code2Wav left-context trim gate
@@ -879,18 +974,66 @@ class Qwen3OmniAudioEngine(ModelEngine):
         )
         self._decode_graph = None
         self._decode_sampler = None
+        self._sampler_rid = None   # whose config/seen-mask is staged for the graph
 
     def _handle(self, pages, seq_pos: int, n: int):
         self._attn.plan(pages, seq_pos, n)
         return self._Handle(self._attn)
 
+    def _talker_cfg(self, mk: dict):
+        """talker_* kwargs -> SamplingConfig; defaults = the previous
+        hard-coded values (temp=1.0, top_k=0, top_p=1.0, rep_penalty=1.1)."""
+        cfg = self._SamplingConfig(
+            vocab_size=self.cfg.talker_text.vocab_size,
+            temperature=float(mk.get("talker_temperature", 1.0)),
+            top_k=int(mk.get("talker_top_k", 0)),
+            top_p=float(mk.get("talker_top_p", 1.0)),
+            repetition_penalty=float(mk.get("talker_repetition_penalty", 1.1)),
+        )
+        if (seed := mk.get("seed")) is not None:
+            cfg.set_seed(int(seed))
+        return cfg
+
+    def register_request(self, request_id, model_kwargs: dict) -> None:
+        # execute keys its per-request state by str(rid) (`srid`) — normalize.
+        rid = str(request_id)
+        mk = model_kwargs or {}
+        self._req_cfg[rid] = self._talker_cfg(mk)
+        if voice := mk.get("voice"):
+            self._req_voice[rid] = str(voice)
+
+    def release_request(self, request_id) -> None:
+        rid = str(request_id)
+        self._req_cfg.pop(rid, None)
+        self._req_voice.pop(rid, None)
+        self._sbuf.unregister_request(rid)
+        if self._sampler_rid == rid:
+            self._sampler_rid = None
+        if rid in self._registered:
+            self._registered.discard(rid)
+            self.sampler.remove_request(rid)
+        self._eos_sent.discard(rid)
+        self._first_chunk.discard(rid)
+        self._codec_eos_hit.discard(request_id)  # keyed by the int rid
+
+    def _cfg_for(self, rid):
+        cfg = self._req_cfg.get(rid)
+        return cfg if cfg is not None else self._talker_cfg({})
+
+    def _voice_for(self, rid) -> str:
+        return self._req_voice.get(rid, self.voice)
+
     def _register(self, rid: str) -> None:
         if rid not in self._registered:
+            cfg = self._cfg_for(rid)
             self.sampler.add_request(rid)
             self.sampler.set_config(
-                rid, vocab_size=self.cfg.talker_text.vocab_size,
-                temperature=1.0, top_p=1.0, repetition_penalty=1.1, ignore_eos=False,
+                rid, vocab_size=cfg.vocab_size, temperature=cfg.temperature,
+                top_k=cfg.top_k, top_p=cfg.top_p,
+                repetition_penalty=cfg.repetition_penalty, ignore_eos=False,
             )
+            if cfg.seed:
+                self.sampler._sampling_config[rid].set_seed(cfg.seed)
             self._registered.add(rid)
 
     def _depth(self, rid: str, handle, input_embeds):
@@ -919,15 +1062,8 @@ class Qwen3OmniAudioEngine(ModelEngine):
         (planned outside) and an in-graph CudaGraphableSampler. All compute is
         mstar's code; only this harness is mine."""
         torch = self._torch
-        cfg = self._SamplingConfig(
-            vocab_size=self.cfg.talker_text.vocab_size,
-            temperature=1.0, top_k=0, top_p=1.0, repetition_penalty=1.1, ignore_eos=False,
-        )
-        self._sbuf.register_request(rid, cfg)
-        seen = self._SeenTokenMask.new(rid, self.cfg.talker_text.vocab_size, self.device)
-        self._sbuf.stage_seen_token_masks([rid], [seen])
-        sampler = self._sbuf.gather_for_request_ids([rid], 1, gather_seen_tokens=True)
-        self._decode_sampler = sampler
+        self._stage_decode_sampler(rid)
+        sampler = self._decode_sampler
         handle = self._Handle(self._decode_attn)
         self._decode_attn.plan(pages, seq_pos, 1)
 
@@ -956,13 +1092,34 @@ class Qwen3OmniAudioEngine(ModelEngine):
         torch.cuda.synchronize()
         self._decode_graph = g
 
+    def _stage_decode_sampler(self, rid) -> None:
+        """(Re)stage `rid`'s sampling params + a FRESH seen-token mask into the
+        per-step SamplerBuffers the captured graph reads — outside the graph, no
+        recapture. Guards on request switch: without the fresh mask, request
+        N+1 would inherit request N's seen tokens and the repetition penalty
+        would bleed across requests. Resets the RNG offset so a fixed seed
+        reproduces per request."""
+        if self._sampler_rid == rid:
+            return
+        self._sbuf.register_request(rid, self._cfg_for(rid))
+        seen = self._SeenTokenMask.new(rid, self.cfg.talker_text.vocab_size, self.device)
+        self._sbuf.stage_seen_token_masks([rid], [seen])
+        self._sbuf.offset_buf.zero_()
+        self._decode_sampler = self._sbuf.gather_for_request_ids(
+            [rid], 1, gather_seen_tokens=True)
+        self._sampler_rid = rid
+
     def _decode_graphed(self, rid: str, input_embeds, pages, seq_pos: int):
         """Replay the captured decode graph for one frame. Re-plans the fi
         wrapper outside the graph (growing KV), copies the input embed in, and
-        reads the static output buffers."""
+        reads the static output buffers. Per-request sampling params re-stage
+        on request switch (the graph reads the buffers; no recapture)."""
         torch = self._torch
         if self._decode_graph is None:
             self._capture_decode(rid, pages, seq_pos)
+            # capture warmups advanced RNG offset + seen mask; restage fresh
+            self._sampler_rid = None
+        self._stage_decode_sampler(rid)
         self._decode_attn.plan(pages, seq_pos, 1)   # growing KV, outside the graph
         self._g_ie.copy_(input_embeds)
         self._decode_graph.replay()
@@ -1080,7 +1237,7 @@ class Qwen3OmniAudioEngine(ModelEngine):
                     # talker_last_prefill
                     self._register(srid)
                     states = named["thinker_states"][0].to(self.device)
-                    codec6 = self.talker._get_last_prefill_codec_hidden(self.voice)
+                    codec6 = self.talker._get_last_prefill_codec_hidden(self._voice_for(srid))
                     text6 = self.talker._get_last_prefill_talker_hidden(states)
                     o = self._depth(srid, handle, codec6 + text6)
                 out[rid] = {

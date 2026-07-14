@@ -130,6 +130,18 @@ class ModelEngine(ABC):
         side effects); the conductor replays the signals. Default: none."""
         return []
 
+    def register_request(self, request_id, model_kwargs: dict) -> None:
+        """Per-request ingest hook: the request's ``model_kwargs`` (sampling
+        knobs, voice, seed, …), delivered before its first `execute`. Mirrors
+        mstar's `get_sampling_config(model_kwargs)`-at-ingest — engines stash
+        per-request config here and read it inside `execute`. Default: ignore
+        (engines with no per-request knobs need nothing)."""
+
+    def release_request(self, request_id) -> None:
+        """Per-request cleanup hook, delivered after the request finishes.
+        Frees whatever `register_request` stashed (sampler slots, voice, …).
+        Default: nothing."""
+
 
 class Model(ModelPolicy, ModelEngine, ABC):
     """A model that is both its own policy and engine. Convenient for the

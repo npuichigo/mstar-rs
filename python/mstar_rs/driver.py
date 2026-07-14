@@ -19,6 +19,7 @@ mirror the Conductor's surface so `server.ServingEngine` can drive either one.
 from __future__ import annotations
 
 import json
+from collections import deque
 from typing import Any
 
 from mstar_rs._core import Runtime
@@ -29,9 +30,15 @@ from .store import TensorStore
 
 class Driver:
     def __init__(self, model: Model, max_batch_size: int = 8,
-                 local_partitions: list[str] | None = None) -> None:
+                 local_partitions: list[str] | None = None,
+                 tp_follow_nodes: list[str] | None = None) -> None:
         self.model = model
         self.max_batch_size = max_batch_size
+        # TP FOLLOWER rank: never self-initiate batches for these nodes; they
+        # are scheduled only by replaying the leader's decisions (see
+        # register_tp_follow) so all TP ranks run identical batches in
+        # identical order — mstar's tp_rank_zero_nodes.
+        self._tp_follow_nodes = list(tp_follow_nodes or [])
         # Decentralized / per-worker mode: this driver OWNS only these
         # partitions (schedules + executes them). Stream outputs to other
         # partitions surface as `stream_out` events collected in `self.outbox`
@@ -65,6 +72,8 @@ class Driver:
             self.runtime.configure_unbatchable([tuple(p) for p in unbatchable])
         if local_partitions is not None:
             self.runtime.set_local_partitions(local_partitions)
+        if self._tp_follow_nodes:
+            self.runtime.set_tp_follower_nodes(self._tp_follow_nodes)
         self.store = TensorStore(self.runtime)
         # request_id -> list of postprocessed emissions
         self.results: dict[int, list[Any]] = {}
@@ -73,7 +82,15 @@ class Driver:
         self.finished: set[int] = set()   # request ids whose request completed
         self.errors: dict[int, str] = {}  # request id -> error message
         self.on_token = None              # callable(front_rid, value) — stream hook
+        self.on_emit = None               # callable(front_rid, modality, value) — multimodal hook
         self.on_done = None               # callable(front_rid)
+        # TP leader hook: fired with (node, walk, [rids]) right after a batch
+        # is scheduled, BEFORE execute (mstar broadcasts ScheduleTPNode before
+        # GPU submission) — the DisaggWorker ships it to follower ranks.
+        self.on_batch = None
+        # TP follower: FIFO of leader batch decisions to replay (mstar's
+        # `tp_batches_pending_schedule`). Filled via register_tp_follow.
+        self._tp_follow: deque = deque()
         # callable(rid, partition) — a locally-owned partition finished. In the
         # decentralized/multi-worker case each worker owns one partition, so
         # finish_partition never returns all-done here; the coordinator collects
@@ -102,6 +119,9 @@ class Driver:
     def submit(self, request: dict[str, Any]) -> int:
         request_id = self.runtime.add_request()
         request = dict(request, request_id=request_id)
+        # Per-request engine config (sampling knobs, voice, seed) lands before
+        # the first execute — mstar's model_kwargs-at-ingest.
+        self.model.register_request(request_id, request.get("model_kwargs") or {})
         # Seed only the initial walks for partitions this driver owns; peers
         # seed their own (decentralized ingest). Single-process owns all.
         for nxt in self.model.initial_walks(request):
@@ -120,6 +140,26 @@ class Driver:
         ]
         self.runtime.start_walk(request_id, walk, seeded, kv_appends, kv_scratch)
 
+    def register_tp_follow(self, node: str, walk: str, request_ids: list[int]) -> None:
+        """Queue a leader rank's batch decision for replay (FIFO). The next
+        poll()s schedule exactly these batches, in order, once each is ready
+        locally — mstar's `register_tp_follow`."""
+        self._tp_follow.append((node, walk, list(request_ids)))
+
+    def _next_batch(self):
+        """Follow-first scheduling: replay the leader's queued batch decisions
+        before initiating anything of our own (the runtime's tp_follower_nodes
+        filter keeps next_batch from self-initiating followed nodes)."""
+        if self._tp_follow:
+            node, walk, rids = self._tp_follow[0]
+            batch = self.runtime.next_batch_for(node, walk, rids)
+            if batch is not None:
+                self._tp_follow.popleft()
+                return batch
+            # head not ready yet (ingest lagging the leader) — fall through so
+            # locally-owned non-TP work keeps flowing.
+        return self.runtime.next_batch(self.max_batch_size)
+
     def poll(self, timeout_ms: int = 0) -> bool:
         """Run the next ready batch IN-PROCESS (no IPC) and route its outputs.
         Returns True if a batch ran. One batch per call so a serving loop can
@@ -127,9 +167,13 @@ class Driver:
         runtime grouping every ready request's same-(node,walk) work into one
         batch). `timeout_ms` is accepted for Conductor-API parity and ignored —
         in-process there is nothing to block on."""
-        batch = self.runtime.next_batch(self.max_batch_size)
+        batch = self._next_batch()
         if batch is None:
             return False
+        if self.on_batch is not None:
+            # TP leader: ship the batch decision to follower ranks BEFORE
+            # executing (mstar sends ScheduleTPNode before GPU submission).
+            self.on_batch(batch.node, batch.walk, list(batch.inputs.keys()))
         inputs = {
             rid: {name: self.store.get_all(refs) for name, refs in named.items()}
             for rid, named in batch.inputs.items()
@@ -163,8 +207,15 @@ class Driver:
             tensors = self.store.get_all(event["tensors"])
             value = self.model.postprocess(event["name"], event["modality"], tensors)
             self.results[rid].append(value)
-            if self.on_token is not None and rid in self._front_rid:
-                self.on_token(self._front_rid[rid], value)  # stream, no per-step IPC
+            # Stream hooks (no per-step IPC): the multimodal hook gets the
+            # modality (needed to build a frontend ResultChunk); on_token is the
+            # legacy value-only form.
+            if rid in self._front_rid:
+                front = self._front_rid[rid]
+                if self.on_emit is not None:
+                    self.on_emit(front, event["modality"], value)
+                elif self.on_token is not None:
+                    self.on_token(front, value)
         elif event["type"] == "walk_done":
             persist = {
                 name: self.store.get_all(refs)
@@ -189,6 +240,7 @@ class Driver:
                 if self.runtime.finish_partition(rid, event["partition"]):
                     self.runtime.finish_request(rid)
                     self.store.free_request(rid)
+                    self.model.release_request(rid)
                     self.finished.add(rid)   # ServingEngine consumes this
                     if self.on_done is not None and rid in self._front_rid:
                         self.on_done(self._front_rid.pop(rid))

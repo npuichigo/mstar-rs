@@ -74,17 +74,86 @@ def _audio_worker(worker_id: str, socket_dir: str, device: str,
         raise
 
 
+def _disagg_speech_worker(kind: str, local_partitions: list, ship_to: dict,
+                          socket_dir: str, tp_world: int, tp_port: int,
+                          max_new: int, voice: str,
+                          tp_followers: list | None = None) -> None:
+    """A self-driving (decentralized) worker for the speech stack: owns its
+    partition(s), runs its own scheduler loop, streams peer-to-peer — no
+    per-step conductor round-trip (mstar's in-worker scheduler model). The
+    worker composes the full audio graph (policy) with its engine so its local
+    Driver can schedule and continue its own walks."""
+    try:
+        from mstar_rs import Model
+        from mstar_rs.dist import DisaggWorker
+        from mstar_rs.models import (
+            Qwen3OmniAudioEngine,
+            Qwen3OmniAudioPolicy,
+            Qwen3OmniThinkerEngine,
+        )
+
+        policy = Qwen3OmniAudioPolicy(max_output_tokens=max_new, voice=voice)
+        if kind.startswith("thinker"):
+            engine = Qwen3OmniThinkerEngine(
+                tp_rank=int(kind[-1]), tp_world=tp_world, max_output_tokens=max_new,
+                greedy=True, tp_port=tp_port, audio_output=True,
+            )
+        else:
+            engine = Qwen3OmniAudioEngine(device=f"cuda:{tp_world}", voice=voice,
+                                          max_output_tokens=max_new)
+
+        class _WorkerModel(Model):
+            def __init__(self):
+                self.device = engine.device
+            def walks(self): return policy.walks()
+            def partitions(self): return policy.partitions()
+            def kv_config(self): return policy.kv_config()
+            def unbatchable(self): return policy.unbatchable()
+            def initial_walks(self, r): return policy.initial_walks(r)
+            def next_forward(self, *a): return policy.next_forward(*a)
+            def postprocess(self, *a): return policy.postprocess(*a)
+            def execute(self, *a, **k): return engine.execute(*a, **k)
+            def loops_to_finish(self): return engine.loops_to_finish()
+
+        model = _WorkerModel()
+        # Only rank 0 of the TP Thinker is the I/O leader; followers compute
+        # for the NCCL all-reduces but suppress outward I/O. Under concurrency
+        # the leader also broadcasts each Thinker batch decision (tp_sched) so
+        # every rank runs identical batches in identical order — follower ranks
+        # never self-initiate Thinker batches (tp_follow_nodes).
+        io_leader = kind == "thinker0" or not kind.startswith("thinker")
+        is_tp_rank = kind.startswith("thinker")
+        DisaggWorker(
+            kind, model, local_partitions, ship_to, socket_dir,
+            device=str(model.device), io_leader=io_leader,
+            coordinator_id="conductor",
+            tp_nodes=["Thinker"] if (is_tp_rank and io_leader) else None,
+            tp_followers=tp_followers if (is_tp_rank and io_leader) else None,
+            tp_follow_nodes=["Thinker"] if (is_tp_rank and not io_leader) else None,
+        ).run()
+    except Exception:
+        import traceback
+        with open(f"{socket_dir}/{kind}.err", "w") as f:
+            traceback.print_exc(file=f)
+        raise
+
+
 # --- generic supervisor ----------------------------------------------------
 
-def serve(*, model_name: str, policy_factory, worker_specs, node_to_workers,
+def serve(*, model_name: str, policy_factory=None, worker_specs, node_to_workers=None,
           port: int = 8000, binary: Path | None = None, frontend: bool = True,
-          socket_dir: str | None = None, load_timeout: float = 300.0) -> int:
+          socket_dir: str | None = None, load_timeout: float = 300.0,
+          backend_factory=None) -> int:
     """Spawn workers, run the conductor's frontend loop, and (unless
     ``frontend=False``) supervise the axum binary. Blocks until interrupted.
 
     worker_specs: list of (worker_id, target, args) for the model workers.
     policy_factory: () -> weightless ModelPolicy for the conductor.
     node_to_workers: graph-node -> worker-id (or list of TP rank ids).
+    backend_factory: optional () -> serving backend (an object with
+        serve_frontend/stop/shutdown_workers). Overrides the default
+        centralized Conductor — the decentralized path passes a
+        DisaggCoordinator factory here.
 
     ``frontend=False`` (the ``--no-frontend`` deploy) starts only the Python
     backend — workers + the conductor's bridge loop bound to ``socket_dir`` — and
@@ -127,9 +196,13 @@ def serve(*, model_name: str, policy_factory, worker_specs, node_to_workers,
         return 1
     print(f"workers bound: {bound}", flush=True)
 
-    from mstar_rs.dist import Conductor
+    if backend_factory is not None:
+        cond = backend_factory()
+    else:
+        from mstar_rs.dist import Conductor
 
-    cond = Conductor(policy_factory(), node_to_worker=node_to_workers, socket_dir=socket_dir)
+        cond = Conductor(policy_factory(), node_to_worker=node_to_workers,
+                         socket_dir=socket_dir)
     serve_thread = threading.Thread(target=cond.serve_frontend, daemon=True)
     serve_thread.start()
     print("conductor serving (frontend bridge up)", flush=True)
@@ -226,6 +299,54 @@ def serve_qwen3_omni_speech(*, tp_world: int = 2, port: int = 8000,
     )
 
 
+def serve_qwen3_omni_speech_decentralized(*, tp_world: int = 2, port: int = 8000,
+                                          max_new: int = 2048, voice: str = "chelsie",
+                                          tp_port: int = 29734, binary: Path | None = None,
+                                          frontend: bool = True) -> int:
+    """Serve the speech stack on the DECENTRALIZED runtime: each worker owns its
+    partition and drives its own scheduler loop (mstar's in-worker model), so
+    the per-token decode pays no conductor round-trip — the coordinator is
+    per-request only (ingest + emission relay). This removes the per-step
+    dispatch overhead of the centralized path. Concurrency-safe under TP:
+    thinker0 broadcasts each batch decision to the follower ranks (tp_sched,
+    mstar's ScheduleTPNode), which replay identical batches in identical
+    order, keeping the NCCL collectives aligned."""
+    from mstar_rs.dist import DisaggCoordinator
+    from mstar_rs.models import Qwen3OmniAudioPolicy
+
+    socket_dir = tempfile.mkdtemp(prefix="mstar_rs_qwen3_disagg_")
+    thinker_ids = [f"thinker{r}" for r in range(tp_world)]
+    partition_to_workers = {"Thinker": thinker_ids, "Talker": ["audio"], "Code2Wav": ["audio"]}
+    # a worker shipping a stream chunk sends it to the consumer's I/O leader
+    ship_to = {"Thinker": thinker_ids[0], "Talker": "audio", "Code2Wav": "audio"}
+
+    followers = thinker_ids[1:]
+    worker_specs = [
+        (wid, _disagg_speech_worker,
+         (wid, ["Thinker"], ship_to, socket_dir, tp_world, tp_port, max_new, voice,
+          followers))
+        for wid in thinker_ids
+    ]
+    worker_specs.append(
+        ("audio", _disagg_speech_worker,
+         ("audio", ["Talker", "Code2Wav"], ship_to, socket_dir, tp_world, tp_port,
+          max_new, voice, None)))
+
+    return serve(
+        model_name="qwen3_omni",
+        worker_specs=worker_specs,
+        port=port,
+        binary=binary,
+        frontend=frontend,
+        socket_dir=socket_dir,
+        # Bind the coordinator as "conductor": that's the peer the Rust
+        # frontend submits to (workers' coordinator_id points here too).
+        backend_factory=lambda: DisaggCoordinator(
+            Qwen3OmniAudioPolicy(max_output_tokens=max_new, voice=voice),
+            partition_to_workers, socket_dir, my_id="conductor"),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="mstar-rs serving launcher (axum + conductor + workers)")
     ap.add_argument("--model", default="qwen3_omni", help="model name (adapter key)")
@@ -234,6 +355,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--speech", action="store_true",
                     help="serve the speech-out stack (adds Talker+Code2Wav on cuda:tp); "
                          "default is text-out only")
+    ap.add_argument("--decentralized", action="store_true",
+                    help="speech stack on the decentralized runtime: in-worker "
+                         "schedulers, per-request coordinator, no per-step conductor "
+                         "dispatch (single request per TP group for now)")
     ap.add_argument("--voice", default="chelsie")
     ap.add_argument("--max-new", type=int, default=None,
                     help="max output tokens (default 256 text / 2048 speech)")
@@ -247,6 +372,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"launcher currently supports --model qwen3_omni; got {args.model!r}", file=sys.stderr)
         return 2
     frontend = not args.no_frontend
+    if args.decentralized:
+        if not args.speech:
+            print("--decentralized currently requires --speech (the multi-partition "
+                  "stack is where in-worker scheduling pays)", file=sys.stderr)
+            return 2
+        return serve_qwen3_omni_speech_decentralized(
+            tp_world=args.tp, port=args.port, voice=args.voice,
+            max_new=args.max_new or 2048, binary=args.binary, frontend=frontend,
+        )
     if args.speech:
         return serve_qwen3_omni_speech(
             tp_world=args.tp, port=args.port, voice=args.voice,
