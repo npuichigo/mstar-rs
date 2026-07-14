@@ -31,6 +31,10 @@ use crate::protocol::{ChatCompletionRequest, Content, ImageGenerationRequest, Sp
 #[derive(Debug, Clone)]
 pub struct SubmitArgs {
     pub text: Option<String>,
+    /// Pre-tokenized prompt (the frontend-tokenizes fast path): when set, the
+    /// model side skips tokenization and the response text streams back as
+    /// raw token ids for the frontend to detokenize off the GIL.
+    pub tokens: Option<Vec<u32>>,
     /// modality -> list of persisted file paths.
     pub file_paths: BTreeMap<String, Vec<String>>,
     pub input_modalities: Vec<String>,
@@ -42,6 +46,7 @@ impl Default for SubmitArgs {
     fn default() -> Self {
         Self {
             text: None,
+            tokens: None,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
@@ -228,6 +233,20 @@ impl Adapter {
         matches!(self, Adapter::Bagel)
     }
 
+    /// Whether this model's prompt processing is expressible in the frontend
+    /// (plain `tokenizer.json`, no custom processor), so the server should
+    /// tokenize + detokenize in Rust and submit token ids — the
+    /// Rust-default-with-model-override capability flag. Requires the server
+    /// to be started with a tokenizer (`MSTAR_TOKENIZER`). Currently false for
+    /// every registered model: qwen3_omni needs its multimodal processor +
+    /// chat template, bagel/orpheus their own prompt formatting — they keep
+    /// the ship-text path. A model opts in here when its processing is a pure
+    /// tokenizer encode (the mechanism is exercised by /generate's
+    /// `tokenize` field and the echo verification).
+    pub fn frontend_tokenizes(&self) -> bool {
+        false
+    }
+
     pub fn chat_to_request(
         &self,
         req: &ChatCompletionRequest,
@@ -253,6 +272,7 @@ impl Adapter {
                     },
                 );
                 Ok(SubmitArgs {
+                    tokens: None,
                     text,
                     file_paths,
                     input_modalities: in_mods,
@@ -291,6 +311,7 @@ impl Adapter {
                     mk.insert("voice".to_string(), Value::from(voice));
                 }
                 Ok(SubmitArgs {
+                    tokens: None,
                     text,
                     file_paths,
                     input_modalities: in_mods,
@@ -322,6 +343,7 @@ impl Adapter {
                     },
                 );
                 Ok(SubmitArgs {
+                    tokens: None,
                     text: Some(req.input.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -347,6 +369,7 @@ impl Adapter {
                     },
                 );
                 Ok(SubmitArgs {
+                    tokens: None,
                     text: Some(req.input.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -366,6 +389,7 @@ impl Adapter {
                     set_default(&mut mk, "seed", Value::from(seed));
                 }
                 Ok(SubmitArgs {
+                    tokens: None,
                     text: Some(req.prompt.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -388,6 +412,7 @@ impl Adapter {
                 let mut file_paths = BTreeMap::new();
                 file_paths.insert("image".to_string(), vec![image_path.to_string()]);
                 Ok(SubmitArgs {
+                    tokens: None,
                     text: Some(prompt.to_string()),
                     file_paths,
                     input_modalities: vec!["image".to_string(), "text".to_string()],

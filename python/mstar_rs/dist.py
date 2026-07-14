@@ -78,6 +78,13 @@ class _FrontendStream:
         self._mbox = mbox
         self._tokenizer = tokenizer
         self._detoks: dict[Any, _IncrementalDetok] = {}
+        # Requests whose FRONTEND detokenizes (it submitted token ids): text
+        # emissions ship as raw ids (modality "token", 4-byte LE) instead of
+        # detokenized pieces — the Rust side holds the incremental decoder.
+        self._raw: set = set()
+
+    def set_raw(self, front_rid) -> None:
+        self._raw.add(front_rid)
 
     def _send(self, front_rid, modality: str, data: bytes) -> None:
         self._mbox.send("frontend", msgpack.packb(
@@ -86,6 +93,9 @@ class _FrontendStream:
 
     def emit(self, front_rid, modality: str, value) -> None:
         if modality == "text":
+            if front_rid in self._raw:
+                self._send(front_rid, "token", int(value).to_bytes(4, "little"))
+                return
             detok = self._detoks.get(front_rid)
             if detok is None:
                 detok = self._detoks[front_rid] = _IncrementalDetok(self._tokenizer)
@@ -102,12 +112,14 @@ class _FrontendStream:
 
     def done(self, front_rid) -> None:
         self._detoks.pop(front_rid, None)
+        self._raw.discard(front_rid)
         self._mbox.send("frontend", msgpack.packb({"t": "done", "rid": front_rid}))
 
     def error(self, front_rid, msg: str) -> None:
         """Terminal backend failure — the frontend surfaces it as an HTTP 500
         (non-streaming) or an SSE/NDJSON error event (streaming)."""
         self._detoks.pop(front_rid, None)
+        self._raw.discard(front_rid)
         self._mbox.send("frontend", msgpack.packb(
             {"t": "err", "rid": front_rid, "msg": str(msg)}))
 
@@ -372,6 +384,7 @@ class Conductor:
         self.on_emit = None       # callable(front_rid, modality, value) — multimodal frontend
         self.on_done = None       # callable(front_rid)
         self.on_error = None      # callable(front_rid, msg) — terminal failure
+        self._stream: _FrontendStream | None = None  # set by serve_frontend
         self._front_rid: dict[int, int] = {}  # runtime rid -> frontend rid
         self._stop = threading.Event()  # graceful shutdown for serve_frontend
 
@@ -479,15 +492,22 @@ class Conductor:
                 self.on_error(msg["rid"], repr(e))
             return
         self._front_rid[rid] = msg["rid"]
+        if msg.get("frontend_detok") and self._stream is not None:
+            # The frontend holds the incremental decoder for this request:
+            # ship its text emissions as raw token ids.
+            self._stream.set_raw(msg["rid"])
 
     def _do_submit(self, msg: dict) -> int:
-        return self.submit({
+        req = {
             "text": msg.get("text"),
             "file_paths": msg.get("file_paths") or {},
             "input_modalities": list(msg.get("input_modalities") or []),
             "output_modalities": list(msg.get("output_modalities") or ["text"]),
             "model_kwargs": dict(msg.get("model_kwargs") or {}),
-        })
+        }
+        if msg.get("tokens") is not None:
+            req["tokens"] = list(msg["tokens"])  # frontend-tokenized prompt
+        return self.submit(req)
 
     def run_until_idle(self) -> dict[int, list[Any]]:
         """Drive until no request has work left (used by the batch demo)."""
@@ -662,7 +682,8 @@ class Conductor:
         the same `ZmqCommunicator` mesh as msgpack. `submit`/`chunk`/`done` are the
         only messages that cross this seam — tensor bytes never do (those move
         worker<->conductor through SHM)."""
-        stream = _FrontendStream(self.mbox, self.policy.tokenizer)
+        stream = _FrontendStream(self.mbox, getattr(self.policy, "tokenizer", None))
+        self._stream = stream
         self.on_emit = stream.emit
         self.on_done = stream.done
         self.on_error = stream.error
@@ -1046,18 +1067,23 @@ class DisaggCoordinator:
                 # centralized Conductor ingests). Ingest failures fail ONE
                 # request instead of killing the serve loop.
                 try:
-                    gid = self.submit({
+                    req = {
                         "text": msg.get("text"),
                         "file_paths": msg.get("file_paths") or {},
                         "input_modalities": list(msg.get("input_modalities") or []),
                         "output_modalities": list(msg.get("output_modalities") or ["text"]),
                         "model_kwargs": dict(msg.get("model_kwargs") or {}),
-                    })
+                    }
+                    if msg.get("tokens") is not None:
+                        req["tokens"] = list(msg["tokens"])
+                    gid = self.submit(req)
                 except Exception as e:  # noqa: BLE001
                     if self._stream is not None:
                         self._stream.error(msg["rid"], repr(e))
                 else:
                     self._front_rid[gid] = msg["rid"]
+                    if msg.get("frontend_detok") and self._stream is not None:
+                        self._stream.set_raw(msg["rid"])
             elif t == "abort":
                 # Frontend gave up (disconnect/timeout): finish the request on
                 # every leader (they forward to TP followers) — idempotent.

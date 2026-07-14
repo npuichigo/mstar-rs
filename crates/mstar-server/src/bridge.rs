@@ -53,6 +53,11 @@ struct SubmitMsg<'a> {
     t: &'static str,
     rid: &'a str,
     text: Option<&'a str>,
+    /// Pre-tokenized prompt (frontend-tokenizes path); `text` is None then.
+    tokens: Option<&'a [u32]>,
+    /// The frontend will detokenize: text emissions come back as raw token
+    /// ids (modality "token", 4-byte LE) instead of detokenized pieces.
+    frontend_detok: bool,
     file_paths: &'a BTreeMap<String, Vec<String>>,
     input_modalities: &'a [String],
     output_modalities: &'a [String],
@@ -153,6 +158,8 @@ impl Bridge {
             t: "submit",
             rid: request_id,
             text: args.text.as_deref(),
+            tokens: args.tokens.as_deref(),
+            frontend_detok: args.tokens.is_some(),
             file_paths: &args.file_paths,
             input_modalities: &args.input_modalities,
             output_modalities: &args.output_modalities,

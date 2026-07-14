@@ -26,6 +26,7 @@ mod bridge;
 mod media;
 mod protocol;
 mod serving;
+mod tokenizer;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -88,12 +89,23 @@ async fn main() {
         eprintln!("no conductor socket dir given — mock generator (HTTP/adapter/media layer only)");
     }
 
+    // Optional Rust-side tokenizer (the frontend-tokenizes fast path): loaded
+    // from MSTAR_TOKENIZER for adapters that flag frontend_tokenizes() and for
+    // /generate's `tokenize` field. Absent => every model ships text and the
+    // model side tokenizes (the multimodal-safe default).
+    let tok = std::env::var("MSTAR_TOKENIZER").ok().map(|path| {
+        let t = tokenizer::Tok::from_file(&path).expect("load MSTAR_TOKENIZER");
+        eprintln!("tokenizer loaded from {path} ({} vocab)", t.vocab_size());
+        Arc::new(t)
+    });
+
     let state = AppState {
         model_name: model_name.clone(),
         upload_dir,
         allow_remote,
         sample_rate,
         request_timeout,
+        tok,
         bridge,
     };
 
@@ -214,10 +226,17 @@ async fn chat_completions(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
+    let mut args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    // Frontend-tokenizes fast path: flagged adapters with a loaded tokenizer
+    // submit token ids and detokenize the reply in Rust, off the GIL.
+    if adapter.frontend_tokenizes() {
+        if let (Some(tok), Some(text)) = (&st.tok, args.text.take()) {
+            args.tokens = Some(tok.encode(&text));
+        }
+    }
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("chatcmpl");
 
@@ -498,6 +517,7 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
     let mut in_mods_raw: Option<String> = None;
     let mut out_mods_raw = "text".to_string();
     let mut streaming = true;
+    let mut tokenize = false;
     let mut mk_raw: Option<String> = None;
     let mut request_id: Option<String> = None;
     let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -532,6 +552,7 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
                 "input_modalities" => in_mods_raw = Some(val),
                 "output_modalities" => out_mods_raw = val,
                 "streaming" => streaming = matches!(val.as_str(), "true" | "True" | "1"),
+                "tokenize" => tokenize = matches!(val.as_str(), "true" | "True" | "1"),
                 "model_kwargs" => mk_raw = Some(val),
                 "request_id" => request_id = Some(val),
                 _ => {}
@@ -570,8 +591,21 @@ async fn generate(State(st): State<AppState>, mut mp: Multipart) -> Response {
     };
     let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // `tokenize=true`: encode the text in Rust and submit token ids; the
+    // reply's text streams back as token ids and detokenizes here too.
+    let mut tokens: Option<Vec<u32>> = None;
+    if tokenize {
+        let Some(tok) = &st.tok else {
+            return error(400, "tokenize=true requires the server to be started \
+                               with MSTAR_TOKENIZER", "invalid_request_error");
+        };
+        tokens = Some(tok.encode(text.as_deref().unwrap_or("")));
+        text = None; // the model side must use the ids, not re-tokenize
+    }
+
     let args = SubmitArgs {
         text,
+        tokens,
         file_paths,
         input_modalities,
         output_modalities,

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::adapters::SubmitArgs;
 use crate::bridge::{Bridge, ResultChunk, StreamItem};
+use crate::tokenizer::{IncrementalDecoder, Tok};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +34,10 @@ pub struct AppState {
     /// Total per-request budget (mstar's `timeout_seconds`, default 600 s):
     /// exceeded => a terminal error + an abort to the conductor.
     pub request_timeout: Duration,
+    /// Loaded when `MSTAR_TOKENIZER` points at a tokenizer.json — enables the
+    /// frontend-tokenizes fast path (tokenize + incremental detok in Rust, off
+    /// the GIL) for flagged adapters and `/generate?tokenize=true`.
+    pub tok: Option<Arc<Tok>>,
     /// Present when a conductor socket dir is given (real streaming); absent =
     /// the self-contained mock generator.
     pub bridge: Option<Arc<Bridge>>,
@@ -65,7 +70,45 @@ impl Drop for AbortGuard {
 }
 
 /// The unified result source: bridge to the conductor, or the mock generator.
+/// On the frontend-tokenizes path (`args.tokens` set, tokenizer loaded), raw
+/// token-id chunks (modality "token", 4-byte LE) coming back are detokenized
+/// HERE, incrementally, so every handler downstream still sees text chunks.
 pub fn result_stream(
+    state: &AppState,
+    args: &SubmitArgs,
+    request_id: &str,
+    streaming: bool,
+) -> OutStream {
+    let base = raw_result_stream(state, args, request_id, streaming);
+    match (&args.tokens, &state.tok) {
+        (Some(_), Some(tok)) => {
+            use futures::StreamExt;
+            let detok = IncrementalDecoder::new(tok.clone());
+            Box::pin(
+                base.scan(detok, |detok, item| {
+                    let mapped = match item {
+                        Out::Chunk(c) if c.modality == "token" && c.data.len() == 4 => {
+                            let id = u32::from_le_bytes([c.data[0], c.data[1], c.data[2], c.data[3]]);
+                            detok.step(id).map(|piece| {
+                                Out::Chunk(ResultChunk {
+                                    modality: "text".to_string(),
+                                    data: piece.into_bytes(),
+                                    metadata: c.metadata,
+                                })
+                            })
+                        }
+                        other => Some(other),
+                    };
+                    futures::future::ready(Some(mapped))
+                })
+                .filter_map(futures::future::ready),
+            )
+        }
+        _ => base,
+    }
+}
+
+fn raw_result_stream(
     state: &AppState,
     args: &SubmitArgs,
     request_id: &str,
