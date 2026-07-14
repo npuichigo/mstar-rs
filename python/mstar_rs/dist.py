@@ -111,7 +111,7 @@ class _FrontendStream:
         self._mbox.send("frontend", msgpack.packb(
             {"t": "err", "rid": front_rid, "msg": str(msg)}))
 
-from mstar_rs._core import ZmqCommunicator, Runtime, ShmArena
+from mstar_rs._core import Runtime, SegmentedShmArena, ShmArena, ZmqCommunicator
 
 from .driver import Driver
 
@@ -143,41 +143,82 @@ def _dtype_str(dtype: torch.dtype) -> str:
 
 
 class ShmPool:
-    """One owned arena (this entity's producer buffer) + a cache of opened
-    peer arenas for reading. A descriptor is
-    ``[arena_name, offset, nbytes, dims, dtype_str]``."""
+    """This entity's producer buffer — a grow-by-segments arena — plus a cache
+    of opened peer arenas for reading. A descriptor is
+    ``[arena_name, offset, nbytes, dims, dtype_str]``; with segmentation the
+    arena_name is a segment name (``mstar_rs_{entity}.seg{i}``), which is an
+    ordinary named arena, so the consumer side is unchanged.
 
-    def __init__(self, entity_id: str, size: int = 1 << 30) -> None:
-        self.name = f"mstar_rs_{entity_id}"
-        self.arena = ShmArena.create(self.name, size)
-        self._peers: dict[str, ShmArena] = {self.name: self.arena}
+    Growth replaces the old fixed 1 GB arena's hard `Full` error: a new
+    fixed-size segment is added under pressure (a dedicated one for oversized
+    tensors), up to ``max_segments``. Segments never move once created —
+    `on_new_segment(name, segment)` fires exactly once per segment, which is
+    where a CUDA host-registration (`cudaHostRegister(ptr, len)`) belongs so
+    D2H/H2D copies through the segment can run truly async on side streams."""
+
+    def __init__(self, entity_id: str, segment_size: int = 1 << 28,
+                 max_segments: int = 32, on_new_segment=None) -> None:
+        self.entity_id = entity_id
+        self.base = f"mstar_rs_{entity_id}"
+        self.arena = SegmentedShmArena.create(self.base, segment_size, max_segments)
+        self.on_new_segment = on_new_segment
+        self._views: list = []                 # segment idx -> memoryview
+        self._own: dict[str, int] = {}          # own segment name -> idx
+        self._peers: dict[str, ShmArena] = {}   # peer arena/segment name -> handle
+        self._sync_segments()
+
+    def _sync_segments(self) -> None:
+        while len(self._views) < self.arena.num_segments:
+            i = len(self._views)
+            seg = self.arena.segment(i)
+            self._views.append(memoryview(seg))
+            self._own[self.arena.segment_name(i)] = i
+            if self.on_new_segment is not None:
+                self.on_new_segment(self.arena.segment_name(i), seg)
+
+    @staticmethod
+    def entity_of(name: str) -> str:
+        """The owning entity id of an arena/segment name."""
+        return name[len("mstar_rs_"):].split(".seg")[0]
 
     def stage(self, t: torch.Tensor) -> list:
         """Copy a tensor's bytes into our arena; return its descriptor."""
         t = t.detach().to("cpu").contiguous()
         nbytes = t.numel() * t.element_size()
-        off = self.arena.reserve(max(nbytes, 1))
+        seg, off = self.arena.reserve(max(nbytes, 1))
+        self._sync_segments()  # growth may have added a segment
         if nbytes:  # torch.frombuffer rejects an empty buffer
-            mv = memoryview(self.arena)[off:off + nbytes]
+            mv = self._views[seg][off:off + nbytes]
             torch.frombuffer(mv, dtype=t.dtype).copy_(t.flatten())
-        return [self.name, off, nbytes, list(t.shape), _dtype_str(t.dtype)]
+        return [self.arena.segment_name(seg), off, nbytes, list(t.shape),
+                _dtype_str(t.dtype)]
 
     def read(self, desc: list) -> torch.Tensor:
         name, off, nbytes, dims, dtype_str = desc
         dtype = _STR_TO_DTYPE[dtype_str]
         if nbytes == 0:  # empty tensor: nothing to map, reconstruct from dims
             return torch.empty(dims, dtype=dtype)
-        arena = self._peers.get(name)
-        if arena is None:
-            arena = ShmArena.open(name)
-            self._peers[name] = arena
-        mv = memoryview(arena)[off:off + nbytes]
+        if (i := self._own.get(name)) is not None:
+            mv = self._views[i][off:off + nbytes]
+        else:
+            arena = self._peers.get(name)
+            if arena is None:
+                arena = ShmArena.open(name)
+                self._peers[name] = arena
+            mv = memoryview(arena)[off:off + nbytes]
         flat = torch.frombuffer(mv, dtype=dtype).clone()
         return flat.reshape(dims)
 
+    def owns(self, name: str) -> bool:
+        return name in self._own
+
+    def free_by_name(self, name: str, off: int) -> bool:
+        """Release an offset in one of OUR segments (by descriptor name)."""
+        i = self._own.get(name)
+        return self.arena.free(i, off) if i is not None else False
+
     def free(self, desc: list) -> None:
-        if desc[0] == self.name:
-            self.arena.free(desc[1])
+        self.free_by_name(desc[0], desc[1])
 
 
 # ---- worker -----------------------------------------------------------------
@@ -216,9 +257,9 @@ class Worker:
                 self.engine.release_request(int(msg["rid"]))
             elif t == "free":
                 # Conductor reclaims a finished request's tensors: release our
-                # arena offsets (all were read/cloned by the conductor already).
-                for off in msg["offs"]:
-                    self.shm.arena.free(off)
+                # (segment, offset)s — all were read/cloned by the conductor.
+                for name, off in msg["items"]:
+                    self.shm.free_by_name(name, off)
 
     def _handle_execute(self, msg: dict) -> None:
         batch_id = msg["batch_id"]
@@ -589,18 +630,19 @@ class Conductor:
         Idempotent — a uuid already freed is no longer in `desc` and is
         skipped (so the request-finish backstop and the incremental Free
         events compose without double-freeing)."""
-        by_worker: dict[str, list[int]] = {}
+        by_worker: dict[str, list] = {}
         for uuid in uuids:
             desc = self.desc.pop(uuid, None)
             if desc is None:
                 continue
             arena_name, off = desc[0], desc[1]
-            if arena_name == self.shm.name:
-                self.shm.arena.free(off)
-            else:  # arena name is f"mstar_rs_{worker_id}"
-                by_worker.setdefault(arena_name[len("mstar_rs_"):], []).append(off)
-        for worker_id, offs in by_worker.items():
-            self.mbox.send(worker_id, msgpack.packb({"t": "free", "offs": offs}))
+            if self.shm.owns(arena_name):
+                self.shm.free_by_name(arena_name, off)
+            else:  # segment name is f"mstar_rs_{worker_id}.seg{i}"
+                by_worker.setdefault(ShmPool.entity_of(arena_name), []).append(
+                    (arena_name, off))
+        for worker_id, items in by_worker.items():
+            self.mbox.send(worker_id, msgpack.packb({"t": "free", "items": items}))
 
     def _reclaim(self, rid: int) -> None:
         """Backstop at request finish: free whatever this request still holds.

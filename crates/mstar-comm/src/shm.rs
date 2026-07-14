@@ -233,6 +233,147 @@ impl Drop for ShmArena {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Segmented arena: grow-by-segments + uuid reclaim (RFC #130 Step 2)
+// ---------------------------------------------------------------------------
+
+/// A producer arena that grows by adding fixed-size segments instead of
+/// erroring (or resizing) when full.
+///
+/// Why segments, not `mremap`: each segment's mapping is created once and
+/// never moves, so a CUDA host-registration (`cudaHostRegister`) of a segment
+/// stays valid for its lifetime — the property that keeps D2H/H2D copies on
+/// side streams truly asynchronous. A dynamically-resized arena would
+/// invalidate the registration on every growth. Registration itself is the
+/// embedder's job (torch/cuda): watch `num_segments()` and register each new
+/// segment's `(ptr, len)` once.
+///
+/// Descriptors are `(segment_name, offset)`: every segment is an ordinary
+/// named [`ShmArena`] (`{base}.seg{i}`), so consumers keep opening arenas
+/// lazily by name — a consumer never needs to know segmentation exists.
+///
+/// Reclaim is uuid-based (mstar's cleanup contract): [`Self::reserve_for`]
+/// records the allocation under the caller's uuid and [`Self::free_uuid`]
+/// releases everything held by that uuid, idempotently. Offset-based
+/// [`Self::free`] remains for embedders that track descriptors themselves.
+///
+/// Allocations larger than the segment size get a dedicated segment of
+/// exactly that size (freed segments are reused like any other).
+pub struct SegmentedShmArena {
+    base: String,
+    segment_size: usize,
+    max_segments: usize,
+    segments: Vec<std::sync::Arc<ShmArena>>,
+    // uuid -> allocations it holds. Multi-tensor uuids supported.
+    ledger: Mutex<HashMap<u64, Vec<(usize, usize)>>>, // (segment idx, offset)
+}
+
+impl SegmentedShmArena {
+    /// Create with one initial segment. `max_segments` caps total growth
+    /// (the arena-full backpressure boundary): `segment_size * max_segments`
+    /// bytes, after which `reserve` reports `Full`.
+    pub fn create(
+        base: &str,
+        segment_size: usize,
+        max_segments: usize,
+    ) -> Result<Self, ShmError> {
+        if segment_size == 0 || max_segments == 0 {
+            return Err(ShmError::ZeroSize);
+        }
+        let first = ShmArena::create(&format!("{base}.seg0"), segment_size)?;
+        Ok(Self {
+            base: base.to_string(),
+            segment_size,
+            max_segments,
+            segments: vec![std::sync::Arc::new(first)],
+            ledger: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Reserve `nbytes`; returns `(segment_index, offset)`. Tries existing
+    /// segments first-fit, then grows by one segment (a dedicated one when
+    /// `nbytes` exceeds the segment size), up to `max_segments`.
+    pub fn reserve(&mut self, nbytes: usize) -> Result<(usize, usize), ShmError> {
+        for (i, seg) in self.segments.iter().enumerate() {
+            if let Ok(off) = seg.reserve(nbytes) {
+                return Ok((i, off));
+            }
+        }
+        if self.segments.len() >= self.max_segments {
+            return Err(ShmError::Full {
+                need: nbytes,
+                free: self.segments.iter().map(|s| s.bytes_free()).sum(),
+                total: self.segments.iter().map(|s| s.size()).sum(),
+            });
+        }
+        let idx = self.segments.len();
+        let size = self.segment_size.max(align_up(nbytes.max(1)));
+        let seg = ShmArena::create(&format!("{}.seg{idx}", self.base), size)?;
+        let off = seg.reserve(nbytes)?; // fresh segment sized to fit: infallible
+        self.segments.push(std::sync::Arc::new(seg));
+        Ok((idx, off))
+    }
+
+    /// Reserve `nbytes` and record the allocation under `uuid` (mstar's
+    /// uuid-based reclaim). One uuid may hold many allocations.
+    pub fn reserve_for(&mut self, uuid: u64, nbytes: usize) -> Result<(usize, usize), ShmError> {
+        let (seg, off) = self.reserve(nbytes)?;
+        self.ledger
+            .lock()
+            .expect("ledger lock")
+            .entry(uuid)
+            .or_default()
+            .push((seg, off));
+        Ok((seg, off))
+    }
+
+    /// Free everything held by `uuid`. Idempotent: an unknown uuid frees
+    /// nothing. Returns the number of allocations released.
+    pub fn free_uuid(&self, uuid: u64) -> usize {
+        let allocs = self
+            .ledger
+            .lock()
+            .expect("ledger lock")
+            .remove(&uuid)
+            .unwrap_or_default();
+        let mut n = 0;
+        for (seg, off) in allocs {
+            if self.segments.get(seg).is_some_and(|s| s.free(off)) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Release one offset (embedder-tracked descriptors). Idempotent.
+    pub fn free(&self, segment: usize, offset: usize) -> bool {
+        self.segments
+            .get(segment)
+            .is_some_and(|s| s.free(offset))
+    }
+
+    pub fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// The `{base}.seg{i}` arena name — what descriptors carry, and what a
+    /// consumer passes to [`ShmArena::open`].
+    pub fn segment_name(&self, i: usize) -> String {
+        format!("{}.seg{i}", self.base)
+    }
+
+    /// A shared handle to segment `i` (buffer views, registration hooks).
+    pub fn segment(&self, i: usize) -> Option<std::sync::Arc<ShmArena>> {
+        self.segments.get(i).cloned()
+    }
+
+    /// `(base_ptr, len)` of segment `i` — the registration hook: the embedder
+    /// `cudaHostRegister`s each new segment ONCE; the mapping never moves.
+    pub fn segment_ptr_len(&self, i: usize) -> Option<(*mut u8, usize)> {
+        self.segments.get(i).map(|s| (s.as_mut_ptr(), s.size()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +427,66 @@ mod tests {
             ShmArena::create(&name("z"), 0),
             Err(ShmError::ZeroSize)
         ));
+    }
+
+    // ---- segmented arena (grow-by-segments + uuid reclaim) ----------------
+
+    #[test]
+    fn segments_grow_under_pressure_and_names_are_openable() {
+        let base = name("seg");
+        let mut a = SegmentedShmArena::create(&base, 1024, 4).unwrap();
+        assert_eq!(a.num_segments(), 1);
+
+        // Fill segment 0, forcing growth into segment 1.
+        let (s0, _) = a.reserve(900).unwrap();
+        let (s1, o1) = a.reserve(900).unwrap();
+        assert_eq!((s0, s1), (0, 1));
+        assert_eq!(a.num_segments(), 2);
+
+        // A late segment is an ordinary named arena a consumer can open —
+        // exactly what a (segment_name, offset) descriptor promises.
+        let cons = ShmArena::open(&a.segment_name(1)).unwrap();
+        assert_eq!(cons.size(), 1024);
+        let _ = (cons.bytes(o1, 4), ());
+
+        // The registration hook surface: stable (ptr, len) per segment.
+        let (p0, l0) = a.segment_ptr_len(0).unwrap();
+        assert!(!p0.is_null());
+        assert_eq!(l0, 1024);
+    }
+
+    #[test]
+    fn oversized_allocation_gets_dedicated_segment() {
+        let base = name("big");
+        let mut a = SegmentedShmArena::create(&base, 1024, 4).unwrap();
+        let (seg, off) = a.reserve(5000).unwrap(); // > segment_size
+        assert_eq!((seg, off), (1, 0));
+        assert!(a.segment(1).unwrap().size() >= 5000);
+    }
+
+    #[test]
+    fn growth_cap_reports_full() {
+        let base = name("cap");
+        let mut a = SegmentedShmArena::create(&base, 512, 2).unwrap();
+        a.reserve(500).unwrap(); // fills seg 0
+        a.reserve(500).unwrap(); // grows + fills seg 1
+        assert!(matches!(a.reserve(500), Err(ShmError::Full { .. })));
+        // Freeing makes room again (backpressure boundary, not a dead end).
+        assert!(a.free(0, 0));
+        assert!(matches!(a.reserve(500), Ok((0, 0))));
+    }
+
+    #[test]
+    fn uuid_reclaim_is_grouped_and_idempotent() {
+        let base = name("uuid");
+        let mut a = SegmentedShmArena::create(&base, 4096, 4).unwrap();
+        a.reserve_for(7, 100).unwrap();
+        a.reserve_for(7, 100).unwrap(); // same uuid holds two allocations
+        a.reserve_for(8, 100).unwrap();
+        assert_eq!(a.free_uuid(7), 2);
+        assert_eq!(a.free_uuid(7), 0); // idempotent
+        assert_eq!(a.free_uuid(999), 0); // unknown uuid: no-op
+        assert_eq!(a.free_uuid(8), 1);
+        assert_eq!(a.segment(0).unwrap().bytes_free(), 4096);
     }
 }

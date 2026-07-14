@@ -17,7 +17,7 @@ use std::collections::BTreeMap as StdBTreeMap;
 
 use std::time::Duration;
 
-use mstar_comm::{RawZmqCommunicator, RecvEvent, ShmArena};
+use mstar_comm::{RawZmqCommunicator, RecvEvent, SegmentedShmArena, ShmArena};
 use mstar_core::{IncomingInput, TensorRef};
 use mstar_runtime::{Event, KvCacheConfig, Runtime, RuntimeError};
 
@@ -462,6 +462,112 @@ impl PyShmArena {
     unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
 }
 
+/// One segment of a `SegmentedShmArena`, exposed with the buffer protocol so
+/// staging stays zero-copy per segment: `torch.frombuffer(memoryview(seg)
+/// [off:off+n], ...)`. The mapping never moves, so a memoryview (and a CUDA
+/// host-registration of the segment) stays valid for the segment's lifetime.
+#[pyclass(name = "ShmSegment")]
+struct PyShmSegment {
+    seg: std::sync::Arc<ShmArena>,
+}
+
+#[pymethods]
+impl PyShmSegment {
+    #[getter]
+    fn size(&self) -> usize {
+        self.seg.size()
+    }
+
+    /// `(base_ptr, len)` for the registration hook — the embedder
+    /// `cudaHostRegister`s each new segment once (e.g. via
+    /// `torch.cuda.cudart().cudaHostRegister(ptr, len, flags)`).
+    fn ptr_len(&self) -> (usize, usize) {
+        (self.seg.as_mut_ptr() as usize, self.seg.size())
+    }
+
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        if view.is_null() {
+            return Err(PyValueError::new_err("null buffer view"));
+        }
+        let borrow = slf.borrow();
+        let ptr = borrow.seg.as_mut_ptr() as *mut c_void;
+        let len = borrow.seg.size() as ffi::Py_ssize_t;
+        let ret = ffi::PyBuffer_FillInfo(view, slf.as_ptr(), ptr, len, 0, flags);
+        if ret != 0 {
+            Err(PyErr::fetch(slf.py()))
+        } else {
+            Ok(())
+        }
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut ffi::Py_buffer) {}
+}
+
+/// Grow-by-segments producer arena + uuid reclaim (RFC #130 Step 2 surface).
+/// `reserve(n) -> (segment_idx, offset)`; descriptors carry
+/// `segment_name(idx)` so consumers keep opening plain `ShmArena`s by name.
+/// Segments are created once and never move — registration-friendly.
+#[pyclass(name = "SegmentedShmArena")]
+struct PySegmentedShmArena {
+    arena: SegmentedShmArena,
+}
+
+#[pymethods]
+impl PySegmentedShmArena {
+    #[staticmethod]
+    fn create(base: &str, segment_size: usize, max_segments: usize) -> PyResult<Self> {
+        Ok(Self {
+            arena: SegmentedShmArena::create(base, segment_size, max_segments)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+
+    /// -> (segment_idx, offset); grows by one segment when full (dedicated
+    /// segment for oversized allocations), errors at the max_segments cap.
+    fn reserve(&mut self, nbytes: usize) -> PyResult<(usize, usize)> {
+        self.arena
+            .reserve(nbytes)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Reserve and record under `uuid` (mstar's uuid-based reclaim).
+    fn reserve_for(&mut self, uuid: u64, nbytes: usize) -> PyResult<(usize, usize)> {
+        self.arena
+            .reserve_for(uuid, nbytes)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Free everything held by `uuid` (idempotent); returns count released.
+    fn free_uuid(&self, uuid: u64) -> usize {
+        self.arena.free_uuid(uuid)
+    }
+
+    fn free(&self, segment: usize, offset: usize) -> bool {
+        self.arena.free(segment, offset)
+    }
+
+    #[getter]
+    fn num_segments(&self) -> usize {
+        self.arena.num_segments()
+    }
+
+    fn segment_name(&self, i: usize) -> String {
+        self.arena.segment_name(i)
+    }
+
+    /// Shared buffer-protocol view of segment `i`.
+    fn segment(&self, i: usize) -> PyResult<PyShmSegment> {
+        self.arena
+            .segment(i)
+            .map(|seg| PyShmSegment { seg })
+            .ok_or_else(|| PyValueError::new_err(format!("no segment {i}")))
+    }
+}
+
 /// The control-plane message mesh for the conductor + worker processes.
 /// Carries **opaque byte frames** — the encoding is the caller's (the Python
 /// side frames its protocol with msgpack; pickle passes through equally, the
@@ -556,6 +662,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyBatch>()?;
     m.add_class::<PyShmArena>()?;
+    m.add_class::<PySegmentedShmArena>()?;
+    m.add_class::<PyShmSegment>()?;
     m.add_class::<PyZmqCommunicator>()?;
     m.add("EMIT_TO_CLIENT", mstar_core::EMIT_TO_CLIENT)?;
     m.add("EMPTY_DESTINATION", mstar_core::EMPTY_DESTINATION)?;

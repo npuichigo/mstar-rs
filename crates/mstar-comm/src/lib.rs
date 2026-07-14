@@ -21,4 +21,4 @@ pub mod shm;
 pub use communicator::{
     BincodeCodec, Codec, CommError, RawZmqCommunicator, RecvEvent, ZmqCommunicator,
 };
-pub use shm::{ShmArena, ShmError, ALIGN};
+pub use shm::{SegmentedShmArena, ShmArena, ShmError, ALIGN};
