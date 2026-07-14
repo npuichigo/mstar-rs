@@ -760,6 +760,23 @@ class DisaggWorker:
         self.driver.on_partition_done = self._partition_done
 
     def run(self) -> None:
+        try:
+            self._run()
+        except Exception as e:  # noqa: BLE001 — report the crash, then die loudly
+            # Tell the coordinator which requests die with us so it fails them
+            # (frontend 500 / errors dict) instead of hanging forever on a
+            # worker that will never report partition_done. Best-effort — the
+            # exception still propagates (the process exits as before).
+            try:
+                if self.io_leader:
+                    self.mbox.send(self.coordinator_id, msgpack.packb(
+                        {"t": "worker_error", "worker": self.worker_id,
+                         "gids": list(self._g2l.keys()), "msg": repr(e)}))
+            except Exception:
+                pass
+            raise
+
+    def _run(self) -> None:
         while not self._stop:
             raw = self.mbox.recv_timeout(50)   # block when idle (no busy spin)
             # Drain a BOUNDED number of queued messages, then always poll — an
@@ -961,12 +978,18 @@ class DisaggCoordinator:
         self.results: dict[int, list[Any]] = {}
         self._pending: dict[int, set] = {}   # gid -> partitions not yet done
         self.finished: set[int] = set()
+        self.errors: dict[int, str] = {}     # gid -> failure detail
+        # Workers that reported a crash: their requests were failed, and new
+        # submits that would seed them are refused up front.
+        self._dead_workers: set[str] = set()
         # Frontend serving (mirrors Conductor.serve_frontend).
         self._front_rid: dict[int, Any] = {}   # gid -> frontend request id
         self._stream: _FrontendStream | None = None
         self._stop = threading.Event()
 
     def submit(self, request: dict[str, Any]) -> int:
+        if dead := (self._dead_workers & self._all_workers()):
+            raise RuntimeError(f"worker(s) {sorted(dead)} died; restart the stack")
         gid = self._gid
         self._gid += 1
         self.results[gid] = []
@@ -1048,6 +1071,29 @@ class DisaggCoordinator:
                     fin = msgpack.packb({"t": "finish", "gid": gid})
                     for worker in {ws[0] for ws in self.partition_to_workers.values()}:
                         self.mbox.send(worker, fin)
+            elif t == "worker_error":
+                # A worker crashed: fail every request it carried (frontend
+                # error / errors dict) so nothing hangs on a partition that
+                # will never report done, tell the surviving leaders to drop
+                # them, and refuse new submits that would seed the dead worker.
+                detail = msg.get("msg", "worker died")
+                dead = msg.get("worker", "")
+                self._dead_workers.add(dead)
+                for gid in msg.get("gids", []):
+                    gid = int(gid)
+                    if gid in self.finished:
+                        continue
+                    self._pending.pop(gid, None)
+                    self.results.pop(gid, None)
+                    self.errors[gid] = detail
+                    self.finished.add(gid)
+                    if (front := self._front_rid.pop(gid, None)) is not None \
+                            and self._stream is not None:
+                        self._stream.error(front, detail)
+                    fin = msgpack.packb({"t": "finish", "gid": gid})
+                    for worker in {ws[0] for ws in self.partition_to_workers.values()}:
+                        if worker != dead:
+                            self.mbox.send(worker, fin)
             raw = self.mbox.try_recv()
 
     def run_until_idle(self) -> dict[int, list[Any]]:
