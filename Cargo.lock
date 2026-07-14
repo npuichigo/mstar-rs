@@ -750,6 +750,7 @@ name = "mstar-comm"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "libc",
  "memmap2",
  "serde",
  "thiserror 2.0.18",

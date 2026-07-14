@@ -10,3 +10,6 @@ bincode = "1.3"
 memmap2 = "0.9"
 thiserror = { workspace = true }
 zmq = "0.10"
+
+[dev-dependencies]
+libc = "0.2"  # eventfd in the wakeup-fd tests

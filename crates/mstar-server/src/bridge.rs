@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mstar_comm::ZmqCommunicator;
+use mstar_comm::RawZmqCommunicator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -70,7 +70,7 @@ struct Inbound {
 }
 
 pub struct Bridge {
-    mbox: Arc<ZmqCommunicator<Vec<u8>>>,
+    mbox: Arc<RawZmqCommunicator>,
     // rid -> the serving task's sender; the demux thread routes chunks here.
     routes: Arc<Mutex<HashMap<String, UnboundedSender<StreamItem>>>>,
 }
@@ -80,7 +80,7 @@ impl Bridge {
     /// conductor messages out to per-request channels.
     pub fn new(socket_dir: &str) -> Result<Self, String> {
         let mbox = Arc::new(
-            ZmqCommunicator::<Vec<u8>>::bind("frontend", socket_dir).map_err(|e| e.to_string())?,
+            RawZmqCommunicator::bind("frontend", socket_dir).map_err(|e| e.to_string())?,
         );
         let routes: Arc<Mutex<HashMap<String, UnboundedSender<StreamItem>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -93,7 +93,7 @@ impl Bridge {
     }
 
     fn demux_loop(
-        mbox: Arc<ZmqCommunicator<Vec<u8>>>,
+        mbox: Arc<RawZmqCommunicator>,
         routes: Arc<Mutex<HashMap<String, UnboundedSender<StreamItem>>>>,
     ) {
         loop {

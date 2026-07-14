@@ -8,12 +8,17 @@
 //! (a real wire format replacing mstar's pickle), one message per zmq frame,
 //! so the envelope schema is explicit and cross-process-stable.
 //!
-//! Transport is deliberately the only thing here; message *types* are the
-//! runtime's concern, so [`ZmqCommunicator`] is generic over any
-//! `Serialize + DeserializeOwned` message.
+//! Transport and encoding are separate layers (the migration seam):
+//! [`RawZmqCommunicator`] moves opaque byte frames — pickle, msgpack, or
+//! bincode pass through untouched — over ipc *or* tcp endpoints, with
+//! wakeup-fd polling (an eventfd wakes the receive loop immediately);
+//! [`ZmqCommunicator`] adds a typed [`Codec`] on top ([`BincodeCodec`] by
+//! default). Message *types* are the runtime's concern.
 
 mod communicator;
 pub mod shm;
 
-pub use communicator::{ZmqCommunicator, CommError};
+pub use communicator::{
+    BincodeCodec, Codec, CommError, RawZmqCommunicator, RecvEvent, ZmqCommunicator,
+};
 pub use shm::{ShmArena, ShmError, ALIGN};

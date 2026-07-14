@@ -17,7 +17,7 @@ use std::collections::BTreeMap as StdBTreeMap;
 
 use std::time::Duration;
 
-use mstar_comm::{ZmqCommunicator, ShmArena};
+use mstar_comm::{RawZmqCommunicator, RecvEvent, ShmArena};
 use mstar_core::{IncomingInput, TensorRef};
 use mstar_runtime::{Event, KvCacheConfig, Runtime, RuntimeError};
 
@@ -463,11 +463,15 @@ impl PyShmArena {
 }
 
 /// The control-plane message mesh for the conductor + worker processes.
-/// Carries opaque `bytes` payloads (the Python side frames its protocol with
-/// msgpack); transport is the ZeroMQ PUSH/PULL `ZmqCommunicator` (ordered, reconnecting).
+/// Carries **opaque byte frames** — the encoding is the caller's (the Python
+/// side frames its protocol with msgpack; pickle passes through equally, the
+/// wire adds no framing). Transport is the ZeroMQ PUSH/PULL
+/// `RawZmqCommunicator`: ordered, reconnecting, ipc or tcp endpoints, with
+/// wakeup-fd polling (an eventfd wakes `recv_or_wake` immediately — mstar's
+/// async-worker pattern).
 #[pyclass(name = "ZmqCommunicator")]
 struct PyZmqCommunicator {
-    inner: ZmqCommunicator<Vec<u8>>,
+    inner: RawZmqCommunicator,
 }
 
 #[pymethods]
@@ -476,14 +480,46 @@ impl PyZmqCommunicator {
     #[new]
     fn new(my_id: &str, dir: &str) -> PyResult<Self> {
         Ok(Self {
-            inner: ZmqCommunicator::bind(my_id, dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+            inner: RawZmqCommunicator::bind(my_id, dir)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
         })
+    }
+
+    /// Bind at an explicit zmq endpoint — e.g. `tcp://0.0.0.0:5701` for the
+    /// multi-node path, or `tcp://127.0.0.1:*` for an OS-assigned port (query
+    /// with `last_endpoint()`). Peers must be `register_peer`ed.
+    #[staticmethod]
+    fn bind_endpoint(my_id: &str, endpoint: &str) -> PyResult<Self> {
+        Ok(Self {
+            inner: RawZmqCommunicator::bind_endpoint(my_id, endpoint)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+
+    /// The bound endpoint as zmq reports it (carries the OS-assigned port).
+    fn last_endpoint(&self) -> PyResult<String> {
+        self.inner
+            .last_endpoint()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Map `peer_id` to an explicit endpoint (tcp or ipc) — required for tcp
+    /// peers; overrides the ipc-dir scheme.
+    fn register_peer(&self, peer_id: &str, endpoint: &str) {
+        self.inner.register_peer(peer_id, endpoint);
+    }
+
+    /// Poll `fd` (e.g. an eventfd) alongside the inbox: when readable,
+    /// `recv_or_wake` returns ("wake", None) immediately. The registrant
+    /// reads/clears the fd; until cleared it keeps waking (level-triggered).
+    fn register_wakeup_fd(&self, fd: i32) {
+        self.inner.register_wakeup_fd(fd);
     }
 
     /// Fire-and-forget send `data` to peer `peer_id`.
     fn send(&self, peer_id: &str, data: &[u8]) -> PyResult<()> {
         self.inner
-            .send(peer_id, &data.to_vec())
+            .send(peer_id, data)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -492,10 +528,26 @@ impl PyZmqCommunicator {
         self.inner.try_recv().map(|b| PyBytes::new(py, &b))
     }
 
-    /// Block up to `timeout_ms` for the next message.
+    /// Block up to `timeout_ms` for the next message. A wakeup fd cuts the
+    /// wait short (returns None); use `recv_or_wake` to tell wake from timeout.
     fn recv_timeout<'py>(&self, py: Python<'py>, timeout_ms: u64) -> Option<Bound<'py, PyBytes>> {
         py.allow_threads(|| self.inner.recv_timeout(Duration::from_millis(timeout_ms)))
             .map(|b| PyBytes::new(py, &b))
+    }
+
+    /// Wake-aware receive: ("msg", bytes) | ("wake", None) | ("timeout", None).
+    fn recv_or_wake<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> (&'static str, Option<Bound<'py, PyBytes>>) {
+        let ev =
+            py.allow_threads(|| self.inner.recv_or_wake(Duration::from_millis(timeout_ms)));
+        match ev {
+            RecvEvent::Message(b) => ("msg", Some(PyBytes::new(py, &b))),
+            RecvEvent::Wake => ("wake", None),
+            RecvEvent::Timeout => ("timeout", None),
+        }
     }
 }
 
