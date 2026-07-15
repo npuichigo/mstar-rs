@@ -348,3 +348,61 @@ class FlashInferCacheHandle:
 
     def advance_seq_lens(self, *a: object, **kw: object) -> None:
         pass  # the Rust runtime owns sequence positions
+
+
+class DoubleBufferedDecodeAttention:
+    """Two decode-attention slots alternating per step — the substrate for
+    mstar's pre-plan-during-replay depth (its double-buffered CudaGraphRunner
+    wrappers + plan_executor): while the CUDA graph captured against slot A
+    replays step N, `plan()` for step N+1 runs against slot B on a side
+    thread, so the FlashInfer planning cost hides under the GPU step instead
+    of sitting between steps.
+
+    Adoption contract for an engine:
+      * capture TWO decode graphs, one against each slot's handle
+        (`slot(0)/slot(1)`), and replay the graph of `active()`;
+      * per step: `plan_active(...)` (or accept a pre-plan), replay, then
+        `swap()`;
+      * a pre-planner thread may call `plan_idle(...)` for the PREDICTED next
+        step (same pages, seq_pos + 1) any time after the active replay has
+        advanced the sequence state — mstar gates this on an advance_event set
+        by the GPU thread right after `advance_seq_lens`.
+
+    Engine adoption + the overlap measurement are GPU-gated and tracked with
+    the GPU verification queue; this primitive is inert until adopted.
+    """
+
+    def __init__(self, cache, num_qo_heads: int, head_dim: int, device,
+                 dtype=None) -> None:
+        import torch as _torch
+
+        dtype = dtype or _torch.bfloat16
+        self._slots = [
+            FlashInferAttention(cache, num_qo_heads, head_dim, device,
+                                max_new_tokens=1, cudagraph=True, causal=True,
+                                dtype=dtype)
+            for _ in range(2)
+        ]
+        self._active = 0
+
+    def slot(self, i: int) -> "FlashInferAttention":
+        return self._slots[i]
+
+    def active(self) -> "FlashInferAttention":
+        return self._slots[self._active]
+
+    def active_index(self) -> int:
+        return self._active
+
+    def plan_active(self, pages, seq_pos: int, new_len: int = 1) -> None:
+        self._slots[self._active].plan(pages, seq_pos, new_len)
+
+    def plan_idle(self, pages, seq_pos: int, new_len: int = 1) -> None:
+        """Pre-plan the NEXT step on the idle slot (side-thread safe: touches
+        only the idle slot's buffers, which no in-flight graph reads)."""
+        self._slots[1 - self._active].plan(pages, seq_pos, new_len)
+
+    def swap(self) -> int:
+        """Make the pre-planned idle slot active; returns the new index."""
+        self._active = 1 - self._active
+        return self._active
