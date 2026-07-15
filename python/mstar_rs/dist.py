@@ -817,8 +817,12 @@ class DisaggWorker:
     def _run(self) -> None:
         if self.async_pipeline:
             return self._run_async()
+        busy = False
         while not self._stop:
-            raw = self.mbox.recv_timeout(50)   # block when idle (no busy spin)
+            # Block only when the LAST tick had no work: a self-driving decode
+            # loop must not pay the poll timeout between frames (that tax was
+            # measured at ~50 ms/frame -> RTF 0.8 instead of ~0.1).
+            raw = self.mbox.recv_timeout(0 if busy else 50)
             # Drain a BOUNDED number of queued messages, then always poll — an
             # unbounded drain would starve poll() when a peer floods this worker
             # with stream chunks faster than it can consume them (the consumer
@@ -831,8 +835,8 @@ class DisaggWorker:
                 n += 1
                 raw = self.mbox.try_recv()
             self._drain_tp_pending()
-            did = self.driver.poll()           # one in-process step, no round-trip
-            if did:
+            busy = self.driver.poll()          # one in-process step, no round-trip
+            if busy:
                 _dbg(self.worker_id, "poll ran a batch")
             self._ship_outbox()
 

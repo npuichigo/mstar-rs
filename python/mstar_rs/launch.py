@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import os
 import signal
 import subprocess
 import sys
@@ -114,6 +115,8 @@ def _disagg_speech_worker(kind: str, local_partitions: list, ship_to: dict,
             def postprocess(self, *a): return policy.postprocess(*a)
             def execute(self, *a, **k): return engine.execute(*a, **k)
             def loops_to_finish(self): return engine.loops_to_finish()
+            def register_request(self, rid, mk): engine.register_request(rid, mk)
+            def release_request(self, rid): engine.release_request(rid)
 
         model = _WorkerModel()
         # Only rank 0 of the TP Thinker is the I/O leader; followers compute
@@ -123,6 +126,11 @@ def _disagg_speech_worker(kind: str, local_partitions: list, ship_to: dict,
         # never self-initiate Thinker batches (tp_follow_nodes).
         io_leader = kind == "thinker0" or not kind.startswith("thinker")
         is_tp_rank = kind.startswith("thinker")
+        # MSTAR_ASYNC_PIPELINE=1: overlap host work with the in-flight batch
+        # (mstar's async worker loop). TP followers stay sync — their replay
+        # path drives the engine from the message loop.
+        use_async = (os.environ.get("MSTAR_ASYNC_PIPELINE") == "1"
+                     and (io_leader or not is_tp_rank))
         DisaggWorker(
             kind, model, local_partitions, ship_to, socket_dir,
             device=str(model.device), io_leader=io_leader,
@@ -130,6 +138,7 @@ def _disagg_speech_worker(kind: str, local_partitions: list, ship_to: dict,
             tp_nodes=["Thinker"] if (is_tp_rank and io_leader) else None,
             tp_followers=tp_followers if (is_tp_rank and io_leader) else None,
             tp_follow_nodes=["Thinker"] if (is_tp_rank and not io_leader) else None,
+            async_pipeline=use_async,
         ).run()
     except Exception:
         import traceback

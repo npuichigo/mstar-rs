@@ -32,6 +32,7 @@ topology):
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from ..graph import (
@@ -438,6 +439,11 @@ class Qwen3OmniThinkerEngine(Qwen3OmniThinkerPolicy, ModelEngine):
 
     def register_request(self, request_id, model_kwargs: dict) -> None:
         cfg = self._cfg_for(model_kwargs or {})
+        # MSTAR_SAMPLING_DEBUG=1: print what each request's sampling resolves
+        # to at ingest — the seam where model_kwargs drops are visible.
+        if os.environ.get("MSTAR_SAMPLING_DEBUG"):
+            print(f"[thinker.register] rid={request_id} mk={model_kwargs} "
+                  f"temp={cfg.temperature} seed={cfg.seed}", flush=True)
         self._req_cfg[request_id] = cfg
         self.sampler.add_request(request_id)
         self.sampler.set_config(
