@@ -632,9 +632,11 @@ impl PyZmqCommunicator {
     }
 
     /// Fire-and-forget send `data` to peer `peer_id`.
-    fn send(&self, peer_id: &str, data: &[u8]) -> PyResult<()> {
-        self.inner
-            .send(peer_id, data)
+    /// Released-GIL send: a PUSH send blocks when the peer is at its
+    /// high-water mark, and blocking with the GIL held would freeze every
+    /// Python thread in the process (pyzmq releases it here too).
+    fn send(&self, py: Python<'_>, peer_id: &str, data: &[u8]) -> PyResult<()> {
+        py.allow_threads(|| self.inner.send(peer_id, data))
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
