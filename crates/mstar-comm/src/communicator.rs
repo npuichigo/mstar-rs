@@ -107,6 +107,37 @@ pub struct RawZmqCommunicator {
     ctx: zmq::Context,
 }
 
+/// Debug-only (env `MSTAR_COMM_MONITOR=1`): stream a socket's connection
+/// lifecycle events (connect/disconnect/retry) to stderr — the decisive
+/// probe for silent pipe reconnects, which drop in-flight frames.
+fn spawn_monitor(ctx: &zmq::Context, sock: &zmq::Socket, tag: String) {
+    if std::env::var("MSTAR_COMM_MONITOR").as_deref() != Ok("1") {
+        return;
+    }
+    let mon_ep = format!("inproc://monitor-{tag}");
+    if sock.monitor(&mon_ep, zmq::SocketEvent::ALL as i32).is_err() {
+        return;
+    }
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let Ok(pair) = ctx.socket(zmq::PAIR) else { return };
+        if pair.connect(&mon_ep).is_err() {
+            return;
+        }
+        loop {
+            // frame 1: event id (u16) + value (u32); frame 2: endpoint
+            let Ok(evt) = pair.recv_msg(0) else { return };
+            let Ok(ep) = pair.recv_msg(0) else { return };
+            let id = u16::from_le_bytes([evt[0], evt[1]]);
+            let ev = zmq::SocketEvent::from_raw(id);
+            eprintln!(
+                "[zmq-mon {tag}] {ev:?} {}",
+                String::from_utf8_lossy(&ep)
+            );
+        }
+    });
+}
+
 impl RawZmqCommunicator {
     /// Bind this entity's PULL inbox at `ipc://<dir>/<my_id>.ipc` (the default
     /// single-node scheme: peers resolve by id within the same dir).
@@ -138,6 +169,7 @@ impl RawZmqCommunicator {
         let ctx = zmq::Context::new();
         let pull = ctx.socket(zmq::PULL)?;
         pull.set_linger(0)?; // don't block on close
+        spawn_monitor(&ctx, &pull, format!("pull-{my_id}"));
         pull.bind(endpoint)?;
         Ok(Self {
             my_id,
@@ -212,6 +244,7 @@ impl RawZmqCommunicator {
             // sequence silently truncated (caught by
             // verify_tp_lockstep_concurrent under load).
             push.set_linger(2000)?;
+            spawn_monitor(&self.ctx, &push, format!("push-{}-{}", self.my_id, peer_id));
             push.connect(&endpoint)?;
             peers.insert(peer_id.to_string(), push);
         }

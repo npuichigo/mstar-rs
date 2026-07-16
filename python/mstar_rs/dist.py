@@ -828,11 +828,14 @@ class DisaggWorker:
             # with stream chunks faster than it can consume them (the consumer
             # would buffer forever and never drive its own partition).
             n = 0
-            while raw is not None and n < 16:
+            while raw is not None:
                 self._handle(raw)
                 if self._stop:
                     return
                 n += 1
+                if n >= 16:
+                    break      # bound reached; do NOT fetch a frame we
+                               # would drop — the next tick resumes the queue
                 raw = self.mbox.try_recv()
             self._drain_tp_pending()
             busy = self.driver.poll()          # one in-process step, no round-trip
@@ -891,11 +894,13 @@ class DisaggWorker:
                     except BlockingIOError:
                         pass
                 n = 0
-                while raw is not None and n < 16:
+                while raw is not None:
                     self._handle(raw)
                     if self._stop:
                         return
                     n += 1
+                    if n >= 16:
+                        break  # bound reached; never fetch-then-drop
                     raw = self.mbox.try_recv()
                 self._drain_tp_pending()
 
@@ -977,19 +982,42 @@ class DisaggWorker:
         """Run the driver until no queued leader decision references this
         request (bounded). The referenced batches are executable by
         construction — the leader only ships batches it scheduled from the
-        same deterministic state."""
+        same deterministic state. A queued decision can also reference OTHER
+        requests whose seeds ride the coordinator connection and may still be
+        in this worker's mailbox (the forwarded finish travels on the leader
+        connection and can overtake them), so the wait must keep consuming
+        the mailbox — anything but a shutdown, which is deferred until the
+        flush completes so it cannot interrupt it."""
         def pending() -> bool:
             return (any(gid in gs for _n, _w, gs in self._tp_pending)
                     or any(local in rs for _n, _w, rs in self.driver._tp_follow))
 
         deadline = time.time() + timeout_s
+        deferred = []
         while pending():
             self._drain_tp_pending()
-            if not self.driver.poll():
-                if time.time() > deadline:
-                    _dbg(self.worker_id, f"flush_follows timeout gid={gid}")
-                    return
-                time.sleep(0.001)
+            if self.driver.poll():
+                continue
+            raw = self.mbox.recv_timeout(1)
+            if raw is not None:
+                if msgpack.unpackb(raw, raw=False,
+                                   strict_map_key=False).get("t") == "shutdown":
+                    deferred.append(raw)
+                else:
+                    self._handle(raw)
+                continue
+            if time.time() > deadline:
+                # Never wedge the replay queue on a decision whose requests
+                # can no longer all map: purge what references this gid (the
+                # replayed sequence has already diverged; keep draining).
+                _dbg(self.worker_id, f"flush_follows timeout gid={gid}; purging")
+                self._tp_pending = [
+                    e for e in self._tp_pending if gid not in e[2]]
+                self.driver._tp_follow = type(self.driver._tp_follow)(
+                    e for e in self.driver._tp_follow if local not in e[2])
+                break
+        for raw in deferred:
+            self._handle(raw)
 
     def _handle(self, raw: bytes) -> None:
         msg = msgpack.unpackb(raw, raw=False, strict_map_key=False)
