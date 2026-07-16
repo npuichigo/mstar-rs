@@ -389,6 +389,16 @@ impl WalkState {
                 let tensors = accumulated.get(&edge.name).cloned().unwrap_or_default();
                 Self::route_edge(&mut self.nodes, events, edge, tensors);
             }
+            // mstar clears the terminated loop's BODY registries (descendant
+            // loops read iteration 0 again); the loop's own counter persists
+            // until a parent advance resets it. Matched for `loop_iters`
+            // parity — descendant state is otherwise reset on the parent's
+            // next advance anyway.
+            for li in self.subtree_loops(idx) {
+                if li != idx {
+                    self.loops[li].curr_iter = 0;
+                }
+            }
             // The loop has finished: its buffered loop-back signals must NOT
             // propagate (mstar's `filtered_signals`) — without this, a parent
             // loop's advance would promote the final loop-back value over the
@@ -489,6 +499,16 @@ impl WalkState {
     /// A walk is done when every node has completed and every loop has
     /// terminated. One walk completion == one forward pass, after which the
     /// policy picks the next walk (or finishes the request).
+    /// Current iteration per loop, by name (mstar's `get_loop_indices`).
+    pub fn loop_iters(&self) -> Vec<(String, u32)> {
+        self.graph
+            .loops
+            .iter()
+            .zip(self.loops.iter())
+            .map(|(spec, st)| (spec.name.clone(), st.curr_iter))
+            .collect()
+    }
+
     pub fn is_done(&self) -> bool {
         self.graph
             .loops
