@@ -856,8 +856,16 @@ class DisaggWorker:
         from on GPU)."""
         from concurrent.futures import ThreadPoolExecutor
 
+        def exec_thread_init() -> None:
+            # A fresh thread's CUDA current-device is 0; engines on any other
+            # card would launch kernels into the wrong context (observed as
+            # cudaErrorIllegalInstruction on the audio worker, cuda:2).
+            if str(self.device).startswith("cuda"):
+                torch.cuda.set_device(self.device)
+
         executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"mstar-exec-{self.worker_id}")
+            max_workers=1, thread_name_prefix=f"mstar-exec-{self.worker_id}",
+            initializer=exec_thread_init)
         efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
         self.mbox.register_wakeup_fd(efd)
         pending = None   # (batch, future)
@@ -947,7 +955,10 @@ class DisaggWorker:
         if node not in self.tp_nodes:
             return
         gids = [self._l2g[r] for r in rids]
-        msg = msgpack.packb({"t": "tp_sched", "node": node, "walk": walk, "gids": gids})
+        self._bseq = getattr(self, "_bseq", 0) + 1
+        msg = msgpack.packb({"t": "tp_sched", "node": node, "walk": walk,
+                             "gids": gids, "seq": self._bseq})
+        _dbg(self.worker_id, f"broadcast #{self._bseq} {node} gids={gids}")
         for follower in self.tp_followers:
             self.mbox.send(follower, msg)
 
@@ -989,6 +1000,33 @@ class DisaggWorker:
             # (the coordinator shuts down only leaders).
             for follower in self.tp_followers:
                 self.mbox.send(follower, raw)
+            # Follower: drain queued leader decisions BEFORE stopping — the
+            # ordered connection guarantees they arrived first, and dropping
+            # them would truncate the replayed sequence (the lockstep
+            # invariant NCCL depends on; caught by
+            # verify_tp_lockstep_concurrent once the poll-tax fix let the
+            # leader finish far ahead of the replay).
+            deadline = time.time() + 5.0
+            quiet = time.time() + 0.2
+            while time.time() < deadline:
+                # keep consuming the mailbox: replay decisions (and their
+                # inputs) can still be in flight when shutdown is handled —
+                # exit only after the queues are empty AND the mailbox has
+                # been quiet for a grace window.
+                queued = self.mbox.try_recv()
+                if queued is not None:
+                    self._handle(queued)
+                    quiet = time.time() + 0.2
+                self._drain_tp_pending()
+                if self.driver.poll():
+                    quiet = time.time() + 0.2
+                elif queued is None:
+                    if not self._tp_pending and not self.driver._tp_follow \
+                            and time.time() >= quiet:
+                        break
+                    time.sleep(0.001)
+            _dbg(self.worker_id, f"shutdown: leftover pending={self._tp_pending} "
+                 f"follow={list(self.driver._tp_follow)}")
             self._stop = True
         elif t == "seed":
             gid = int(msg["gid"])
@@ -1010,6 +1048,14 @@ class DisaggWorker:
                 (node, name, [self.shm.read(d).to(self.device) for d in descs])
                 for node, name, descs in msg["inputs"]
             ]
+            # The staged seed bytes are copied out above — release the
+            # coordinator's arena slots (same protocol as worker-to-worker
+            # frees; without this every request leaks its seeds there).
+            items = [(d[0], d[1])
+                     for _n, _nm, descs in msg["inputs"] for d in descs]
+            if items:
+                self.mbox.send(self.coordinator_id, msgpack.packb(
+                    {"t": "free", "items": items}))
             self.driver.start(local, msg["walk"], inputs, *msg["kv"])
         elif t == "stream":
             _dbg(self.worker_id, f"stream gid={msg['gid']} {msg['from']}->{msg['to']}")
@@ -1022,7 +1068,7 @@ class DisaggWorker:
             self.driver.signal_stream_done(local, msg["from"], msg["edge"], msg["to"])
         elif t == "tp_sched":
             # leader's batch decision (TP follow) — replay after gid mapping
-            _dbg(self.worker_id, f"tp_sched {msg['node']} gids={msg['gids']}")
+            _dbg(self.worker_id, f"tp_sched #{msg.get('seq')} {msg['node']} gids={msg['gids']}")
             self._tp_pending.append((msg["node"], msg["walk"], [int(g) for g in msg["gids"]]))
         elif t == "finish":
             gid = int(msg["gid"])
@@ -1126,6 +1172,8 @@ class DisaggCoordinator:
         # Workers that reported a crash: their requests were failed, and new
         # submits that would seed them are refused up front.
         self._dead_workers: set[str] = set()
+        # staged seed slot -> ranks yet to read it (TP seeds are shared)
+        self._stage_refs: dict[tuple, int] = {}
         # Frontend serving (mirrors Conductor.serve_frontend).
         self._front_rid: dict[int, Any] = {}   # gid -> frontend request id
         self._stream: _FrontendStream | None = None
@@ -1147,8 +1195,14 @@ class DisaggCoordinator:
             msg = msgpack.packb(
                 {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded,
                  "kv": list(kv), "mk": mk})
-            # seed every rank of the partition (TP group runs in lockstep)
-            for worker in self.partition_to_workers[self.walk_partition[walk]]:
+            # seed every rank of the partition (TP group runs in lockstep);
+            # every rank reads the SAME staged slots, so they are freed only
+            # after ALL ranks report their read (refcounted below).
+            ranks = self.partition_to_workers[self.walk_partition[walk]]
+            for _node, _name, descs in seeded:
+                for d in descs:
+                    self._stage_refs[(d[0], d[1])] = len(ranks)
+            for worker in ranks:
                 self.mbox.send(worker, msg)
         return gid
 
@@ -1174,6 +1228,7 @@ class DisaggCoordinator:
                     continue  # late report for an aborted request
                 self._pending[gid].discard(msg["partition"])
                 if not self._pending[gid]:
+                    self._pending.pop(gid)  # bookkeeping done for this gid
                     self.finished.add(gid)
                     # Finish only each partition's LEADER rank (workers[0]);
                     # leaders forward it to their TP followers on the same
@@ -1207,6 +1262,16 @@ class DisaggCoordinator:
                     self._front_rid[gid] = msg["rid"]
                     if msg.get("frontend_detok") and self._stream is not None:
                         self._stream.set_raw(msg["rid"])
+            elif t == "free":
+                # a rank consumed staged seed tensors: release each slot once
+                # ALL ranks of its partition have reported their read
+                for name, off in msg["items"]:
+                    left = self._stage_refs.get((name, off), 1) - 1
+                    if left <= 0:
+                        self._stage_refs.pop((name, off), None)
+                        self.shm.free_by_name(name, off)
+                    else:
+                        self._stage_refs[(name, off)] = left
             elif t == "abort":
                 # Frontend gave up (disconnect/timeout): finish the request on
                 # every leader (they forward to TP followers) — idempotent.

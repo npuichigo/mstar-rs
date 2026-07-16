@@ -487,6 +487,12 @@ impl PyShmSegment {
         self.seg.size()
     }
 
+    /// Unallocated bytes — lets tests assert full reclaim per segment.
+    #[getter]
+    fn bytes_free(&self) -> usize {
+        self.seg.bytes_free()
+    }
+
     /// `(base_ptr, len)` for the registration hook — the embedder
     /// `cudaHostRegister`s each new segment once (e.g. via
     /// `torch.cuda.cudart().cudaHostRegister(ptr, len, flags)`).

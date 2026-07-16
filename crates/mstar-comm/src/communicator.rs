@@ -205,7 +205,13 @@ impl RawZmqCommunicator {
         if !peers.contains_key(peer_id) {
             let endpoint = self.resolve(peer_id)?;
             let push = self.ctx.socket(zmq::PUSH)?;
-            push.set_linger(0)?;
+            // Bounded linger: close flushes queued outbound messages (up to
+            // 2 s) instead of discarding them. linger(0) dropped a TP
+            // leader's final tp_sched broadcast + forwarded shutdown when the
+            // process exited right after sending — the follower's replayed
+            // sequence silently truncated (caught by
+            // verify_tp_lockstep_concurrent under load).
+            push.set_linger(2000)?;
             push.connect(&endpoint)?;
             peers.insert(peer_id.to_string(), push);
         }
