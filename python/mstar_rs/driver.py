@@ -219,7 +219,14 @@ class Driver:
         if prepared is None:
             return False
         batch, inputs = prepared
-        outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+        try:
+            outputs = self.model.execute(batch.node, batch.walk, inputs, kv=batch.kv)
+        except Exception as e:
+            # Let the caller contain a bad batch without killing the loop
+            # (mstar's worker reports the batch's requests as failed and keeps
+            # serving): tag the exception with the requests it takes down.
+            e.batch_request_ids = list(batch.inputs.keys())
+            raise
         self.finish_batch(batch, outputs)
         return True
 

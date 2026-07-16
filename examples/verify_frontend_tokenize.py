@@ -3,15 +3,15 @@ Rust (off the GIL), token ids on the wire both ways — the
 Rust-default-with-model-override mechanism from RFC #130 Step 3.
 
     HTTP -> axum TOKENIZES (HF tokenizers crate) -> submit token ids
-         -> conductor seeds the model with ids (no Python tokenize)
+         -> coordinator seeds the model with ids (no Python tokenize)
          -> emissions ship back as raw ids (modality "token", 4-byte LE)
          -> axum DETOKENIZES incrementally -> NDJSON/collect text
 
 The conductor's EchoPolicy is built WITHOUT a tokenizer — if any Python-side
 tokenize/detok were still on this path, the run would fail, which is the
-point: the flag moves that work wholly into the frontend. Contrast
-serve_bridge.py, where the model side tokenizes (the multimodal-safe default —
-both paths coexist on the same wire).
+point: the flag moves that work wholly into the frontend. The model-side-tokenizes
+default (multimodal-safe) coexists on the same wire — see
+verify_serving_errors.py, where the coordinator's policy detokenizes.
 
     python examples/verify_frontend_tokenize.py <tokenizer.json> [port]
 """
@@ -36,10 +36,11 @@ sys.path.insert(0, str(REPO / "python"))
 
 def worker_main(worker_id: str, socket_dir: str) -> None:
     try:
-        from mstar_rs.dist import Worker
-        from mstar_rs.models.echo import EchoEngine
+        from mstar_rs.dist import DisaggWorker
+        from mstar_rs.models.echo import EchoAR
 
-        Worker(worker_id, EchoEngine(), socket_dir, device="cpu").run()
+        DisaggWorker(worker_id, EchoAR(), ["P"], {"P": worker_id},
+                     socket_dir, device="cpu", coordinator_id="conductor").run()
     except Exception:
         import traceback
 
@@ -82,12 +83,12 @@ def main() -> int:
     while time.time() < deadline and not Path(f"{socket_dir}/worker_0.ipc").exists():
         time.sleep(0.1)
 
-    from mstar_rs.dist import Conductor
+    from mstar_rs.dist import DisaggCoordinator
     from mstar_rs.models.echo import EchoPolicy
 
     # NO tokenizer on the model side: any Python tokenize/detok would fail.
-    cond = Conductor(EchoPolicy(tokenizer=None),
-                     node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
+    cond = DisaggCoordinator(EchoPolicy(tokenizer=None), {"P": ["worker_0"]},
+                             socket_dir, my_id="conductor")
     serve_thread = threading.Thread(target=cond.serve_frontend, daemon=True)
     serve_thread.start()
 

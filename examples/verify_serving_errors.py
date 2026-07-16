@@ -9,7 +9,9 @@ behaviors mstar's api_server has and a hung HTTP call doesn't:
 Toy character-echo model: text becomes ord() tokens, echoed one per step; a
 prompt starting with '!' makes the WORKER raise mid-generation, an empty
 prompt fails at INGEST (policy raises while seeding). Driven over real HTTP
-through the axum binary -> bridge -> conductor -> worker.
+through the axum binary -> bridge -> coordinator -> self-driving worker. The
+worker CONTAINS the engine error (fails just that batch's requests, keeps
+serving), so the recovery request rides the same worker process.
 
     python examples/verify_serving_errors.py [port]
 """
@@ -50,6 +52,9 @@ class CharEcho(Model):
 
     tokenizer = _CharTokenizer()
 
+    def partitions(self):
+        return ([{"name": "P", "walks": ["gen"]}], [])
+
     def walks(self):
         return {
             "gen": sequential(node("step", ["state"], [
@@ -84,9 +89,10 @@ class CharEcho(Model):
 
 def worker_main(socket_dir: str) -> None:
     try:
-        from mstar_rs.dist import Worker
+        from mstar_rs.dist import DisaggWorker
 
-        Worker("worker_0", CharEcho(), socket_dir, device="cpu").run()
+        DisaggWorker("worker_0", CharEcho(), ["P"], {"P": "worker_0"},
+                     socket_dir, device="cpu", coordinator_id="conductor").run()
     except Exception:
         import traceback
 
@@ -130,9 +136,10 @@ def main() -> int:
     while time.time() < deadline and not Path(f"{socket_dir}/worker_0.ipc").exists():
         time.sleep(0.1)
 
-    from mstar_rs.dist import Conductor
+    from mstar_rs.dist import DisaggCoordinator
 
-    cond = Conductor(CharEcho(), node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
+    cond = DisaggCoordinator(CharEcho(), {"P": ["worker_0"]}, socket_dir,
+                             my_id="conductor")
     serve_thread = threading.Thread(target=cond.serve_frontend, daemon=True)
     serve_thread.start()
 

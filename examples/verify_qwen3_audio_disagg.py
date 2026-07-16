@@ -12,7 +12,7 @@ no per-step conductor round-trip:
     locally.
 A thin DisaggCoordinator only ingests the request and collects text + audio.
 
-Contrast verify_qwen3_audio_dist.py (centralized Conductor: a batch dispatched
+Contrast the centralized alternative (a per-step conductor: a batch dispatched
 over ZMQ every step).
 
     CUDA_VISIBLE_DEVICES=1,6,7 python examples/verify_qwen3_audio_disagg.py

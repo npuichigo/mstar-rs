@@ -1,16 +1,14 @@
-"""A decentralized worker CRASHING must fail its requests, not hang the stack.
+"""Worker failure semantics, both tiers:
 
-Before this, a DisaggWorker that died mid-request (engine exception, OOM,
-segfault-adjacent) simply never reported partition_done — the coordinator
-(and any HTTP client behind it) waited forever. Now the dying worker reports
-`worker_error` with the gids it carried; the coordinator fails those requests
-(errors dict / frontend 500), tells surviving leaders to drop them, and
-refuses new submits that would seed the dead worker.
-
-Sequence: a good request completes; a poison request (token 13) kills the
-worker's engine; the coordinator must (a) finish+error the poison request so
-run_until_idle terminates, (b) keep the good result, (c) reject the next
-submit with a clear "worker died" error.
+1. ENGINE errors are CONTAINED (mstar's per-batch semantics): a poison
+   request (token 13) raises in `execute`; the worker fails just that
+   request (`req_error` -> coordinator errors dict / frontend 500) and KEEPS
+   SERVING — the next submit works on the same worker process.
+2. RUNTIME failures still kill the worker LOUDLY: an internal failure outside
+   the engine (simulated by a corrupt control frame) crashes the loop; the
+   dying worker reports `worker_error` with the gids it carried; the
+   coordinator fails those requests, and refuses new submits that would seed
+   the dead worker — nothing hangs.
 
     python examples/verify_disagg_worker_crash.py
 """
@@ -64,7 +62,7 @@ class CrashyEcho(Model):
         for rid, named in inputs.items():
             state = named["state"][0]
             if int(state[0]) == POISON:
-                raise RuntimeError("poison token: worker down")
+                raise RuntimeError("poison token: engine failure")
             out[rid] = {"token": [state[:1]], "rest": [state[1:]]}
         return out
 
@@ -96,22 +94,39 @@ def main() -> int:
 
     cond = DisaggCoordinator(CrashyEcho(), {"P": "w0"}, socket_dir)
 
-    # The good request completes BEFORE the poison is submitted (a request
-    # in flight when the worker dies is correctly failed along with it).
     good = cond.submit({"tokens": [1, 2, 3]})
     results = cond.run_until_idle()
 
+    # --- tier 1: engine error is contained; the worker keeps serving -------
     poison = cond.submit({"tokens": [POISON, 99]})
-    # run_until_idle must TERMINATE (the crash report finishes the poison gid).
     t0 = time.time()
-    results = cond.run_until_idle()
+    results = cond.run_until_idle()   # must TERMINATE (req_error finishes it)
     dt = time.time() - t0
 
     ok_good = results.get(good) == [1, 2, 3]
     ok_err = poison in cond.errors and "poison" in cond.errors[poison]
-    print(f"  good request:   {results.get(good)} {'OK' if ok_good else 'FAIL'}")
-    print(f"  poison request: errors[{poison}]={cond.errors.get(poison)!r} "
+    print(f"  good request:    {results.get(good)} {'OK' if ok_good else 'FAIL'}")
+    print(f"  poison request:  errors[{poison}]={cond.errors.get(poison)!r} "
           f"{'OK' if ok_err else 'FAIL'} (idle in {dt:.1f}s — no hang)")
+
+    # the SAME worker process serves the next request (containment)
+    after = cond.submit({"tokens": [7, 8]})
+    results = cond.run_until_idle()
+    ok_contained = results.get(after) == [7, 8] and p.is_alive()
+    print(f"  post-error req:  {results.get(after)} worker alive={p.is_alive()} "
+          f"{'OK' if ok_contained else 'FAIL'}")
+
+    # --- tier 2: a runtime failure kills the worker loudly ------------------
+    # Simulate internal corruption: a control frame the worker cannot parse
+    # crashes its loop outside the engine-containment seam.
+    hang = cond.submit({"tokens": [5, 5, 5, 5, 5, 5, 5, 5]})  # in flight
+    cond.mbox.send("w0", b"\xc1 not msgpack")
+    t0 = time.time()
+    results = cond.run_until_idle()   # worker_error must finish `hang`
+    dt = time.time() - t0
+    ok_dead = hang in cond.errors
+    print(f"  runtime failure: errors[{hang}]={cond.errors.get(hang)!r} "
+          f"{'OK' if ok_dead else 'FAIL'} (idle in {dt:.1f}s — no hang)")
 
     # New submits must be refused with a clear error, not silently queued.
     try:
@@ -123,9 +138,9 @@ def main() -> int:
         print(f"  post-crash submit: refused ({e}) {'OK' if ok_refuse else 'FAIL'}")
 
     p.join(timeout=5)
-    ok = ok_good and ok_err and ok_refuse
+    ok = ok_good and ok_err and ok_contained and ok_dead and ok_refuse
     print(f"\nDISAGG WORKER-CRASH HANDLING {'OK' if ok else 'FAILED'} "
-          f"(crash fails its requests; no hang; new submits refused)")
+          f"(engine errors contained; runtime crash fails its requests, no hang, new submits refused)")
     return 0 if ok else 1
 
 

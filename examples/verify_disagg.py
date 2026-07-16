@@ -5,7 +5,7 @@ peer-to-peer straight to worker B (SHM descriptor + ZMQ notify), never through
 a scheduler. A thin coordinator only ingests the request and collects the
 emission — NO per-step conductor round-trip in the hot loop.
 
-Contrast run_dist.py (centralized Conductor: a batch dispatched to a worker
+Contrast the centralized alternative (a conductor dispatching a batch to a worker
 over ZMQ every step). CPU + toy, so it runs anywhere.
 
     python examples/verify_disagg.py

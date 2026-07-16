@@ -237,7 +237,7 @@ class Qwen3OmniPolicy(ModelPolicy):
 # Code2Wav, a single-partition prefill -> decode loop (the same control shape
 # as orpheus). It is driven through the TP-aware conductor/worker in dist.py
 # (a node maps to the LIST of its ranks; only rank 0's output is routed) —
-# see examples/verify_thinker_tp_dist.py. The full 3-partition audio path
+# see examples/verify_tp_lockstep_concurrent.py. The full 3-partition audio path
 # (Qwen3OmniPolicy above) layers on top later.
 # =========================================================================
 
@@ -275,6 +275,15 @@ class Qwen3OmniThinkerPolicy(ModelPolicy):
                 max_iters=self.max_output_tokens,
             ),
         }
+
+    def partitions(self):
+        # Text-only stack: everything is the one Thinker partition (the
+        # decentralized coordinator/worker pair schedules by partition).
+        return (
+            [partition("Thinker", ["prefill_text", "prefill_audio",
+                                   "prefill_vision", "thinker_decode"])],
+            [],
+        )
 
     def kv_config(self):
         return [(THINKER_KV, THINKER_TEXT_PAGES, PAGE_SIZE)], {"Thinker": THINKER_KV}

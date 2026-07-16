@@ -64,6 +64,6 @@ model (conductor policy + engine), and the frontend ships
 proposed Rust-default-with-model-override tokenization hook composes with it
 (the wire supports token-id submits as well).
 
-Verified by `examples/serve_bridge.py` (echo round-trip over real HTTP),
+Verified by `examples/verify_frontend_tokenize.py` (echo round-trip over real HTTP),
 `examples/verify_serving_errors.py` (failure surfaces + loop survival), and
 the mock path (`mstar-server <model> <port>` with no backend).

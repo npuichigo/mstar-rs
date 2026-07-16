@@ -9,7 +9,7 @@ bs=1 single-slot graphs in pi05/orpheus are the degenerate case.
 
 Verification:
   * `padded_bucket` and the pad/discard index math are **pure Python** and are
-    unit-tested on CPU (`test_batched_graph_buckets` in examples/verify_dist).
+    unit-tested on CPU (examples/verify_batched_graph_buckets.py).
   * `BucketedCudaGraph` capture/replay is **verified bit-exact on GPU** by
     `examples/verify_batched_capture.py` (graph-replay == eager batched,
     max_abs_diff 0.0). What remains is wiring a model's decode step to it.

@@ -1,8 +1,8 @@
 """The serving drive-loop: `ServingEngine`.
 
-`ServingEngine` owns a **background drive thread** that holds the `Conductor`
+`ServingEngine` owns a **background drive thread** that holds the `Driver`
 (and thus the Rust `Runtime` — all runtime access stays on one thread, as PyO3
-requires) and loops `conductor.poll()`, continuously-batching across every
+requires) and loops `poll()`, continuously-batching across every
 in-flight request. Callers submit and block for the result. It's the reusable
 request-driver, independent of any HTTP layer: `verify_serve_local.py` drives an
 in-process `Driver` through it with no server at all.
@@ -10,7 +10,7 @@ in-process `Driver` through it with no server at all.
 The production **HTTP surface is the Rust axum frontend** (`crates/mstar-server`),
 started together with the workers by `mstar_rs.launch`. The frontend runs HTTP +
 adapters + media + SSE off the GIL in its own process and talks to the Python
-conductor over the `mstar-comm` ZmqCommunicator (submit text/media, stream
+coordinator over the `mstar-comm` ZmqCommunicator (submit text/media, stream
 `ResultChunk`s back) — the same split vLLM (`rust/vllm-server`) and SGLang
 (`sgl-router`) use. This module carries no HTTP server of its own; the earlier
 in-process FastAPI dev-path was removed once the axum frontend + launcher
@@ -23,17 +23,13 @@ import queue
 import threading
 from typing import Any
 
-from .dist import Conductor
-
-
 class ServingEngine:
     """Owns the request-driver on a background thread; HTTP handlers submit here.
 
-    Drives either a multi-process `dist.Conductor` (batches dispatched to worker
-    processes over ZeroMQ every step — for genuinely-distributed deployments) or
-    an in-process `driver.Driver` (scheduler + engine co-located, no per-step
-    IPC — the co-located fast path). Both expose the same submit/poll/finished/
-    errors/shutdown_workers surface, so the HTTP layer is identical for both."""
+    Drives an in-process `driver.Driver` (scheduler + engine co-located, no
+    per-step IPC) via the submit/poll/finished/errors/shutdown_workers
+    surface. Multi-process serving runs the decentralized stack instead
+    (`dist.DisaggCoordinator` + self-driving workers via `mstar_rs.launch`)."""
 
     def __init__(self, conductor) -> None:  # Conductor | Driver
         self.cond = conductor

@@ -1,10 +1,9 @@
 """Verify per-request model_kwargs plumbing (mstar's model_kwargs-at-ingest)
-across all three runtimes — the value must reach the ENGINE before its first
+across both runtimes — the value must reach the ENGINE before its first
 execute, and be released at finish:
 
   1. in-process Driver          (register in submit, release at finish)
-  2. centralized Conductor      ({"t":"register"/"release"} worker messages)
-  3. decentralized DisaggWorker (kwargs ride the seed; release on finish)
+  2. decentralized DisaggWorker (kwargs ride the seed; release on finish)
 
 The toy model echoes its prompt tokens shifted by a per-request `offset` model
 kwarg — so the OUTPUT proves the kwarg reached execute (a dropped kwarg yields
@@ -98,41 +97,6 @@ def run_driver() -> bool:
     return ok
 
 
-def _worker_main(worker_id: str, socket_dir: str) -> None:
-    try:
-        from mstar_rs.dist import Worker
-
-        Worker(worker_id, OffsetEcho(), socket_dir, device="cpu").run()
-    except Exception:
-        import traceback
-
-        with open(f"{socket_dir}/{worker_id}.err", "w") as f:
-            traceback.print_exc(file=f)
-        raise
-
-
-def run_conductor() -> bool:
-    from mstar_rs.dist import Conductor
-
-    ctx = mp.get_context("spawn")
-    socket_dir = tempfile.mkdtemp(prefix="mstar_rs_kwargs_")
-    p = ctx.Process(target=_worker_main, args=("worker_0", socket_dir), daemon=True)
-    p.start()
-    deadline = time.time() + 15
-    while time.time() < deadline and not Path(f"{socket_dir}/worker_0.ipc").exists():
-        time.sleep(0.1)
-
-    cond = Conductor(OffsetEcho(), node_to_worker={"step": "worker_0"}, socket_dir=socket_dir)
-    rid = cond.submit({"tokens": [10, 20, 30], "model_kwargs": {"offset": 100}})
-    rid2 = cond.submit({"tokens": [1, 2]})
-    results = cond.run_until_idle()
-    cond.shutdown_workers()
-    p.join(timeout=3)
-    ok = check("conductor kwargs", results[rid], [110, 120, 130])
-    ok &= check("conductor default", results[rid2], [1, 2])
-    return ok
-
-
 PARTS = [{"name": "P", "walks": ["gen"]}]
 
 
@@ -180,14 +144,12 @@ def run_disagg() -> bool:
 
 
 def main() -> int:
-    print("[1/3] in-process Driver")
+    print("[1/2] in-process Driver")
     ok = run_driver()
-    print("[2/3] centralized Conductor + Worker")
-    ok &= run_conductor()
-    print("[3/3] decentralized DisaggWorker + Coordinator")
+    print("[2/2] decentralized DisaggWorker + Coordinator")
     ok &= run_disagg()
     print(f"\nPER-REQUEST MODEL_KWARGS {'OK' if ok else 'FAILED'} "
-          f"(register-at-ingest -> engine execute -> release-at-finish, all 3 runtimes)")
+          f"(register-at-ingest -> engine execute -> release-at-finish, both runtimes)")
     return 0 if ok else 1
 
 

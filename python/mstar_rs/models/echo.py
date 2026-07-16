@@ -8,13 +8,14 @@ It "generates" by echoing the prompt token-ids back one per forward pass: the
 deliberately the smallest thing that exercises the real serving path — one
 emission per decode step, continued across forward passes — with no CUDA, no
 checkpoint, and no math, so a CPU box can prove the whole
-HTTP → axum → conductor → worker → streamed-tokens → SSE loop.
+HTTP → axum → coordinator → worker → streamed-tokens → SSE loop.
 
 It is split into `EchoPolicy` (control plane — no weights) and `EchoEngine`
 (data plane — where `execute` and any weights would live) to show the
-conductor/worker separation: a `Conductor(EchoPolicy())` never constructs the
-engine, so it never loads weights. `EchoAR` bundles both for the
-single-process `Driver` and for passing one object to both roles.
+coordinator/worker separation: a `DisaggCoordinator(EchoPolicy())` never
+constructs the engine, so it never loads weights. `EchoAR` bundles both for
+the single-process `Driver` and for a self-driving `DisaggWorker` (which
+schedules locally, so it needs the policy half too).
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ class EchoPolicy(ModelPolicy):
         # tokenizer detokenizes the echoed ids back at the frontend seam. When
         # absent, the legacy `tokens` request field is used directly.
         self.tokenizer = tokenizer
+
+    def partitions(self):
+        # Single-partition topology (everything on one worker) — the shape the
+        # decentralized coordinator/worker pair schedules by.
+        return ([{"name": "P", "walks": ["gen"]}], [])
 
     def walks(self) -> dict[str, Any]:
         return {
