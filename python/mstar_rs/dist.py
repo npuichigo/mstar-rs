@@ -203,7 +203,13 @@ class ShmPool:
         return [self.arena.segment_name(seg), off, nbytes, list(t.shape),
                 _dtype_str(t.dtype)]
 
-    def read(self, desc: list) -> torch.Tensor:
+    def read(self, desc) -> torch.Tensor:
+        if isinstance(desc, dict):  # inline (cross-node): bytes in the message
+            dtype = _STR_TO_DTYPE[desc["dtype"]]
+            if not desc["b"]:
+                return torch.empty(desc["dims"], dtype=dtype)
+            return torch.frombuffer(
+                bytearray(desc["b"]), dtype=dtype).reshape(desc["dims"])
         name, off, nbytes, dims, dtype_str = desc
         dtype = _STR_TO_DTYPE[dtype_str]
         if nbytes == 0:  # empty tensor: nothing to map, reconstruct from dims
@@ -222,6 +228,16 @@ class ShmPool:
     def owns(self, name: str) -> bool:
         return name in self._own
 
+    @staticmethod
+    def inline(t: torch.Tensor) -> dict:
+        """An INLINE descriptor: the tensor's bytes ride the control message
+        itself (msgpack bin) instead of a SHM slot — the cross-NODE form,
+        where the consumer cannot map this process's /dev/shm. Same reader
+        (`read`) handles both forms; inline slots need no `free`."""
+        t = t.detach().to("cpu").contiguous()
+        return {"dims": list(t.shape), "dtype": _dtype_str(t.dtype),
+                "b": t.numpy().tobytes() if t.numel() else b""}
+
     def free_by_name(self, name: str, off: int) -> bool:
         """Release an offset in one of OUR segments (by descriptor name)."""
         i = self._own.get(name)
@@ -229,6 +245,21 @@ class ShmPool:
 
     def free(self, desc: list) -> None:
         self.free_by_name(desc[0], desc[1])
+
+
+def _bind_mailbox(my_id: str, socket_dir: str, endpoints: dict):
+    """Bind this entity's inbox — an explicit endpoint (tcp, for entities
+    that receive cross-node traffic) or the default ipc dir scheme — and
+    register every explicitly-addressed peer."""
+    if my_id in endpoints:
+        # tcp inbox, ipc-dir fallback for same-node peers not in `endpoints`
+        mbox = ZmqCommunicator.bind_endpoint(my_id, endpoints[my_id], socket_dir)
+    else:
+        mbox = ZmqCommunicator(my_id, socket_dir)
+    for peer, ep in endpoints.items():
+        if peer != my_id:
+            mbox.register_peer(peer, ep)
+    return mbox
 
 
 # ---- worker -----------------------------------------------------------------
@@ -256,8 +287,18 @@ class DisaggWorker:
                  tp_nodes: list | None = None,
                  tp_followers: list | None = None,
                  tp_follow_nodes: list | None = None,
-                 async_pipeline: bool = False) -> None:
+                 async_pipeline: bool = False,
+                 node_map: dict | None = None,
+                 endpoints: dict | None = None) -> None:
         self.worker_id = worker_id
+        # Multi-node topology. node_map: entity id -> node name (None = all
+        # co-located). Same-node tensor edges use SHM descriptors; cross-node
+        # edges ship the bytes INLINE in the control message. endpoints:
+        # entity id -> zmq endpoint (e.g. tcp://host:port) for every entity
+        # that receives cross-node traffic; entities not listed bind the
+        # default ipc scheme in socket_dir.
+        self._node_map = node_map or {}
+        self._endpoints = endpoints or {}
         # Tensor-parallel batch coordination (mstar's ScheduleTPNode):
         #   leader rank:   tp_nodes = the TP nodes it initiates; tp_followers =
         #                  the follower worker ids to ship each batch decision to
@@ -290,7 +331,7 @@ class DisaggWorker:
         # unbroken speculation chain.
         self.spec_cap = 8
         self._spec_streak = 0
-        self.mbox = ZmqCommunicator(worker_id, socket_dir)
+        self.mbox = _bind_mailbox(worker_id, socket_dir, self._endpoints)
         self.shm = ShmPool(worker_id)
         self.partition_to_worker = partition_to_worker
         # Where emissions/partition-done go. "coordinator" for the standalone
@@ -547,6 +588,15 @@ class DisaggWorker:
         for raw in deferred:
             self._handle(raw)
 
+    def _same_node(self, peer: str) -> bool:
+        if not self._node_map:
+            return True
+        return self._node_map.get(self.worker_id) == self._node_map.get(peer)
+
+    def _stage_for(self, t: torch.Tensor, peer: str):
+        """SHM descriptor for a same-node peer; inline bytes cross-node."""
+        return self.shm.stage(t) if self._same_node(peer) else ShmPool.inline(t)
+
     def _poll_contained(self) -> bool:
         """driver.poll with per-batch error containment (the legacy conductor
         path's semantics, kept for serving parity): an engine exception fails
@@ -641,7 +691,8 @@ class DisaggWorker:
             # coordinator's arena slots (same protocol as worker-to-worker
             # frees; without this every request leaks its seeds there).
             items = [(d[0], d[1])
-                     for _n, _nm, descs in msg["inputs"] for d in descs]
+                     for _n, _nm, descs in msg["inputs"] for d in descs
+                     if isinstance(d, list)]
             if items:
                 self.mbox.send(self.coordinator_id, msgpack.packb(
                     {"t": "free", "items": items}))
@@ -686,10 +737,11 @@ class DisaggWorker:
             return
         for frm, edge, to, tensors, local in self.driver.outbox:
             gid = self._l2g[local]
-            _dbg(self.worker_id, f"ship {frm}->{to} gid={gid} -> {self.partition_to_worker[to]}")
-            descs = [self.shm.stage(t) for t in tensors]
+            consumer = self.partition_to_worker[to]
+            _dbg(self.worker_id, f"ship {frm}->{to} gid={gid} -> {consumer}")
+            descs = [self._stage_for(t, consumer) for t in tensors]
             self.mbox.send(
-                self.partition_to_worker[to],
+                consumer,
                 msgpack.packb({"t": "stream", "gid": gid, "from": frm,
                                "edge": edge, "to": to, "descs": descs}),
             )
@@ -709,7 +761,7 @@ class DisaggWorker:
         if isinstance(value, torch.Tensor):
             self.mbox.send(self.coordinator_id, msgpack.packb(
                 {"t": "emission", "gid": gid, "modality": modality,
-                 "desc": self.shm.stage(value)}))
+                 "desc": self._stage_for(value, self.coordinator_id)}))
         else:
             self.mbox.send(self.coordinator_id, msgpack.packb(
                 {"t": "emission", "gid": gid, "modality": modality, "value": value}))
@@ -735,8 +787,16 @@ class DisaggCoordinator:
     completes a request when all partitions report done."""
 
     def __init__(self, policy, partition_to_worker, socket_dir,
-                 my_id: str = "coordinator") -> None:
+                 my_id: str = "coordinator",
+                 node_map: dict | None = None,
+                 endpoints: dict | None = None) -> None:
         self.policy = policy
+        # Multi-node topology (same contract as DisaggWorker): node_map maps
+        # entity ids to node names; seeds to same-node ranks ride SHM
+        # descriptors, seeds to cross-node ranks ship their bytes inline.
+        # endpoints lists the tcp-bound entities (everyone else = ipc).
+        self._node_map = node_map or {}
+        self._endpoints = endpoints or {}
         # A partition maps to a LIST of workers (its TP ranks; a bare string is
         # a 1-rank group). Seeds go to ALL ranks (they run in lockstep); the
         # first is the I/O leader (peers ship stream chunks to it).
@@ -751,7 +811,8 @@ class DisaggCoordinator:
         # `my_id` is this coordinator's inbox name. The serving launcher binds
         # it as "conductor" (the peer the Rust frontend submits to) and points
         # the workers' coordinator_id here.
-        self.mbox = ZmqCommunicator(my_id, socket_dir)
+        self.my_id = my_id
+        self.mbox = _bind_mailbox(my_id, socket_dir, self._endpoints)
         self.shm = ShmPool(my_id)
         self._gid = 0
         self.results: dict[int, list[Any]] = {}
@@ -779,21 +840,39 @@ class DisaggCoordinator:
         mk = dict(request.get("model_kwargs") or {})
         for nxt in self.policy.initial_walks(req):
             walk, inputs, *kv = nxt
-            seeded = [[node, name, [self.shm.stage(t) for t in tensors]]
-                      for node, name, tensors in inputs]
-            msg = msgpack.packb(
-                {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded,
-                 "kv": list(kv), "mk": mk})
-            # seed every rank of the partition (TP group runs in lockstep);
-            # every rank reads the SAME staged slots, so they are freed only
-            # after ALL ranks report their read (refcounted below).
             ranks = self.partition_to_workers[self.walk_partition[walk]]
-            for _node, _name, descs in seeded:
-                for d in descs:
-                    self._stage_refs[(d[0], d[1])] = len(ranks)
-            for worker in ranks:
-                self.mbox.send(worker, msg)
+            local = [w for w in ranks if self._same_node(w)]
+            remote = [w for w in ranks if not self._same_node(w)]
+            if local:
+                # Same-node ranks read the SAME staged SHM slots (TP group
+                # runs in lockstep); freed only after ALL of them report
+                # their read (refcounted below).
+                seeded = [[node, name, [self.shm.stage(t) for t in tensors]]
+                          for node, name, tensors in inputs]
+                for _node, _name, descs in seeded:
+                    for d in descs:
+                        self._stage_refs[(d[0], d[1])] = len(local)
+                msg = msgpack.packb(
+                    {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded,
+                     "kv": list(kv), "mk": mk})
+                for worker in local:
+                    self.mbox.send(worker, msg)
+            if remote:
+                # Cross-node ranks cannot map this process's /dev/shm: the
+                # seed bytes ride the message inline (no slot, no free).
+                inlined = [[node, name, [ShmPool.inline(t) for t in tensors]]
+                           for node, name, tensors in inputs]
+                msg = msgpack.packb(
+                    {"t": "seed", "gid": gid, "walk": walk, "inputs": inlined,
+                     "kv": list(kv), "mk": mk})
+                for worker in remote:
+                    self.mbox.send(worker, msg)
         return gid
+
+    def _same_node(self, peer: str) -> bool:
+        if not self._node_map:
+            return True
+        return self._node_map.get(self.my_id) == self._node_map.get(peer)
 
     def poll(self, timeout_ms: int = 20) -> None:
         raw = self.mbox.recv_timeout(timeout_ms)

@@ -610,11 +610,16 @@ impl PyZmqCommunicator {
     /// multi-node path, or `tcp://127.0.0.1:*` for an OS-assigned port (query
     /// with `last_endpoint()`). Peers must be `register_peer`ed.
     #[staticmethod]
-    fn bind_endpoint(my_id: &str, endpoint: &str) -> PyResult<Self> {
-        Ok(Self {
-            inner: RawZmqCommunicator::bind_endpoint(my_id, endpoint)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-        })
+    #[pyo3(signature = (my_id, endpoint, dir=None))]
+    fn bind_endpoint(my_id: &str, endpoint: &str, dir: Option<&str>) -> PyResult<Self> {
+        let inner = match dir {
+            // Mixed mesh: tcp inbox + the ipc-dir scheme as the fallback for
+            // unregistered (same-node) peers.
+            Some(d) => RawZmqCommunicator::bind_endpoint_in_dir(my_id, endpoint, d),
+            None => RawZmqCommunicator::bind_endpoint(my_id, endpoint),
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// The bound endpoint as zmq reports it (carries the OS-assigned port).

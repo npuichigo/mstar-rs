@@ -161,6 +161,20 @@ impl RawZmqCommunicator {
         Self::bind_inner(my_id.into(), None, endpoint)
     }
 
+    /// Bind at an explicit endpoint (tcp) while KEEPING the ipc-dir scheme as
+    /// the fallback for peers without a registered endpoint — the mixed-mesh
+    /// shape: this entity receives cross-node traffic over tcp, but still
+    /// reaches its same-node peers through their ipc inboxes.
+    pub fn bind_endpoint_in_dir(
+        my_id: impl Into<String>,
+        endpoint: &str,
+        dir: impl Into<PathBuf>,
+    ) -> Result<Self, CommError> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Self::bind_inner(my_id.into(), Some(dir), endpoint)
+    }
+
     fn bind_inner(
         my_id: String,
         dir: Option<PathBuf>,
