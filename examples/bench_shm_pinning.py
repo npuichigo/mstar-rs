@@ -1,4 +1,4 @@
-"""The Step-2 pinning question, measured: does `cudaHostRegister`ing a
+"""The segment-pinning question, measured: does `cudaHostRegister`ing a
 `/dev/shm` segment make D2H/H2D copies through it truly async on a side
 stream (overlapping compute), where the unregistered (pageable) mmap
 synchronizes?

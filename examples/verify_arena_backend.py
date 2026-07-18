@@ -1,4 +1,4 @@
-"""Interop proof for the RFC #130 Step-2 backend draft: mstar's tensor
+"""Interop proof for the arena tensor-transport backend: mstar's tensor
 transport primitives (store / load / uuid-reclaim) over the segmented arena —
 the object `SharedMemoryCommunicationManager` swaps in for the per-tensor
 file dance. Cross-process load, grouped+idempotent uuid reclaim, dedicated

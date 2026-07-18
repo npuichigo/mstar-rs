@@ -1,4 +1,4 @@
-"""Interop proof for the RFC #130 Step-1 draft: mstar's pyzmq
+"""Interop proof for the transport wrapper: mstar's pyzmq
 ``ZMQCommunicator`` and the Rust-backed ``RustZMQCommunicator`` (the draft
 wrapper in mstar's tree) exchanging PICKLED messages over the SAME endpoints —
 so migration can proceed one process at a time, wrapped and unwrapped entities

@@ -447,7 +447,7 @@ class DisaggWorker:
         While batch N runs, its follow-up is SPECULATED (same loop body); the
         moment N completes, the speculation is claimed and N+1 submitted
         before any post-processing — mstar's submit-asap ordering. An eventfd
-        registered with the mailbox (the Step-1 wakeup path) wakes the loop
+        registered with the mailbox (the transport's wakeup-fd path) wakes the loop
         the instant the future finishes, instead of on the poll timeout.
 
         Thread discipline: the runtime, the tensor store, and all routing stay
