@@ -166,11 +166,18 @@ class ShmPool:
     where a CUDA host-registration (`cudaHostRegister(ptr, len)`) belongs so
     D2H/H2D copies through the segment can run truly async on side streams."""
 
-    def __init__(self, entity_id: str, segment_size: int = 1 << 28,
-                 max_segments: int = 32, on_new_segment=None) -> None:
+    def __init__(self, entity_id: str, segment_size: int | None = None,
+                 max_segments: int | None = None, on_new_segment=None) -> None:
         self.entity_id = entity_id
         self.base = f"mstar_rs_{entity_id}"
+        if segment_size is None:
+            segment_size = int(
+                os.environ.get("MSTAR_RS_SHM_SEGMENT_MB", "256")) << 20
+        if max_segments is None:
+            max_segments = int(
+                os.environ.get("MSTAR_RS_SHM_MAX_SEGMENTS", "32"))
         self.arena = SegmentedShmArena.create(self.base, segment_size, max_segments)
+        self._spill_warned = False
         self.on_new_segment = on_new_segment
         self._views: list = []                 # segment idx -> memoryview
         self._own: dict[str, int] = {}          # own segment name -> idx
@@ -191,12 +198,42 @@ class ShmPool:
         """The owning entity id of an arena/segment name."""
         return name[len("mstar_rs_"):].split(".seg")[0]
 
-    def stage(self, t: torch.Tensor) -> list:
-        """Copy a tensor's bytes into our arena; return its descriptor."""
+    def stage(self, t: torch.Tensor):
+        """Copy a tensor's bytes into our arena; return its descriptor.
+
+        At the segment cap, degrade to the INLINE form instead of failing:
+        the bytes ride the control message itself (the multi-node wire
+        shape, which every reader already handles). Slots here are
+        request-scoped, so waiting for frees mid-request is futile — the
+        overflow tier is the right immediate response; it costs one extra
+        copy through the message and needs no reclaim."""
         t = t.detach().to("cpu").contiguous()
         nbytes = t.numel() * t.element_size()
-        seg, off = self.arena.reserve(max(nbytes, 1))
+        try:
+            seg, off = self.arena.reserve(max(nbytes, 1))
+        except RuntimeError:
+            total, free, largest = self.arena.stats()
+            if not self._spill_warned:
+                if free >= nbytes:
+                    # Fragmentation signature: total free covers the need,
+                    # but no contiguous block does.
+                    _log = (f"fragmented: {free} free but largest block "
+                            f"{largest}")
+                else:
+                    _log = f"full: {free} free of {total}"
+                print(f"[{self.entity_id}] SHM arena {_log}; staging inline "
+                      f"(MSTAR_RS_SHM_SEGMENT_MB/_MAX_SEGMENTS to grow)",
+                      flush=True)
+                self._spill_warned = True
+            return self.inline(t)
+        prev = len(self._views)
         self._sync_segments()  # growth may have added a segment
+        if len(self._views) > prev:
+            total, free, largest = self.arena.stats()
+            _dbg(self.entity_id,
+                 f"arena grew to {self.arena.num_segments} segments "
+                 f"({total >> 20} MiB total, {free >> 20} MiB free, "
+                 f"largest block {largest >> 20} MiB)")
         if nbytes:  # torch.frombuffer rejects an empty buffer
             mv = self._views[seg][off:off + nbytes]
             torch.frombuffer(mv, dtype=t.dtype).copy_(t.flatten())
@@ -851,7 +888,8 @@ class DisaggCoordinator:
                           for node, name, tensors in inputs]
                 for _node, _name, descs in seeded:
                     for d in descs:
-                        self._stage_refs[(d[0], d[1])] = len(local)
+                        if isinstance(d, list):   # inline spills own no slot
+                            self._stage_refs[(d[0], d[1])] = len(local)
                 msg = msgpack.packb(
                     {"t": "seed", "gid": gid, "walk": walk, "inputs": seeded,
                      "kv": list(kv), "mk": mk})
