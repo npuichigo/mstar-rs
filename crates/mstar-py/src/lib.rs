@@ -570,6 +570,12 @@ impl PySegmentedShmArena {
         self.arena.num_segments()
     }
 
+    /// `(total_bytes, free_bytes, largest_free_block)` across all segments —
+    /// the fragmentation gauge for stats logging.
+    fn stats(&self) -> (usize, usize, usize) {
+        self.arena.stats()
+    }
+
     fn segment_name(&self, i: usize) -> String {
         self.arena.segment_name(i)
     }
@@ -668,14 +674,19 @@ impl PyZmqCommunicator {
         &self,
         py: Python<'py>,
         timeout_ms: u64,
-    ) -> (&'static str, Option<Bound<'py, PyBytes>>) {
+    ) -> PyResult<(&'static str, Option<Bound<'py, PyBytes>>)> {
         let ev =
             py.allow_threads(|| self.inner.recv_or_wake(Duration::from_millis(timeout_ms)));
-        match ev {
+        Ok(match ev {
             RecvEvent::Message(b) => ("msg", Some(PyBytes::new(py, &b))),
             RecvEvent::Wake => ("wake", None),
+            RecvEvent::WakeFdError => {
+                return Err(PyRuntimeError::new_err(
+                    "a registered wakeup fd is closed/invalid (POLLERR): \
+                     fix the eventfd lifetime"));
+            }
             RecvEvent::Timeout => ("timeout", None),
-        }
+        })
     }
 }
 
