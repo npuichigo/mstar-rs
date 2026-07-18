@@ -1,4 +1,4 @@
-"""Verify the mstar-comm Step-1 capabilities from Python — the exact shapes
+"""Verify the mstar-comm transport capabilities from Python — the exact shapes
 mstar's worker needs to wrap this communicator:
 
   1. eventfd wakeup: register an eventfd alongside the PULL inbox; a write

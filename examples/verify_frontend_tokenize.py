@@ -1,6 +1,6 @@
 """The frontend-tokenizes fast path, end to end: tokenize AND detokenize in
 Rust (off the GIL), token ids on the wire both ways — the
-Rust-default-with-model-override mechanism from RFC #130 Step 3.
+Rust-default-with-model-override mechanism.
 
     HTTP -> axum TOKENIZES (HF tokenizers crate) -> submit token ids
          -> coordinator seeds the model with ids (no Python tokenize)
